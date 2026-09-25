@@ -14,7 +14,7 @@ a CLI that can scan, diagnose, move safely and undo.
 
 | # | Task | Depends on | Status |
 | --- | --- | --- | --- |
-| 01 | [Project scaffold](tasks/01-project-scaffold.md) | — | not started |
+| 01 | [Project scaffold](tasks/01-project-scaffold.md) | — | done |
 | 02 | [`RelPath` and normalization](tasks/02-relpath-and-normalization.md) | 01 | not started |
 | 03 | [Test fixture library](tasks/03-test-fixtures.md) | 01, 02 | not started |
 | 04 | [Config and mpd.conf discovery](tasks/04-config-discovery.md) | 01, 02 | not started |

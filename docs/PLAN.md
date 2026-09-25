@@ -132,7 +132,7 @@ we would not control. See task `13`.
 | `camino` | 1.2 | `Utf8Path` — paths are UTF-8 by contract here |
 | `walkdir` | 2.5 | directory traversal |
 | `serde` + `serde_json` | 1.0 | config and journal |
-| `toml` | 0.9 | config file |
+| `toml` | 1.1 | config file |
 | `anyhow` / `thiserror` | — | error handling: `thiserror` in core, `anyhow` at the edges |
 | `tempfile` | 3.27 | atomic writes and test fixtures |
 | `insta` | 1.48 | snapshot tests for previews and playlist round-trips |

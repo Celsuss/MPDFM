@@ -1,0 +1,13 @@
+[package]
+name = "mpdfm-core"
+description = "Library, playlist and tag logic for MPDFM — no terminal, no CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Core stays free of `clap`, `crossterm` and `ratatui` on purpose; the
+# dependency direction is one-way. `tests/manifest_deps.rs` enforces it.
+[dependencies]
+thiserror.workspace = true
