@@ -2,7 +2,7 @@
 
 - **Phase:** M1 · Trustworthy move engine
 - **Depends on:** nothing
-- **Status:** not started
+- **Status:** done
 
 ## Goal
 
@@ -39,13 +39,13 @@ Pin exact dependency versions. Add `rust-toolchain.toml`, `rustfmt.toml`,
 
 ## Acceptance criteria
 
-- [ ] `cargo build` and `cargo test` succeed on a clean checkout
-- [ ] `cargo clippy --all-targets -- -D warnings` is clean
-- [ ] `cargo fmt --check` is clean
-- [ ] `mpdfm --help` lists every subcommand above
-- [ ] `mpdfm move a b` exits non-zero with "not implemented" rather than panicking
-- [ ] `just check` (or `make check`) runs fmt + clippy + test
-- [ ] `mpdfm-core` has no terminal or CLI dependency in its manifest
+- [x] `cargo build` and `cargo test` succeed on a clean checkout
+- [x] `cargo clippy --all-targets -- -D warnings` is clean
+- [x] `cargo fmt --check` is clean
+- [x] `mpdfm --help` lists every subcommand above
+- [x] `mpdfm move a b` exits non-zero with "not implemented" rather than panicking
+- [x] `just check` (or `make check`) runs fmt + clippy + test
+- [x] `mpdfm-core` has no terminal or CLI dependency in its manifest
 
 ## Files
 
