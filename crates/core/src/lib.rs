@@ -5,6 +5,8 @@
 //! `mpdfm` binary's CLI and TUI) are built on top of it, never the other way
 //! around — see `docs/PLAN.md` §4.
 
+pub mod paths;
+
 /// Anything that can go wrong in core.
 ///
 /// Callers match on the variant, so new variants are added rather than folding
@@ -20,6 +22,11 @@ pub enum Error {
         /// The task file that will implement it, e.g. `"15-cli-move-and-doctor.md"`.
         task: &'static str,
     },
+
+    /// A path that could not be made into a [`paths::RelPath`], or one that
+    /// escaped a configured root.
+    #[error(transparent)]
+    Path(#[from] paths::PathError),
 
     /// An I/O failure, with the path that caused it.
     #[error("{path}: {source}")]

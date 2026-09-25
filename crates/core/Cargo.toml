@@ -10,4 +10,8 @@ repository.workspace = true
 # Core stays free of `clap`, `crossterm` and `ratatui` on purpose; the
 # dependency direction is one-way. `tests/manifest_deps.rs` enforces it.
 [dependencies]
+camino.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

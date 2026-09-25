@@ -150,7 +150,8 @@ The canonical identity of a track is its **path relative to
 `music_directory`**, UTF-8, `/`-separated, no leading `./`, no `..`, never
 absolute — because that is exactly what playlists, the state file and MPD all
 store. A newtype enforces this so a raw `PathBuf` can never leak into a
-playlist line.
+playlist line. A leading `./` is *rejected* rather than normalized (task 02), so
+every string the newtype accepts renders back byte-identically.
 
 ### Playlist entries are byte-preserving
 
