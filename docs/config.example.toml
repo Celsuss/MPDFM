@@ -1,0 +1,60 @@
+# MPDFM configuration — ~/.config/mpdfm/config.toml
+#
+# Every setting is optional, and this file as shipped changes nothing: MPDFM is
+# meant to work without it. Copy it, uncomment what you want to change.
+#
+# Values are resolved in this order, first hit wins:
+#
+#   1. a command-line flag (--music-dir, --playlist-dir)
+#   2. this file
+#   3. mpd.conf, the first of these that exists:
+#        $XDG_CONFIG_HOME/mpd/mpd.conf, ~/.mpdconf,
+#        ~/.config/mpd/mpd.conf, /etc/mpd.conf
+#   4. MPDFM's built-in defaults
+#
+# Run `mpdfm config show` to see what each setting resolved to and which of the
+# four answered it.
+#
+# In this file `~` and `$VAR` / `${VAR}` are expanded. In mpd.conf only `~` is,
+# because MPD expands only `~` there too — MPDFM will not silently disagree with
+# MPD about where your library is.
+
+# Where the music lives. Taken from mpd.conf's `music_directory` when unset.
+# This directory must exist; MPDFM refuses to run against one that does not.
+# music_dir = "~/Music"
+
+# Where MPD keeps its .m3u files. Taken from mpd.conf's `playlist_directory`.
+# playlist_dir = "~/.config/mpd/playlists"
+
+# MPDFM's own journal and playlist backups.
+# data_dir = "$XDG_DATA_HOME/mpdfm"
+
+# MPD's state file, which holds the saved queue. Taken from mpd.conf's
+# `state_file`. Only used when rewrite_saved_queue is on.
+# state_file = "~/.config/mpd/state"
+
+# How to reach the daemon: "host", "host:port", "[::1]:6600", or a unix socket
+# path. Taken from mpd.conf's `bind_to_address` and `port` when unset.
+# mpd_address = "127.0.0.1:6600"
+
+# Whether to talk to MPD at all. `--no-mpd` forces this off for one run.
+# mpd_enabled = true
+
+# Rewrite the saved queue in the state file when a move changes a path it
+# references. Turn this off if you would rather lose the queue than have MPDFM
+# edit MPD's own file.
+# rewrite_saved_queue = true
+
+# Ask MPD to rescan the affected directories after a commit.
+# trigger_update_after_commit = true
+
+# When false, MPDFM never deletes anything: it will move, rename and rewrite,
+# but any operation that would remove a file is refused.
+# delete_enabled = true
+
+# How many committed transactions to keep backups and undo records for.
+# backup_keep = 50
+
+# The default path template for `mpdfm organize`. Override per run with
+# `--template`.
+# organize_template = "{genre}/{albumartist}/{year} - {album}/{track:02} {title}"

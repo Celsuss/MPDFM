@@ -41,6 +41,7 @@ mpdfm-core.workspace = true
 anyhow.workspace = true
 camino.workspace = true
 clap.workspace = true
+serde_json.workspace = true
 
 [profile.release]
 strip = true

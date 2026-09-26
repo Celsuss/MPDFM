@@ -3,12 +3,15 @@
 //! Command bodies land in later tasks; every one of them currently reports
 //! `not implemented` and the task that owns it, rather than panicking.
 
+mod config;
+
 use std::process::ExitCode;
 
 use anyhow::Result;
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{ArgAction, Args, Parser, Subcommand};
 use mpdfm_core::Error;
+use mpdfm_core::config::{ConfigWarning, Env, Overrides};
 
 /// Success.
 pub const EXIT_OK: ExitCode = ExitCode::SUCCESS;
@@ -62,6 +65,12 @@ pub struct Globals {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Show where MPDFM is looking and why.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+
     /// Survey the library: counts by format, album dirs, warnings.
     Scan,
 
@@ -108,6 +117,13 @@ pub enum Command {
 
     /// Finish or roll back a transaction that a crash left pending.
     Recover,
+}
+
+/// `mpdfm config …`
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Print every resolved setting with the source that supplied it.
+    Show,
 }
 
 /// `mpdfm tag …`
@@ -201,8 +217,18 @@ impl Cli {
 }
 
 impl Globals {
-    /// The globals, as resolved from the command line alone. Config and mpd.conf
-    /// fill in the rest from task 04 on.
+    /// The part of the configuration the command line supplies.
+    fn overrides(&self) -> Overrides {
+        Overrides {
+            music_dir: self.music_dir.clone(),
+            playlist_dir: self.playlist_dir.clone(),
+            config_file: self.config.clone(),
+            no_mpd: self.no_mpd,
+        }
+    }
+
+    /// The globals, as given on the command line alone — traced before any file
+    /// is read, so `-v` shows the input to resolution as well as its result.
     fn describe(&self) -> String {
         fn show(value: &Option<Utf8PathBuf>) -> &str {
             value.as_deref().map_or("-", Utf8Path::as_str)
@@ -219,16 +245,48 @@ impl Globals {
     }
 }
 
+/// Print the warnings resolution collected.
+///
+/// They go to stderr so that `--json` output on stdout stays machine-readable,
+/// and the routine ones (see [`ConfigWarning::is_routine`]) wait for `-v` so a
+/// normal run is quiet.
+fn report(cli: &Cli, warnings: &[ConfigWarning]) {
+    for warning in warnings {
+        if warning.is_routine() {
+            cli.trace(warning);
+        } else {
+            eprintln!("mpdfm: warning: {warning}");
+        }
+    }
+}
+
 /// Parse arguments and run.
 pub fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
     cli.trace(cli.globals.describe());
+
+    // Resolved once, before anything dispatches: every command downstream
+    // shares one canonical library root rather than working one out for itself.
+    let (settings, warnings) =
+        mpdfm_core::config::resolve(&cli.globals.overrides(), &Env::from_process());
+    // `config show` renders the warnings itself, as part of the picture it
+    // exists to give; every other command gets them on stderr.
+    if !matches!(cli.command, Some(Command::Config { .. })) {
+        report(&cli, &warnings);
+    }
+    cli.trace(format!(
+        "music_dir={} (from {})",
+        settings.music_dir, settings.sources.music_dir
+    ));
 
     let Some(command) = &cli.command else {
         return crate::tui::run(&cli);
     };
 
     let (what, task) = match command {
+        Command::Config { command } => match command {
+            ConfigCommand::Show => return config::show(&cli, &settings, &warnings),
+        },
         Command::Scan => ("mpdfm scan", "15-cli-move-and-doctor.md"),
         Command::Doctor => ("mpdfm doctor", "15-cli-move-and-doctor.md"),
         Command::Move {
@@ -286,10 +344,47 @@ mod tests {
         let cmd = Cli::command();
         let names: Vec<&str> = cmd.get_subcommands().map(|s| s.get_name()).collect();
         for expected in [
-            "scan", "doctor", "move", "organize", "tag", "undo", "recover",
+            "config", "scan", "doctor", "move", "organize", "tag", "undo", "recover",
         ] {
             assert!(names.contains(&expected), "missing subcommand `{expected}`");
         }
+    }
+
+    #[test]
+    fn config_show_is_reachable_and_takes_the_global_flags() {
+        let cli = Cli::try_parse_from(["mpdfm", "config", "show", "--json"]).unwrap();
+        assert!(cli.globals.json);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Config {
+                command: ConfigCommand::Show
+            })
+        ));
+    }
+
+    #[test]
+    fn globals_become_the_overrides_resolution_starts_from() {
+        let cli = Cli::try_parse_from([
+            "mpdfm",
+            "--music-dir",
+            "/srv/music",
+            "--config",
+            "~/alt.toml",
+            "--no-mpd",
+            "config",
+            "show",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.globals.overrides(),
+            Overrides {
+                music_dir: Some(Utf8PathBuf::from("/srv/music")),
+                playlist_dir: None,
+                config_file: Some(Utf8PathBuf::from("~/alt.toml")),
+                no_mpd: true,
+            }
+        );
     }
 
     #[test]

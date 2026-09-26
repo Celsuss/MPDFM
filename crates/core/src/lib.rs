@@ -5,6 +5,8 @@
 //! `mpdfm` binary's CLI and TUI) are built on top of it, never the other way
 //! around — see `docs/PLAN.md` §4.
 
+pub mod config;
+pub mod mpdconf;
 pub mod paths;
 
 // The fixture library (task 03). Behind a feature so a release build carries
@@ -32,6 +34,12 @@ pub enum Error {
     /// escaped a configured root.
     #[error(transparent)]
     Path(#[from] paths::PathError),
+
+    /// A configured root directory that is missing or unusable. Raised by
+    /// [`config::Config::require_music_dir`] and its playlist counterpart, at
+    /// the point a command is about to rely on the root.
+    #[error(transparent)]
+    Config(#[from] config::RootProblem),
 
     /// An I/O failure, with the path that caused it.
     #[error("{path}: {source}")]
