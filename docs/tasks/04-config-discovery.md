@@ -2,7 +2,7 @@
 
 - **Phase:** M1 · Trustworthy move engine
 - **Depends on:** 01, 02
-- **Status:** not started
+- **Status:** done
 
 ## Goal
 
@@ -48,15 +48,15 @@ mpd.conf does not exist"), never a hard failure for a missing optional file.
 
 ## Acceptance criteria
 
-- [ ] parses the real `~/.config/mpd/mpd.conf` on this machine and yields
+- [x] parses the real `~/.config/mpd/mpd.conf` on this machine and yields
       `~/Music` and `~/.config/mpd/playlists`
-- [ ] `audio_output { ... }` blocks do not leak keys into the top level
-- [ ] `~` and `$XDG_*` expansion tested
-- [ ] missing mpd.conf, missing mpdfm config, and an unreadable file each
+- [x] `audio_output { ... }` blocks do not leak keys into the top level
+- [x] `~` and `$XDG_*` expansion tested
+- [x] missing mpd.conf, missing mpdfm config, and an unreadable file each
       produce a warning, not an error
-- [ ] CLI flags override config which overrides mpd.conf
-- [ ] `mpdfm config show` (or `scan --json`) prints resolved values and sources
-- [ ] a config with an unknown key warns instead of failing
+- [x] CLI flags override config which overrides mpd.conf
+- [x] `mpdfm config show` (or `scan --json`) prints resolved values and sources
+- [x] a config with an unknown key warns instead of failing
 
 ## Files
 
