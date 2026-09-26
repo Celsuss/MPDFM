@@ -7,6 +7,11 @@
 
 pub mod paths;
 
+// The fixture library (task 03). Behind a feature so a release build carries
+// none of it, and so the embedded audio templates cost nothing in production.
+#[cfg(feature = "testing")]
+pub mod testing;
+
 /// Anything that can go wrong in core.
 ///
 /// Callers match on the variant, so new variants are added rather than folding
