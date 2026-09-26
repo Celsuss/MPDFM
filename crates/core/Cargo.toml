@@ -7,11 +7,25 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# The fixture builder in `src/testing/`. Off in a normal build, so a release
+# binary carries none of it; core's own tests switch it on through the
+# dev-dependency on itself below, which is why `cargo test` needs no extra flag.
+[features]
+testing = ["dep:tempfile", "dep:walkdir"]
+
 # Core stays free of `clap`, `crossterm` and `ratatui` on purpose; the
 # dependency direction is one-way. `tests/manifest_deps.rs` enforces it.
 [dependencies]
 camino.workspace = true
 thiserror.workspace = true
 
+tempfile = { workspace = true, optional = true }
+walkdir = { workspace = true, optional = true }
+
 [dev-dependencies]
+# Depending on ourselves with `testing` on is what makes `mpdfm_core::testing`
+# visible to this crate's own unit and integration tests. Cargo unifies the two
+# resolutions, so the lib is still built once.
+mpdfm-core = { path = ".", features = ["testing"] }
+
 tempfile.workspace = true

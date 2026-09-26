@@ -16,7 +16,7 @@ a CLI that can scan, diagnose, move safely and undo.
 | --- | --- | --- | --- |
 | 01 | [Project scaffold](tasks/01-project-scaffold.md) | — | done |
 | 02 | [`RelPath` and normalization](tasks/02-relpath-and-normalization.md) | 01 | done |
-| 03 | [Test fixture library](tasks/03-test-fixtures.md) | 01, 02 | not started |
+| 03 | [Test fixture library](tasks/03-test-fixtures.md) | 01, 02 | done |
 | 04 | [Config and mpd.conf discovery](tasks/04-config-discovery.md) | 01, 02 | not started |
 | 05 | [Library scanner](tasks/05-library-scanner.md) | 02, 03 | not started |
 | 06 | [Byte-preserving m3u parser](tasks/06-playlist-parser.md) | 02, 03 | not started |
