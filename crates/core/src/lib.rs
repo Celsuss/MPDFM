@@ -6,6 +6,7 @@
 //! around — see `docs/PLAN.md` §4.
 
 pub mod config;
+pub mod library;
 pub mod mpdconf;
 pub mod paths;
 
