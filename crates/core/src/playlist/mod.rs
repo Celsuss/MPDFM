@@ -57,9 +57,11 @@
 //! [`Playlist::real_path`], since only the caller knows the configured roots.
 //! [`crate::paths::contains`] is that check.
 
+mod index;
 mod parse;
 mod write;
 
+pub use index::{IndexWarning, PlaylistIndex, Ref};
 pub use parse::ParseError;
 
 use camino::{Utf8Path, Utf8PathBuf};

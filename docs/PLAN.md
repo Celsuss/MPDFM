@@ -68,9 +68,12 @@ layout              genre at top level: rock/ hiphop/ lofi/ japanese/ electronic
 playlists           17 files, relative paths, no leading "./"
                     Radios.m3u is a SYMLINK to ~/workspace/dotfiles/mpd/playlists/Radios.m3u
                     Radios.m3u contains #EXTM3U, "# comment" lines, #EXTINF:-1,Name and http(s):// URLs
-                    Pop.m3u contains a CUE virtual track, currently broken:
+                    Pop.m3u contains a CUE virtual track, which MPD does not play:
                       "pop/…/Imagine Dragons - Mercury - Acts 1.flac.cue/track0017"
-                    1 broken reference out of 231 total
+                    231 references over 212 distinct paths, and all 231 resolve on
+                    disk — the sheet, its TRACK 17 and that track's FILE all exist
+                    (re-checked in task 07). Whichever way MPD reads a multi-FILE
+                    sheet is task 13's to find out; it is not a missing file.
 filenames           1 023 contain non-ASCII characters; all are valid UTF-8
 ```
 
@@ -259,7 +262,7 @@ that owns each one is named.
 | Case-insensitive collisions (`Artist` vs `artist`) | 08, 27 |
 | ID3v2.3 vs v2.4, and preserving frames MPDFM doesn't model | 17 |
 | A file that is read-only, or a directory without write permission | 08 |
-| Already-broken playlist references (1 exists today) | 07, 29 |
+| Already-broken playlist references (none on disk today; see §3) | 07, 29 |
 | Two playlists referencing the same file | 07, 09 |
 | Very long lists: ~2 800 tracks must scroll without lag | 22 |
 
