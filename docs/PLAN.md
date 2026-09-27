@@ -160,16 +160,20 @@ enum Entry {
     Blank,
     Comment(String),                                   // "# Liquid Drum & Bass"
     ExtM3u,                                            // "#EXTM3U"
-    ExtInf { duration: i64, title: String },           // "#EXTINF:-1,Lofi Radio"
+    ExtInf { duration: i64, title: String, raw: String },  // "#EXTINF:-1,Lofi Radio"
     Url(String),                                       // "http://ice1.somafm.com/…"
     Track { rel: RelPath, cue: Option<String>, raw: String },
+    Unparsed(String),                                  // "/absolute/path.mp3"
 }
 ```
 
 Every variant keeps enough information to be written back **byte-identically**.
 Only `Track` entries whose `rel` exactly matches a moved file are ever rewritten;
 everything else round-trips untouched. `cue` holds the `trackNNNN` suffix of an
-MPD CUE virtual track, so `album.flac.cue/track0017` moves as a unit.
+MPD CUE virtual track, so `album.flac.cue/track0017` moves as a unit. `Unparsed`
+is the line MPDFM has no reading of — an absolute path, a `./` path, a stray
+carriage return — preserved rather than dropped, because dropping a line the user
+wrote is a data-loss bug (task 06).
 
 ### Operations and the two-phase commit
 

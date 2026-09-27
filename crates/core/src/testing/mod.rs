@@ -39,9 +39,11 @@
 //! in `/tmp`.
 
 mod audio;
+mod playlists;
 mod snapshot;
 
 pub use audio::AudioTemplate;
+pub use playlists::{PLAYLIST_TEMPLATES, PlaylistTemplate, playlist_template};
 pub use snapshot::{Entry as SnapshotEntry, EntryKind as SnapshotEntryKind, Snapshot, digest};
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -590,6 +592,27 @@ impl FixtureBuilder {
     #[must_use]
     pub fn playlist_raw(mut self, name: &str, bytes: &[u8]) -> Self {
         self.add_playlist(name, bytes);
+        self
+    }
+
+    /// All seventeen committed playlist fixtures
+    /// ([`PLAYLIST_TEMPLATES`][crate::testing::PLAYLIST_TEMPLATES]), written
+    /// byte-for-byte into the playlist directory.
+    ///
+    /// This is the playlist directory task 06's round-trip property test reads,
+    /// and the one task 07 indexes: the same count and the same shapes as the
+    /// real `~/.config/mpd/playlists`, including a `.m3u8`, CRLF, a BOM, a file
+    /// with no trailing newline and an empty file.
+    ///
+    /// Their track lines use the same paths as [`names`], but no audio is created
+    /// for them — a test that needs the files to exist as well should build the
+    /// albums it cares about too. They overwrite any playlist of the same name,
+    /// so call this before [`FixtureBuilder::symlinked_playlist`], not after.
+    #[must_use]
+    pub fn real_playlists(mut self) -> Self {
+        for template in PLAYLIST_TEMPLATES {
+            self.add_playlist(template.name, template.bytes);
+        }
         self
     }
 
