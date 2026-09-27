@@ -9,6 +9,7 @@ pub mod config;
 pub mod library;
 pub mod mpdconf;
 pub mod paths;
+pub mod playlist;
 
 // The fixture library (task 03). Behind a feature so a release build carries
 // none of it, and so the embedded audio templates cost nothing in production.
@@ -41,6 +42,10 @@ pub enum Error {
     /// the point a command is about to rely on the root.
     #[error(transparent)]
     Config(#[from] config::RootProblem),
+
+    /// A playlist whose bytes could not be read as UTF-8.
+    #[error(transparent)]
+    Playlist(#[from] playlist::ParseError),
 
     /// An I/O failure, with the path that caused it.
     #[error("{path}: {source}")]

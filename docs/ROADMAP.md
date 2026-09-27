@@ -19,7 +19,7 @@ a CLI that can scan, diagnose, move safely and undo.
 | 03 | [Test fixture library](tasks/03-test-fixtures.md) | 01, 02 | done |
 | 04 | [Config and mpd.conf discovery](tasks/04-config-discovery.md) | 01, 02 | done |
 | 05 | [Library scanner](tasks/05-library-scanner.md) | 02, 03 | done |
-| 06 | [Byte-preserving m3u parser](tasks/06-playlist-parser.md) | 02, 03 | not started |
+| 06 | [Byte-preserving m3u parser](tasks/06-playlist-parser.md) | 02, 03 | done |
 | 07 | [Playlist index](tasks/07-playlist-index.md) | 06 | not started |
 | 08 | [Filesystem move executor](tasks/08-move-executor.md) | 02, 05 | not started |
 | 09 | [Playlist rewriting](tasks/09-playlist-rewrite.md) | 06, 07, 08 | not started |

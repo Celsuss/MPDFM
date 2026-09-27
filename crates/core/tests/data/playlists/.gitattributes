@@ -1,0 +1,4 @@
+# These files exist to be compared byte for byte. Git must never translate a
+# line ending, strip a BOM or add a trailing newline on checkout or commit,
+# whatever the checkout machine's `core.autocrlf` says.
+* -text
