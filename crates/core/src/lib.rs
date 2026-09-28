@@ -8,6 +8,7 @@
 pub mod config;
 pub mod library;
 pub mod mpdconf;
+pub mod ops;
 pub mod paths;
 pub mod playlist;
 
@@ -46,6 +47,10 @@ pub enum Error {
     /// A playlist whose bytes could not be read as UTF-8.
     #[error(transparent)]
     Playlist(#[from] playlist::ParseError),
+
+    /// A filesystem step that could not be executed, or could not be reversed.
+    #[error(transparent)]
+    Fs(#[from] ops::exec_fs::FsError),
 
     /// An I/O failure, with the path that caused it.
     #[error("{path}: {source}")]
