@@ -100,6 +100,7 @@ MPDFM/
 │       │   ├── write.rs          TagSet → file, preserving unknown frames
 │       │   └── bulk.rs           multi-file common/<multiple> semantics
 │       ├── ops/
+│       │   ├── exec_fs.rs        one filesystem step at a time, each reversible
 │       │   ├── op.rs             Operation enum
 │       │   ├── plan.rs           Plan, validate() → Effects (the preview)
 │       │   └── exec.rs           commit(), two-phase with journal
