@@ -154,7 +154,11 @@ fn split_lines(text: &str, line_ending: LineEnding) -> impl Iterator<Item = &str
 }
 
 /// Read one line. See the table in the [module docs][self].
-fn classify(line: &str) -> Entry {
+///
+/// `pub(super)` for `rewrite`, which turns a [`LineEdit`][super::rewrite::LineEdit]'s
+/// replacement text back into a typed [`Entry`] — so a rewritten line is read by
+/// exactly the code that read the line it replaces.
+pub(super) fn classify(line: &str) -> Entry {
     if line.is_empty() {
         return Entry::Blank;
     }

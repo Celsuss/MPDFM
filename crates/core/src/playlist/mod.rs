@@ -59,6 +59,7 @@
 
 mod index;
 mod parse;
+pub mod rewrite;
 mod write;
 
 pub use index::{IndexWarning, PlaylistIndex, Ref};

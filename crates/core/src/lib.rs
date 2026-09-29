@@ -52,6 +52,11 @@ pub enum Error {
     #[error(transparent)]
     Fs(#[from] ops::exec_fs::FsError),
 
+    /// A playlist edit that no longer matches the file it was planned against,
+    /// or a backup that could not be taken.
+    #[error(transparent)]
+    Rewrite(#[from] playlist::rewrite::RewriteError),
+
     /// An I/O failure, with the path that caused it.
     #[error("{path}: {source}")]
     Io {
