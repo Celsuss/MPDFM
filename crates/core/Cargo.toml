@@ -17,6 +17,7 @@ testing = ["dep:tempfile"]
 # dependency direction is one-way. `tests/manifest_deps.rs` enforces it.
 [dependencies]
 camino.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 walkdir.workspace = true
@@ -29,4 +30,6 @@ tempfile = { workspace = true, optional = true }
 # resolutions, so the lib is still built once.
 mpdfm-core = { path = ".", features = ["testing"] }
 
+insta.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true

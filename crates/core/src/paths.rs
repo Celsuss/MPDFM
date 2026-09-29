@@ -118,7 +118,10 @@ pub enum PathError {
 ///
 /// Ordering and hashing are byte-wise over that canonical form, which is what
 /// makes it usable as the key of the playlist index (task 07).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
 pub struct RelPath(Utf8PathBuf);
 
 impl RelPath {

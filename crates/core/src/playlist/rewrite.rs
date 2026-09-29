@@ -92,7 +92,7 @@ use crate::{Error, Result};
 /// removes a line instead of changing one — but it selects its lines by the same
 /// exact match, so it belongs in the same list rather than in a parallel one
 /// that could fall out of step with it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PathMove {
     /// The path the playlists name today.
     pub from: RelPath,
@@ -130,7 +130,7 @@ impl PathMove {
 /// journal, and applied some time later — possibly after a crash and a restart —
 /// and "line 7 of Pop.m3u" on its own is not enough to be sure it still names
 /// what it named when the plan was made.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LineEdit {
     /// 0-based index into the playlist's [`Playlist::entries`]. Add one before
     /// showing it to a user.
@@ -150,7 +150,7 @@ impl LineEdit {
 }
 
 /// Every line to change in one playlist.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlaylistEdit {
     /// Index into [`PlaylistIndex::playlists`] of the index this was planned
     /// against. Only meaningful to that index — it is rebuilt after every

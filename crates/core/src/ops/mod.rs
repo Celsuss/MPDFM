@@ -1,14 +1,58 @@
 //! Operations: the layer between "the user asked for this" and "the disk changed".
 //!
-//! [`exec_fs`] is the bottom of it — one filesystem change at a time, each with a
-//! receipt that is enough to put it back. The layers above arrive with their own
-//! tasks: the `Operation` enum and the pure `Plan::validate` that expands a
-//! directory move into [`exec_fs::FsStep`]s and reports conflicts before anything
-//! is touched (task 10), and the journaled two-phase `commit` that executes them
-//! (task 11).
+//! Three levels, each one expansion away from the next:
 //!
-//! The split is deliberate. `exec_fs` knows how to move one file correctly and
-//! nothing about transactions; the journal knows about transactions and nothing
-//! about `EXDEV`. Neither can quietly grow the other's bugs.
+//! | | | |
+//! |---|---|---|
+//! | [`Operation`] | what the user asked for | "move this album there" |
+//! | [`FsStep`][exec_fs::FsStep] | one filesystem change | "rename this file" |
+//! | [`StepReceipt`][exec_fs::StepReceipt] | what that change did | "and here is how to put it back" |
+//!
+//! [`Plan::validate`] does the first expansion, purely: it produces [`Effects`],
+//! which holds every step, every playlist line and every reason the whole thing
+//! might be refused, and writes nothing. Task 11's journaled commit does the
+//! second, one step at a time, keeping the receipts. Task 12 walks the receipts
+//! backwards.
+//!
+//! The split is deliberate. [`exec_fs`] knows how to move one file correctly and
+//! nothing about transactions; [`plan`] knows about ordering a whole plan and
+//! nothing about `EXDEV`; the journal will know about crashes and nothing about
+//! either. None of them can quietly grow another's bugs.
+//!
+//! ```no_run
+//! use mpdfm_core::library::Library;
+//! use mpdfm_core::ops::{Operation, Plan};
+//! use mpdfm_core::paths::RelPath;
+//! use mpdfm_core::playlist::PlaylistIndex;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let (config, _warnings) = mpdfm_core::config::resolve(&Default::default(),
+//!                                                       &mpdfm_core::config::Env::from_process());
+//! let library = Library::scan(config.require_music_dir()?)?;
+//! let (index, _) = PlaylistIndex::load(&config.playlist_dir);
+//!
+//! let plan = Plan::of(vec![Operation::MoveDir {
+//!     from: RelPath::parse("hiphop/MF DOOM - Mm..Food (2004)")?,
+//!     to: RelPath::parse("hiphop/MF DOOM/Mm..Food (2004)")?,
+//! }]);
+//!
+//! // Nothing has been touched yet, and nothing will be until this is shown to
+//! // someone who says yes.
+//! let effects = plan.validate(&library, &index, &config);
+//! println!("{}", effects.render(80));
+//!
+//! if effects.is_committable() {
+//!     // Task 11 takes `effects.fs_steps` and `effects.playlist_edits` from here.
+//! }
+//! # Ok(())
+//! # }
+//! ```
 
+pub mod effects;
 pub mod exec_fs;
+pub mod op;
+pub mod plan;
+pub mod render;
+
+pub use effects::{Conflict, Effects, OpEffect, Summary, Warning};
+pub use op::{Operation, Plan};

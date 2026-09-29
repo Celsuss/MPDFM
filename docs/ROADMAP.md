@@ -23,7 +23,7 @@ a CLI that can scan, diagnose, move safely and undo.
 | 07 | [Playlist index](tasks/07-playlist-index.md) | 06 | done |
 | 08 | [Filesystem move executor](tasks/08-move-executor.md) | 02, 05 | done |
 | 09 | [Playlist rewriting](tasks/09-playlist-rewrite.md) | 06, 07, 08 | done |
-| 10 | [Plan, validation and preview](tasks/10-plan-and-preview.md) | 05, 07, 08, 09 | not started |
+| 10 | [Plan, validation and preview](tasks/10-plan-and-preview.md) | 05, 07, 08, 09 | done |
 | 11 | [Two-phase commit and journal](tasks/11-journal-and-commit.md) | 08, 09, 10 | not started |
 | 12 | [Undo and recover](tasks/12-undo-and-recover.md) | 11 | not started |
 | 13 | [Minimal MPD client](tasks/13-mpd-client.md) | 04 | not started |
@@ -119,8 +119,10 @@ one of the large ones (08, 10, 11, 22, 27).
 
 ## Open questions to revisit
 
-- Chained moves (`a → b`, `b → c`) in one plan: order them or reject them?
-  Decide in task 10 and record the choice there.
+- ~~Chained moves (`a → b`, `b → c`) in one plan: order them or reject them?~~
+  **Decided in task 10: ordered.** They are topologically sorted; a ring is a
+  `Conflict::Cycle`; every operation's source must exist in the library as it is
+  now, which removes the two-hop reading. Rationale in `ops::plan`'s module docs.
 - FLAC multi-valued fields: `Vec<String>` throughout, or join-and-remember?
   Decide in task 16; it affects the tag editor UI.
 - How much of `--deep` duplicate detection is worth it on a 2 800-file library

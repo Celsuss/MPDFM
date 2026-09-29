@@ -104,7 +104,7 @@ use crate::paths::{self, PathError, RelPath};
 /// after `music_directory` has been moved or renamed — the journal records the
 /// root separately. The one absolute path is a backup destination, which lives in
 /// MPDFM's own data directory and not in the library at all.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FsStep {
     /// Create `at` and any missing directory above it.
     ///

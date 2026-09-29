@@ -207,7 +207,19 @@ impl std::fmt::Display for Kind {
 /// assert!(DirPath::of(&stray).is_root());
 /// # Ok::<(), mpdfm_core::paths::PathError>(())
 /// ```
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(transparent)]
 pub struct DirPath(Option<RelPath>);
 
 impl DirPath {

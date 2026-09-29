@@ -48,6 +48,11 @@ pub use snapshot::{Entry as SnapshotEntry, EntryKind as SnapshotEntryKind, Snaps
 
 use camino::{Utf8Path, Utf8PathBuf};
 
+use crate::config::{
+    Config, DEFAULT_BACKUP_KEEP, DEFAULT_MPD_PORT, DEFAULT_ORGANIZE_TEMPLATE, MpdAddress, Source,
+    Sources,
+};
+
 use crate::paths::{self, RelPath};
 
 /// Where the fixture puts each of the four roots MPDFM knows about, relative to
@@ -269,6 +274,49 @@ impl Fixture {
     #[must_use]
     pub fn data_dir(&self) -> &Utf8Path {
         &self.data_dir
+    }
+
+    /// A [`Config`] whose four roots are this fixture's, with everything else at
+    /// its built-in default and deletion **enabled**.
+    ///
+    /// Built directly rather than through [`config::resolve`][crate::config::resolve],
+    /// which is task 04's own subject: a planner test that has to arrange an
+    /// `mpd.conf` and four environment variables to get a `music_directory` is a
+    /// test about configuration discovery, not about planning. Every source reads
+    /// as [`Source::Default`] for the same reason — nothing here came from a
+    /// file the user wrote.
+    ///
+    /// Deletion is on because the interesting delete tests are the ones where it
+    /// happens; a test about `delete_enabled = false` sets the field back.
+    #[must_use]
+    pub fn config(&self) -> Config {
+        Config {
+            music_dir: self.music_dir.clone(),
+            playlist_dir: self.playlist_dir.clone(),
+            data_dir: self.data_dir.clone(),
+            state_file: Some(self.state_file.clone()),
+            mpd_address: MpdAddress::parse("127.0.0.1", DEFAULT_MPD_PORT)
+                .expect("the default address parses"),
+            mpd_enabled: false,
+            rewrite_saved_queue: true,
+            trigger_update_after_commit: false,
+            delete_enabled: true,
+            backup_keep: DEFAULT_BACKUP_KEEP,
+            organize_template: DEFAULT_ORGANIZE_TEMPLATE.to_owned(),
+            sources: Sources {
+                music_dir: Source::Default,
+                playlist_dir: Source::Default,
+                data_dir: Source::Default,
+                state_file: Source::Default,
+                mpd_address: Source::Default,
+                mpd_enabled: Source::Default,
+                rewrite_saved_queue: Source::Default,
+                trigger_update_after_commit: Source::Default,
+                delete_enabled: Source::Default,
+                backup_keep: Source::Default,
+                organize_template: Source::Default,
+            },
+        }
     }
 
     /// The absolute path of something inside the music directory.

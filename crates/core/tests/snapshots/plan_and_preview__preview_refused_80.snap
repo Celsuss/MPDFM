@@ -1,0 +1,19 @@
+---
+source: crates/core/tests/plan_and_preview.rs
+expression: effects.render(80)
+---
+REFUSED (2 ops, 2 conflicts)
+MOVE   …04) [V0] scene-tag/01 Beef Rap.mp3 → …320] vtwin88cube/01.Smokin' On.mp3
+        1 audio file, 1.5 kB, 2 playlists, REFUSED
+MOVE   hiphop/never existed.mp3 → hiphop/somewhere.mp3
+        no files, REFUSED
+
+Conflicts (2)
+x operation 0: hiphop/Snoop Dogg & Wiz Khalifa - Mac …kin' On.mp3 already exists
+x operation 1: hiphop/never existed.mp3 is not in the library
+
+Playlists
+  Hip hop.m3u 1 line rewritten
+  MF Doom.m3u 1 line rewritten
+
+! hiphop/MF DOOM - Mm..Food (2004) [V0] scene-tag wil…t: 1 of 3 tracks move away

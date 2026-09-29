@@ -1,0 +1,16 @@
+---
+source: crates/core/tests/plan_and_preview.rs
+expression: effects.render(120)
+---
+PENDING (2 ops)
+MOVE   hiphop/MF DOOM - Mm..Food (2004) [V0] scene-tag → hiphop/MF DOOM/Mm..Food (2004)
+        3 audio + 5 aux files, 4.8 kB, 2 playlists
+DELETE …Snoop Dogg & Wiz Khalifa - Mac + Devin Go To High School (Soundtrack) (2011) [320] vtwin88cube/01.Smokin' On.mp3
+        1 audio file, 1.5 kB, 1 playlist
+
+Playlists
+  Hip hop.m3u 1 line rewritten, 1 line removed
+  MF Doom.m3u 1 line rewritten
+
+! Hip hop.m3u: 1 line(s) will be removed, not rewritten
+! hiphop/Snoop Dogg & Wiz Khalifa - Mac + Devin Go To High School (Soundtrack) (… will be split: 1 of 2 tracks move away

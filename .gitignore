@@ -3,3 +3,6 @@
 
 # insta review leftovers
 **/*.snap.new
+
+# Ralph loop session bookkeeping
+.claude/ralph-loop.local.md

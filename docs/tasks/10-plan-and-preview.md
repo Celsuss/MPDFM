@@ -2,7 +2,7 @@
 
 - **Phase:** M1 · Trustworthy move engine
 - **Depends on:** 05, 07, 08, 09
-- **Status:** not started
+- **Status:** done
 
 ## Goal
 
@@ -75,20 +75,56 @@ before a later op depends on the result.
 
 ## Acceptance criteria
 
-- [ ] `validate` performs zero filesystem writes (assert via a fixture snapshot
+- [x] `validate` performs zero filesystem writes (assert via a fixture snapshot
       before/after)
-- [ ] a directory move expands into the right per-file steps including aux files
-- [ ] every conflict class above has a test and blocks `commit`
-- [ ] every warning class above has a test and does not block `commit`
-- [ ] two ops targeting the same destination is a conflict
-- [ ] a chain (`a → b`, `b → c`) is either ordered correctly or reported as a
+- [x] a directory move expands into the right per-file steps including aux files
+- [x] every conflict class above has a test and blocks `commit`
+- [x] every warning class above has a test and does not block `commit`
+- [x] two ops targeting the same destination is a conflict
+- [x] a chain (`a → b`, `b → c`) is either ordered correctly or reported as a
       conflict — decide and document which
-- [ ] `render` output is snapshot-tested (`insta`) at 80 and 120 columns
-- [ ] `Summary` counts match what `commit` actually does (property test)
+- [x] `render` output is snapshot-tested (`insta`) at 80 and 120 columns
+- [x] `Summary` counts match what `commit` actually does — six plan shapes
+      (album, single track, delete, delete + move, one disc of a set, two albums)
+      each committed for real and compared. Table-driven rather than generated:
+      no property-testing crate is in the workspace, and adding one to assert
+      four equalities was not worth the dependency. Revisit in task 11 if the
+      journal wants generated crash points.
+
+## Decisions taken here
+
+**Chained moves are ordered, not rejected** (the roadmap's open question).
+`validate` topologically sorts the operations over the edges "X vacates Y's
+destination, so X runs first", ties broken by the order the user staged them in.
+A ring — a swap — has no such order and is `Conflict::Cycle`. The ambiguity in
+`a → b, b → c` is removed by one rule: **every operation's source must exist in
+the library as it is now**, so the pair means "two distinct things change places"
+and never "move `a` to `b`, then move that on to `c`"; the latter reading is a
+`SourceMissing` conflict, and someone who wants it stages `a → c`. The reasoning
+is in `ops::plan`'s module docs — a reorganization produces chains constantly,
+and refusing them would push the user into committing twice.
+
+**`Operation::WriteTags` is not in the enum yet.** It needs `TagDelta`, which M2
+defines (tasks 16–18, and the multi-valued FLAC field question is still open). A
+placeholder now would be a guess that tasks 16–18 then have to unpick. The
+preview's `TAG` row arrives with it; nothing else in this task depends on it.
+
+**`Effects` derives `serde`.** The pitfall below asks for it to stay
+serializable; it is simpler to keep that true by having the compiler check it.
+`RelPath`, `DirPath`, `FsStep`, `PathMove`, `LineEdit` and `PlaylistEdit` gained
+derives to make it possible, which is also what the journal (task 11) and
+`--json` (task 15) need.
+
+**`Fixture::config()` was added** (task 03's fixture library). Every task from
+here on needs a `Config` pointed at a fixture, and arranging an `mpd.conf` and
+four environment variables to get one makes a planner test into a test about
+configuration discovery.
 
 ## Files
 
 `crates/core/src/ops/{op.rs,plan.rs,effects.rs,render.rs}`
+`crates/core/tests/plan_and_preview.rs`
+`crates/core/tests/snapshots/plan_and_preview__preview_{80,120,refused_80}.snap`
 
 ## Pitfalls
 
