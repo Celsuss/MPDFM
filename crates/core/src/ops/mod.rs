@@ -10,14 +10,14 @@
 //!
 //! [`Plan::validate`] does the first expansion, purely: it produces [`Effects`],
 //! which holds every step, every playlist line and every reason the whole thing
-//! might be refused, and writes nothing. Task 11's journaled commit does the
-//! second, one step at a time, keeping the receipts. Task 12 walks the receipts
-//! backwards.
+//! might be refused, and writes nothing. [`commit`] does the second, one journaled
+//! step at a time, keeping the receipts. Task 12 walks the receipts backwards.
 //!
 //! The split is deliberate. [`exec_fs`] knows how to move one file correctly and
 //! nothing about transactions; [`plan`] knows about ordering a whole plan and
-//! nothing about `EXDEV`; the journal will know about crashes and nothing about
-//! either. None of them can quietly grow another's bugs.
+//! nothing about `EXDEV`; [`commit`] and the [`journal`][crate::journal] know
+//! about crashes and nothing about either. None of them can quietly grow another's
+//! bugs.
 //!
 //! ```no_run
 //! use mpdfm_core::library::Library;
@@ -42,17 +42,19 @@
 //! println!("{}", effects.render(80));
 //!
 //! if effects.is_committable() {
-//!     // Task 11 takes `effects.fs_steps` and `effects.playlist_edits` from here.
+//!     // `commit::commit` takes it from here — see that module's example.
 //! }
 //! # Ok(())
 //! # }
 //! ```
 
+pub mod commit;
 pub mod effects;
 pub mod exec_fs;
 pub mod op;
 pub mod plan;
 pub mod render;
 
+pub use commit::{CommitError, CommitWarning, Committed, Previewed};
 pub use effects::{Conflict, Effects, OpEffect, Summary, Warning};
 pub use op::{Operation, Plan};

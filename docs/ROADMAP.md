@@ -24,7 +24,7 @@ a CLI that can scan, diagnose, move safely and undo.
 | 08 | [Filesystem move executor](tasks/08-move-executor.md) | 02, 05 | done |
 | 09 | [Playlist rewriting](tasks/09-playlist-rewrite.md) | 06, 07, 08 | done |
 | 10 | [Plan, validation and preview](tasks/10-plan-and-preview.md) | 05, 07, 08, 09 | done |
-| 11 | [Two-phase commit and journal](tasks/11-journal-and-commit.md) | 08, 09, 10 | not started |
+| 11 | [Two-phase commit and journal](tasks/11-journal-and-commit.md) | 08, 09, 10 | done |
 | 12 | [Undo and recover](tasks/12-undo-and-recover.md) | 11 | not started |
 | 13 | [Minimal MPD client](tasks/13-mpd-client.md) | 04 | not started |
 | 14 | [MPD saved-queue rewriting](tasks/14-mpd-state-queue.md) | 06, 11, 13 | not started |
@@ -123,6 +123,11 @@ one of the large ones (08, 10, 11, 22, 27).
   **Decided in task 10: ordered.** They are topologically sorted; a ring is a
   `Conflict::Cycle`; every operation's source must exist in the library as it is
   now, which removes the two-hop reading. Rationale in `ops::plan`'s module docs.
+- ~~Journal flush: after every step, or in small batches?~~ **Decided in task 11:
+  after every step, appended to a second file.** Rewriting the whole record each
+  time is quadratic (115 s extrapolated for the 4 500 steps a real whole-library
+  reorganization produces); one appended line per step is flat and keeps the
+  invariant batching would have broken. Measurements in task 11's decisions.
 - FLAC multi-valued fields: `Vec<String>` throughout, or join-and-remember?
   Decide in task 16; it affects the tag editor UI.
 - How much of `--deep` duplicate detection is worth it on a 2 800-file library

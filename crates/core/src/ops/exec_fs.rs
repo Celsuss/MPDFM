@@ -85,10 +85,11 @@
 //! # What this module does not do
 //!
 //! No transaction, no journal, no ordering. [`execute_with`] takes one step,
-//! does it, and hands back a receipt; deciding the order of steps and making the
-//! record durable before the first one runs belongs to tasks 10 and 11. Calling
-//! [`execute_with`] outside a `commit` violates safety invariant 1 — which is
-//! why the tests here are the only caller until task 11 exists.
+//! does it, and hands back a receipt; deciding the order of steps belongs to
+//! [`plan`][super::plan] and making the record durable before the first one runs
+//! to [`commit`][super::commit]. Calling [`execute_with`] anywhere but from a
+//! commit violates safety invariant 1, so the only callers are that module and
+//! the tests here.
 
 use std::io::Read as _;
 use std::time::SystemTime;
@@ -267,7 +268,11 @@ pub enum Inject {
 
 /// What one [`FsStep`] actually did — enough to undo it, and enough for task 12
 /// to check first whether undoing it is still safe.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable because the journal is the only thing that survives a crash
+/// (task 11): a receipt that could not be written down would make the step it
+/// describes irreversible the moment the process died.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StepReceipt {
     /// The step as it was asked for.
     pub step: FsStep,
@@ -279,7 +284,7 @@ pub struct StepReceipt {
 }
 
 /// The outcome of a step, in the shape its own reversal needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Done {
     /// [`FsStep::MkDir`]: the directories created, outermost first. Empty when
     /// everything was already there, in which case there is nothing to undo.
@@ -316,7 +321,7 @@ pub enum Done {
 }
 
 /// How an entry got from one path to another.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Method {
     /// `rename`, which is atomic and keeps the inode, the mode and the mtime.
     /// A case-only rename is two renames through a temp name, and still this.
@@ -334,11 +339,12 @@ pub enum Method {
 /// This is what task 12 compares against before reversing a step: a destination
 /// whose size or mtime no longer matches was changed by someone else after the
 /// commit, and undoing it blindly would throw that change away.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Facts {
     /// Length in bytes.
     pub size: u64,
     /// Last modification time, or `None` if the filesystem would not say.
+    #[serde(with = "epoch", default)]
     pub mtime: Option<SystemTime>,
     /// Permission bits, on unix.
     pub mode: Option<u32>,
@@ -348,9 +354,77 @@ pub struct Facts {
     pub hash: Option<u64>,
 }
 
+/// [`Facts::mtime`] on the way into and out of a journal record.
+///
+/// `serde`'s own `SystemTime` representation refuses any time before 1970, which
+/// a file on disk is allowed to have — `touch -d 1969` is not an error — and a
+/// commit that could not journal such a file would be unable to move it. Whole
+/// seconds plus nanoseconds, signed, so every representable mtime round-trips.
+mod epoch {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use serde::{Deserialize as _, Deserializer, Serialize as _, Serializer};
+
+    /// Seconds and nanoseconds since the epoch, as the journal spells them.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Stamp {
+        /// Whole seconds, negative before 1970.
+        secs: i64,
+        /// Nanoseconds after `secs`, always forwards in time.
+        nanos: u32,
+    }
+
+    /// Write `None` as `null`, and a time as its two numbers.
+    pub(super) fn serialize<S: Serializer>(
+        mtime: &Option<SystemTime>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let stamp = mtime.map(|mtime| match mtime.duration_since(UNIX_EPOCH) {
+            Ok(since) => Stamp {
+                secs: i64::try_from(since.as_secs()).unwrap_or(i64::MAX),
+                nanos: since.subsec_nanos(),
+            },
+            // Before the epoch: `before` is how far back, so the whole second it
+            // falls inside is one earlier whenever there is a remainder.
+            Err(err) => {
+                let before = err.duration();
+                let secs = i64::try_from(before.as_secs()).unwrap_or(i64::MAX);
+                match before.subsec_nanos() {
+                    0 => Stamp {
+                        secs: -secs,
+                        nanos: 0,
+                    },
+                    nanos => Stamp {
+                        secs: -secs - 1,
+                        nanos: 1_000_000_000 - nanos,
+                    },
+                }
+            }
+        });
+        stamp.serialize(serializer)
+    }
+
+    /// Read back what [`serialize`] wrote.
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<SystemTime>, D::Error> {
+        let Some(stamp) = Option::<Stamp>::deserialize(deserializer)? else {
+            return Ok(None);
+        };
+        let nanos = Duration::new(0, stamp.nanos);
+        Ok(Some(match u64::try_from(stamp.secs) {
+            Ok(secs) => UNIX_EPOCH + Duration::from_secs(secs) + nanos,
+            Err(_) => {
+                let before = Duration::from_secs(stamp.secs.unsigned_abs());
+                UNIX_EPOCH - before + nanos
+            }
+        }))
+    }
+}
+
 /// A directory [`FsStep::RmDirIfEmpty`] removed, with the mode to recreate it
 /// with.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RemovedDir {
     /// Where it was.
     pub at: RelPath,
@@ -361,7 +435,7 @@ pub struct RemovedDir {
 // ---------------------------------------------------------------------------
 
 /// Something worth telling the user that did not stop the step.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FsWarning {
     /// The destination differs only by case from something already in that
     /// directory. On ext4 these are two entries and the move is fine; on a

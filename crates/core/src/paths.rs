@@ -31,7 +31,10 @@ use camino::{Utf8Path, Utf8PathBuf};
 /// Callers match on the variant — the scanner turns [`PathError::NotUtf8`] into
 /// a warning and skips the file, while the playlist parser treats any rejection
 /// as "this line is not a track" and preserves it byte-for-byte.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+// Serializable because a rejected name travels into the journal inside
+// `ops::exec_fs::FsWarning::Unnamable`, and a record has to read back as what was
+// written.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize)]
 pub enum PathError {
     /// The empty string, which names nothing.
     #[error("empty path")]

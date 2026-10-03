@@ -204,9 +204,12 @@ Effects {
 `commit()` is deliberately two-phase so that a crash mid-operation is
 recoverable:
 
-1. Write journal record with status `pending`, including every backup path.
-2. Copy affected playlists (and the state file) into
+1. Copy affected playlists (and the state file) into
    `~/.local/share/mpdfm/backups/<txid>/`.
+2. Write journal record with status `pending`, including every backup path. (This
+   way round: a crash between the two leaves an orphan backup directory, which is
+   garbage, where the other order would leave a record naming backups that are not
+   there, which `undo` would believe. Task 11.)
 3. Execute filesystem operations in order, appending each completed step to the
    journal.
 4. Rewrite playlists and the state file atomically (temp file + `rename` in the
@@ -275,6 +278,7 @@ that owns each one is named.
 ~/.config/mpdfm/config.toml          settings; music_dir/playlist_dir override mpd.conf
 ~/.config/mpdfm/keys.toml            keymap
 ~/.local/share/mpdfm/journal/*.json  one record per transaction
+~/.local/share/mpdfm/journal/*.steps what each step did, appended as it happens
 ~/.local/share/mpdfm/backups/<txid>/ playlist + state file copies
 ~/.cache/mpdfm/scan.json             optional scan cache (only if scanning proves slow)
 ```

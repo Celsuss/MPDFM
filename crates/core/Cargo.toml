@@ -18,6 +18,11 @@ testing = ["dep:tempfile"]
 [dependencies]
 camino.workspace = true
 serde.workspace = true
+# The journal is JSON on disk (task 11, `docs/PLAN.md` §7): one record per
+# transaction, read back after a crash by a build that may be newer than the one
+# that wrote it. `serde_json::Value` is also what holds a future version's
+# unknown fields so that writing a record back cannot drop them.
+serde_json.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 walkdir.workspace = true
@@ -31,5 +36,4 @@ tempfile = { workspace = true, optional = true }
 mpdfm-core = { path = ".", features = ["testing"] }
 
 insta.workspace = true
-serde_json.workspace = true
 tempfile.workspace = true

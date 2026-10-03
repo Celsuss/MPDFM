@@ -6,6 +6,7 @@
 //! around — see `docs/PLAN.md` §4.
 
 pub mod config;
+pub mod journal;
 pub mod library;
 pub mod mpdconf;
 pub mod ops;
@@ -56,6 +57,14 @@ pub enum Error {
     /// or a backup that could not be taken.
     #[error(transparent)]
     Rewrite(#[from] playlist::rewrite::RewriteError),
+
+    /// A journal record that could not be written, read or understood.
+    #[error(transparent)]
+    Journal(#[from] journal::JournalError),
+
+    /// A transaction that was refused, or that stopped partway through.
+    #[error(transparent)]
+    Commit(#[from] ops::commit::CommitError),
 
     /// An I/O failure, with the path that caused it.
     #[error("{path}: {source}")]

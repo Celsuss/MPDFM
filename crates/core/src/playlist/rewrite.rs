@@ -60,7 +60,9 @@
 //!
 //! # Backup first, then write
 //!
-//! [`apply`] runs in three passes, and the order is the point:
+//! [`apply`] runs in three passes, and the order is the point ([`prepare`] and
+//! [`Prepared`] are the same three, separately, for a caller that has to make a
+//! journal record durable between the second and the third):
 //!
 //! 1. read and verify every affected playlist, and compute its new bytes.
 //!    Nothing is written, so an edit that no longer matches the file fails with
@@ -73,9 +75,9 @@
 //!
 //! A failure in pass 3 leaves the playlists before it written and the ones after
 //! it untouched, and every one of the five has a backup — so [`restore`] puts
-//! the whole set back regardless of where it stopped. Task 11 owns the journal
-//! that records which pass was reached; this module owns being safe to resume
-//! from either side of it.
+//! the whole set back regardless of where it stopped.
+//! [`ops::commit`][crate::ops::commit] owns the journal that records which pass was
+//! reached; this module owns being safe to resume from either side of it.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -438,38 +440,129 @@ pub fn apply(edits: &[PlaylistEdit], backup_dir: &Utf8Path) -> Result<()> {
 ///
 /// As [`apply`], plus [`RewriteError::Injected`] when `inject` fires.
 pub fn apply_with(edits: &[PlaylistEdit], backup_dir: &Utf8Path, inject: Inject) -> Result<()> {
-    // Pass 1: read, verify, compute. Nothing is written, so a stale edit — or a
-    // playlist that has stopped being UTF-8 — costs nothing.
+    let prepared = prepare(edits)?;
+    prepared.back_up(backup_dir)?;
+    prepared.write_with(inject)
+}
+
+/// Pass 1 on its own: read every affected playlist, check every line against
+/// the plan, and work out the bytes to write — **without writing any of them**.
+///
+/// [`apply`] is this followed by [`Prepared::back_up`] and [`Prepared::write`],
+/// and is what a caller that owns no journal should use. The commit (task 11)
+/// needs the three passes separately, because its journal record has to become
+/// durable *between* the backups and the write, and because a stale playlist must
+/// stop the transaction before the first file is moved rather than after.
+///
+/// # Errors
+///
+/// [`Error::Rewrite`] for an edit whose line no longer reads as the plan saw it,
+/// [`Error::Playlist`] for a playlist whose bytes are not UTF-8, and
+/// [`Error::Io`] if one cannot be read.
+pub fn prepare(edits: &[PlaylistEdit]) -> Result<Prepared<'_>> {
     let mut pending = Vec::with_capacity(edits.len());
     for edit in edits {
         let original = read(&edit.real_path)?;
         let playlist = Playlist::from_bytes(&edit.real_path, &original)?;
         let updated = rewritten(&playlist, edit)?.to_bytes();
-        pending.push((edit, original, updated));
+        pending.push(Pending {
+            edit,
+            original,
+            updated,
+        });
     }
+    Ok(Prepared { pending })
+}
 
-    // Pass 2: every backup, before the first modification.
-    std::fs::create_dir_all(backup_dir).map_err(|source| Error::Io {
-        path: backup_dir.to_string(),
-        source,
-    })?;
-    for (edit, original, _) in &pending {
-        back_up(backup_dir, &edit.file_name, original)?;
-    }
-    sync_dir(backup_dir);
+/// One playlist, as [`prepare`] left it.
+#[derive(Debug)]
+struct Pending<'a> {
+    /// The edit it came from.
+    edit: &'a PlaylistEdit,
+    /// Its bytes now, which is what the backup holds.
+    original: Vec<u8>,
+    /// Its bytes afterwards.
+    updated: Vec<u8>,
+}
 
-    // Pass 3: write. Each one is atomic on its own; the set is not, which is
-    // what the backups and the journal are for.
-    for (position, (edit, _, updated)) in pending.iter().enumerate() {
-        if inject == Inject::FailBeforeWriting(position) {
-            return Err(RewriteError::Injected {
-                playlist: edit.real_path.clone(),
-            }
-            .into());
+/// Verified edits, with the bytes to write already computed: everything
+/// [`apply`] does after its first pass, as two steps a commit can journal
+/// between.
+///
+/// Holding the bytes rather than re-reading them is deliberate. The file was
+/// read, checked against the plan and backed up at a known point in the
+/// transaction; reading it again at write time would open a window where a
+/// playlist edited in between is written back from the newer bytes without ever
+/// having been checked.
+#[derive(Debug)]
+pub struct Prepared<'a> {
+    pending: Vec<Pending<'a>>,
+}
+
+impl Prepared<'_> {
+    /// Pass 2: copy every affected playlist into `backup_dir` under its own name,
+    /// creating the directory if it is not there, and `fsync` it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Rewrite`] if a backup of that name is already there — MPDFM never
+    /// overwrites the only copy of what is about to change — and [`Error::Io`] if
+    /// the directory or a copy cannot be written.
+    pub fn back_up(&self, backup_dir: &Utf8Path) -> Result<()> {
+        std::fs::create_dir_all(backup_dir).map_err(|source| Error::Io {
+            path: backup_dir.to_string(),
+            source,
+        })?;
+        for pending in &self.pending {
+            back_up(backup_dir, &pending.edit.file_name, &pending.original)?;
         }
-        write::replace_file(&edit.real_path, updated, write::Stop::Never)?;
+        sync_dir(backup_dir);
+        Ok(())
     }
-    Ok(())
+
+    /// Pass 3: replace every playlist, each through task 06's atomic temp-file +
+    /// `rename`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if a playlist cannot be replaced.
+    pub fn write(&self) -> Result<()> {
+        self.write_with(Inject::Nothing)
+    }
+
+    /// [`Prepared::write`], with the failure injection the atomicity tests need.
+    ///
+    /// # Errors
+    ///
+    /// As [`Prepared::write`], plus [`RewriteError::Injected`] when `inject`
+    /// fires.
+    pub fn write_with(&self, inject: Inject) -> Result<()> {
+        // Each write is atomic on its own; the set is not, which is what the
+        // backups and the journal are for.
+        for (position, pending) in self.pending.iter().enumerate() {
+            if inject == Inject::FailBeforeWriting(position) {
+                return Err(RewriteError::Injected {
+                    playlist: pending.edit.real_path.clone(),
+                }
+                .into());
+            }
+            write::replace_file(
+                &pending.edit.real_path,
+                &pending.updated,
+                write::Stop::Never,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The playlists this will write, in the order it writes them.
+    #[must_use]
+    pub fn playlists(&self) -> Vec<&Utf8Path> {
+        self.pending
+            .iter()
+            .map(|pending| pending.edit.real_path.as_path())
+            .collect()
+    }
 }
 
 /// Put every playlist in `edits` back from its backup.
