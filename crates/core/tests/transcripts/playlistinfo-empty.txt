@@ -1,0 +1,4 @@
+# An empty queue: `OK` and nothing else. Not the same thing as a failure.
+S: OK MPD 0.24.0
+C: playlistinfo
+S: OK

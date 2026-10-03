@@ -1,0 +1,11 @@
+# Refusals, all three captured from the daemon. Note the empty `{}`: MPD does not
+# always know which command it was running. `hunter2` is not the password of
+# anything — this daemon has none configured, and MPD refuses any `password`
+# command when it has none.
+S: OK MPD 0.24.0
+C: nosuchcommand
+S: ACK [5@0] {} unknown command "nosuchcommand"
+C: password "hunter2"
+S: ACK [3@0] {password} incorrect password
+C: load "mpdfm no such playlist"
+S: ACK [50@0] {load} No such playlist

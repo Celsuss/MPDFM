@@ -1,0 +1,12 @@
+# `update` and `rescan` with no argument: the whole library. Hand-written — the
+# response shape is the captured one from `update-quoting.txt`, and the point of
+# the file is the command line, which must carry no argument at all rather than an
+# empty quoted one. Not captured because a full rescan of ~2 800 files is real
+# work to ask of someone's daemon for a test that needs none of it.
+S: OK MPD 0.24.0
+C: update
+S: updating_db: 20
+S: OK
+C: rescan
+S: updating_db: 21
+S: OK

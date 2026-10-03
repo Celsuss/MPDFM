@@ -39,10 +39,12 @@
 //! in `/tmp`.
 
 mod audio;
+mod mpd;
 mod playlists;
 mod snapshot;
 
 pub use audio::AudioTemplate;
+pub use mpd::{Transcript, TranscriptStream};
 pub use playlists::{PLAYLIST_TEMPLATES, PlaylistTemplate, playlist_template};
 pub use snapshot::{Entry as SnapshotEntry, EntryKind as SnapshotEntryKind, Snapshot, digest};
 

@@ -26,7 +26,7 @@ a CLI that can scan, diagnose, move safely and undo.
 | 10 | [Plan, validation and preview](tasks/10-plan-and-preview.md) | 05, 07, 08, 09 | done |
 | 11 | [Two-phase commit and journal](tasks/11-journal-and-commit.md) | 08, 09, 10 | done |
 | 12 | [Undo and recover](tasks/12-undo-and-recover.md) | 11 | done |
-| 13 | [Minimal MPD client](tasks/13-mpd-client.md) | 04 | not started |
+| 13 | [Minimal MPD client](tasks/13-mpd-client.md) | 04 | done |
 | 14 | [MPD saved-queue rewriting](tasks/14-mpd-state-queue.md) | 06, 11, 13 | not started |
 | 15 | [CLI: scan, doctor, move, undo](tasks/15-cli-move-and-doctor.md) | 04, 05, 07, 10–14 | not started |
 

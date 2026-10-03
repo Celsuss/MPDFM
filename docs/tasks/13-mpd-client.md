@@ -2,7 +2,7 @@
 
 - **Phase:** M1 · Trustworthy move engine
 - **Depends on:** 04
-- **Status:** not started
+- **Status:** done
 
 ## Goal
 
@@ -47,16 +47,16 @@ task 26 (status indicator).
 
 ## Acceptance criteria
 
-- [ ] connects to the real daemon on `127.0.0.1:6600` and reports its version
-- [ ] `update` with a path containing spaces, `[`, `]`, `&`, `+`, `'` and `"`
+- [x] connects to the real daemon on `127.0.0.1:6600` and reports its version
+- [x] `update` with a path containing spaces, `[`, `]`, `&`, `+`, `'` and `"`
       succeeds — tested against a real daemon or a mock that asserts the wire bytes
-- [ ] `ACK` responses become typed errors with the MPD error code
-- [ ] connect to a closed port fails within the timeout and does not panic
-- [ ] a daemon that disconnects mid-response yields an error, not a hang
-- [ ] `queue_paths` returns the current queue as `RelPath`s
-- [ ] a unit test drives the parser from recorded protocol transcripts (no daemon
+- [x] `ACK` responses become typed errors with the MPD error code
+- [x] connect to a closed port fails within the timeout and does not panic
+- [x] a daemon that disconnects mid-response yields an error, not a hang
+- [x] `queue_paths` returns the current queue as `RelPath`s
+- [x] a unit test drives the parser from recorded protocol transcripts (no daemon
       required in CI)
-- [ ] `--no-mpd` prevents any socket from being opened (assert in a test)
+- [x] `--no-mpd` prevents any socket from being opened (assert in a test)
 
 ## Files
 

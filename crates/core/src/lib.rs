@@ -8,6 +8,7 @@
 pub mod config;
 pub mod journal;
 pub mod library;
+pub mod mpd;
 pub mod mpdconf;
 pub mod ops;
 pub mod paths;
@@ -48,6 +49,12 @@ pub enum Error {
     /// A playlist whose bytes could not be read as UTF-8.
     #[error(transparent)]
     Playlist(#[from] playlist::ParseError),
+
+    /// Talking to the MPD daemon did not work. Never fatal on its own — the
+    /// filesystem is the source of truth (`docs/PLAN.md` D6) — but it travels as
+    /// an `Error` so a command that only talks to MPD can return one.
+    #[error(transparent)]
+    Mpd(#[from] mpd::MpdError),
 
     /// A filesystem step that could not be executed, or could not be reversed.
     #[error(transparent)]

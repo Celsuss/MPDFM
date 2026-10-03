@@ -1,0 +1,15 @@
+# `currentsong` for a track whose name carries a `[…]` YouTube id — one of the
+# shapes that makes quoting and path handling worth testing.
+S: OK MPD 0.24.0
+C: currentsong
+S: file: hiphop-lofi/mf-doom/MF_DOOM_Lofi_Villain_IV_[8R6riJrP1rU].mp3
+S: Last-Modified: 2026-01-18T21:54:02Z
+S: Added: 2026-01-18T21:54:12Z
+S: Format: 48000:16:2
+S: Artist: Mf Doom
+S: Title: Lofi Villain IV
+S: Time: 3157
+S: duration: 3156.625
+S: Pos: 0
+S: Id: 438
+S: OK

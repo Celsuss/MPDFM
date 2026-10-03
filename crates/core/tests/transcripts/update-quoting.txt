@@ -1,0 +1,26 @@
+# The acceptance criterion about quoting, on the wire — and this exchange was run
+# against the real daemon exactly as written here, job ids included. Three real
+# directory names from the library (spaces, `&`, `+`, brackets, an apostrophe, a
+# `..` inside a component, a non-ASCII `ï`), one carrying the `"` that has to be
+# escaped, and one carrying a `\`, which `RelPath` rejects outright — so it can
+# only arrive through the raw `command` escape hatch, and the escaping still has
+# to be right.
+#
+# None of these five paths exists, which is why running it changed nothing: MPD
+# queues the job, finds no such directory, and leaves its database alone.
+S: OK MPD 0.24.0
+C: update "hiphop/MF DOOM - Mm..Food (2004) [V0] scene-tag"
+S: updating_db: 20
+S: OK
+C: update "hiphop/Snoop Dogg & Wiz Khalifa - Mac + Devin Go To High School (Soundtrack) (2011) [320] vtwin88cube/01.Smokin' On.mp3"
+S: updating_db: 21
+S: OK
+C: update "electronic/KREAM - So Hï [c0D2h71bFFI]"
+S: updating_db: 22
+S: OK
+C: update "quotes/a \"quoted\" name & a + sign"
+S: updating_db: 23
+S: OK
+C: update "quotes/a back\\slash"
+S: updating_db: 24
+S: OK
