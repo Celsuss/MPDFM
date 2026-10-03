@@ -6,7 +6,7 @@ members = ["crates/core"]
 mpdfm-core = { path = "crates/core" }
 
 anyhow = "=1.0.104"
-camino = "=1.2.6"
+camino = { version = "=1.2.6", features = ["serde1"] }
 clap = { version = "=4.6.7", features = ["derive"] }
 crossterm = "=0.29.0"
 insta = "=1.48.0"
