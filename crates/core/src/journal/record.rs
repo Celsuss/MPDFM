@@ -214,6 +214,44 @@ impl std::fmt::Display for Status {
     }
 }
 
+/// What a record's steps describe: work that was done, or work that was taken
+/// back.
+///
+/// Every commit writes [`Direction::Forward`]. The record [`undo`][super::undo]
+/// writes about *itself* is [`Direction::Reverse`], and undoing that one
+/// re-applies the original change — which is why there is no separate `redo`
+/// command. The direction is what tells undo which way to go, and it flips every
+/// time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    /// The steps were executed. A commit, or an undo of an undo.
+    #[default]
+    Forward,
+    /// The steps were reversed. An undo's own record.
+    Reverse,
+}
+
+impl Direction {
+    /// The other one: what undoing a record of this direction leaves behind.
+    #[must_use]
+    pub fn flipped(self) -> Self {
+        match self {
+            Self::Forward => Self::Reverse,
+            Self::Reverse => Self::Forward,
+        }
+    }
+}
+
+impl std::fmt::Display for Direction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Forward => "forward",
+            Self::Reverse => "reverse",
+        })
+    }
+}
+
 /// One step of the plan, and whether it has happened.
 ///
 /// `step` is the authority on what was asked for and `receipt` on what was done;
@@ -234,6 +272,17 @@ pub struct StepRecord {
     /// Why it did not, for the one step that failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Whether `receipt` was reconstructed by looking at the disk rather than
+    /// written down by the step that ran.
+    ///
+    /// [`recover`][super::recover] does that for a step whose journal line a
+    /// crash lost — a step whose destination is there and whose source is not
+    /// is a step that ran, whatever the log says. Recorded because a
+    /// reconstructed receipt knows less than a real one (no hash, and a method
+    /// that is inferred rather than observed), and a rollback that relies on
+    /// one should be able to say so.
+    #[serde(default, skip_serializing_if = "not")]
+    pub reconstructed: bool,
 }
 
 impl StepRecord {
@@ -245,6 +294,7 @@ impl StepRecord {
             done: false,
             receipt: None,
             error: None,
+            reconstructed: false,
         }
     }
 
@@ -266,6 +316,25 @@ impl StepRecord {
             warnings: receipt.warnings,
         });
         self.error = None;
+        self.reconstructed = false;
+    }
+
+    /// Record a step that was found to have run, with a receipt worked out from
+    /// the disk rather than observed — see [`StepRecord::reconstructed`].
+    pub fn found_done(&mut self, receipt: StepReceipt) {
+        self.completed(receipt);
+        self.reconstructed = true;
+    }
+
+    /// Record a step that was found to have been *reversed* without being
+    /// journaled, which leaves no receipt to keep: putting a reversed step back
+    /// means executing it again, and executing a step needs nothing but the
+    /// step.
+    pub fn found_reversed(&mut self) {
+        self.done = true;
+        self.receipt = None;
+        self.error = None;
+        self.reconstructed = true;
     }
 
     /// Record a step that failed, with what the filesystem said.
@@ -273,6 +342,19 @@ impl StepRecord {
         self.done = false;
         self.receipt = None;
         self.error = Some(error.to_string());
+        self.reconstructed = false;
+    }
+
+    /// Record a step this transaction deliberately left alone, and why.
+    ///
+    /// `undo --force` is the one thing that does this: the step is not done —
+    /// its work is still in effect — and the record says which it skipped and
+    /// what made it skip them.
+    pub fn skipped(&mut self, why: &dyn std::fmt::Display) {
+        self.done = false;
+        self.receipt = None;
+        self.error = Some(format!("skipped: {why}"));
+        self.reconstructed = false;
     }
 }
 
@@ -295,6 +377,10 @@ pub struct StepEntry {
     /// Why it did not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Whether the receipt was reconstructed — see
+    /// [`StepRecord::reconstructed`].
+    #[serde(default, skip_serializing_if = "not")]
+    pub reconstructed: bool,
 }
 
 impl StepEntry {
@@ -306,6 +392,7 @@ impl StepEntry {
             done: step.done,
             receipt: step.receipt.clone(),
             error: step.error.clone(),
+            reconstructed: step.reconstructed,
         }
     }
 
@@ -320,6 +407,7 @@ impl StepEntry {
             step.done = self.done;
             step.receipt = self.receipt.clone();
             step.error = self.error.clone();
+            step.reconstructed = self.reconstructed;
         }
     }
 }
@@ -350,6 +438,23 @@ pub struct Record {
 
     /// Where the transaction got to.
     pub status: Status,
+
+    /// Whether [`Record::steps`] were executed or reversed.
+    ///
+    /// Defaults to [`Direction::Forward`], which every record a commit writes is
+    /// — and which every record written before task 12 existed is too.
+    #[serde(default)]
+    pub direction: Direction,
+
+    /// The transaction this one put back, when this record is
+    /// [`undo`][super::undo]'s own rather than a commit's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undo_of: Option<TxId>,
+
+    /// The transaction that put this one back, once one has. The explanation an
+    /// [`Status::Reverted`] record owes the user who asks to undo it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undone_by: Option<TxId>,
 
     /// When it started, as `2026-09-24T22:45:00Z`.
     pub started_at: String,
@@ -439,6 +544,9 @@ impl Record {
             txid,
             version: VERSION,
             status: Status::Pending,
+            direction: Direction::Forward,
+            undo_of: None,
+            undone_by: None,
             started_at: stamp(started),
             finished_at: None,
             music_dir,
@@ -488,9 +596,10 @@ impl Record {
         self.status == Status::Complete && !self.backup_pruned
     }
 
-    /// One line for `undo --list`: the id, when it started, and what it did.
+    /// What the transaction did, in a few words: the counts the preview led
+    /// with, which is enough to recognize it in a list without replaying it.
     #[must_use]
-    pub fn headline(&self) -> String {
+    pub fn summary_phrase(&self) -> String {
         let summary = &self.summary;
         let mut parts = Vec::new();
         if summary.files_moved > 0 {
@@ -505,14 +614,57 @@ impl Record {
         if parts.is_empty() {
             parts.push("nothing".to_owned());
         }
+        if let Some(of) = &self.undo_of {
+            parts.push(format!(
+                "{} {of}",
+                match self.direction {
+                    Direction::Reverse => "undo of",
+                    Direction::Forward => "re-applied",
+                }
+            ));
+        }
+        parts.join(", ")
+    }
+
+    /// One line for `undo --list`: the id, when it started, and what it did.
+    #[must_use]
+    pub fn headline(&self) -> String {
         format!(
             "{}  {}  {}  {}",
             self.txid,
             self.started_at,
             self.status,
-            parts.join(", ")
+            self.summary_phrase()
         )
     }
+
+    /// What is in the way of undoing this transaction, or `None` when nothing
+    /// is.
+    ///
+    /// The phrase goes straight into `undo --list`'s last column and into the
+    /// refusal [`undo`][super::undo] raises, so there is one explanation rather
+    /// than two that can drift apart.
+    #[must_use]
+    pub fn why_not_undoable(&self) -> Option<String> {
+        match self.status {
+            Status::Complete if self.backup_pruned => {
+                Some("its backups have been pruned".to_owned())
+            }
+            Status::Complete => None,
+            Status::Reverted => Some(match &self.undone_by {
+                Some(by) => format!("it was already undone by {by}"),
+                None => "it has already been undone".to_owned(),
+            }),
+            Status::Pending | Status::Failed => {
+                Some(format!("it is {}; run `mpdfm recover`", self.status))
+            }
+        }
+    }
+}
+
+/// `!flag`, as a path `serde`'s `skip_serializing_if` can name.
+fn not(flag: &bool) -> bool {
+    !flag
 }
 
 // ---------------------------------------------------------------------------

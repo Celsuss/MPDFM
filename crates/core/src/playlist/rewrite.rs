@@ -585,6 +585,75 @@ pub fn restore(edits: &[PlaylistEdit], backup_dir: &Utf8Path) -> Result<()> {
     Ok(())
 }
 
+/// The bytes a commit leaves in one playlist, given the bytes it had before.
+///
+/// Undo's "is this still what we left here?" question (task 12): the backup in
+/// the transaction's directory is the *before*, this is the *after*, and a file
+/// that matches neither was edited by somebody else in between — which a restore
+/// would throw away. There is no second implementation of the line arithmetic;
+/// this is the same [`rewritten`] the commit used.
+///
+/// # Errors
+///
+/// [`Error::Playlist`] if `original` is not UTF-8, and [`Error::Rewrite`] if the
+/// edit does not apply to it — which, for the backup of the very file the edit
+/// was applied to, means the backup is not what it claims to be.
+pub fn after(original: &[u8], edit: &PlaylistEdit) -> Result<Vec<u8>> {
+    let playlist = Playlist::from_bytes(&edit.real_path, original)?;
+    Ok(rewritten(&playlist, edit)?.to_bytes())
+}
+
+/// Replace one playlist's bytes, atomically and through its resolved path.
+///
+/// The primitive [`Prepared::write`] uses, for the one caller that computes the
+/// bytes somewhere else: `recover` finishing a transaction writes what
+/// [`after`] produced, having first checked that the file does not already hold
+/// it.
+///
+/// # Errors
+///
+/// [`Error::Io`] if the playlist cannot be replaced.
+pub fn replace(edit: &PlaylistEdit, bytes: &[u8]) -> Result<()> {
+    write::replace_file(&edit.real_path, bytes, write::Stop::Never)
+}
+
+/// Copy every playlist `edits` names into `backup_dir` exactly as it is now,
+/// whatever it says.
+///
+/// [`Prepared::back_up`] cannot do this job: it backs up what it has first
+/// verified against a plan, and undo has to back up a file that may no longer
+/// match any plan at all — which is precisely the file a restore is about to
+/// overwrite. A playlist that is no longer there is skipped and reported, since
+/// there is nothing to lose.
+///
+/// # Errors
+///
+/// [`Error::Rewrite`] if a backup of that name is already there, and
+/// [`Error::Io`] if the directory or a copy cannot be written.
+pub fn back_up_now(edits: &[PlaylistEdit], backup_dir: &Utf8Path) -> Result<Vec<usize>> {
+    std::fs::create_dir_all(backup_dir).map_err(|source| Error::Io {
+        path: backup_dir.to_string(),
+        source,
+    })?;
+    let mut taken = Vec::new();
+    for (position, edit) in edits.iter().enumerate() {
+        let bytes = match std::fs::read(&edit.real_path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(Error::Io {
+                    path: edit.real_path.to_string(),
+                    source,
+                });
+            }
+        };
+        back_up(backup_dir, &edit.file_name, &bytes)?;
+        taken.push(position);
+    }
+    sync_dir(backup_dir);
+    Ok(taken)
+}
+
 /// The playlist with `edit` applied, or the reason it cannot be.
 ///
 /// Every line is checked before any is changed, so a rejected edit leaves the

@@ -218,8 +218,12 @@ recoverable:
 5. Mark journal record `complete`.
 6. If MPD is reachable, `update` the affected directories.
 
-A `pending` record found at startup means a previous run died: offer
-`mpdfm undo <txid>` or `mpdfm recover`.
+A `pending` record found at startup means a previous run died, and `mpdfm
+recover` is what deals with it: it works out from the disk what the transaction
+actually managed — the journal can be one line short of the truth, never more —
+and then rolls it back (the default) or finishes it. `mpdfm undo` deliberately
+refuses a record that is not `complete` and says so, because undo believes the
+record and a `pending` one is not a finished account of anything. Task 12.
 
 ### Safety invariants
 
@@ -279,7 +283,7 @@ that owns each one is named.
 ~/.config/mpdfm/keys.toml            keymap
 ~/.local/share/mpdfm/journal/*.json  one record per transaction
 ~/.local/share/mpdfm/journal/*.steps what each step did, appended as it happens
-~/.local/share/mpdfm/backups/<txid>/ playlist + state file copies
+~/.local/share/mpdfm/backups/<txid>/ playlist + state file copies, deleted bytes
 ~/.cache/mpdfm/scan.json             optional scan cache (only if scanning proves slow)
 ```
 
