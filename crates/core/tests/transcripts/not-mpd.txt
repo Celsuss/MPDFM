@@ -1,0 +1,4 @@
+# Something else is listening on the configured port. Caught at the greeting,
+# before any command is sent.
+S: HTTP/1.1 400 Bad Request
+S: Content-Type: text/html

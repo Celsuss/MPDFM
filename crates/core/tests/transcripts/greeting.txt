@@ -1,0 +1,5 @@
+# The connection itself: the greeting, and `ping` as the cheapest command there
+# is. Proves the version is parsed and that a bare `OK` response is a response.
+S: OK MPD 0.24.0
+C: ping
+S: OK

@@ -1,0 +1,8 @@
+# MPD restarted (or `mpd --kill` ran) while answering. The last line arrives
+# without its newline and then the connection ends: half a response, which must
+# be an error and not a hang, and not a `Status` built from what did arrive.
+S: OK MPD 0.24.0
+C: status
+S: volume: 75
+S: playlist: 644
+S| state: pa

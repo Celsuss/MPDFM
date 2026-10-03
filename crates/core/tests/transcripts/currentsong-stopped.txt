@@ -1,0 +1,4 @@
+# Nothing loaded: MPD answers `currentsong` with an empty response.
+S: OK MPD 0.24.0
+C: currentsong
+S: OK

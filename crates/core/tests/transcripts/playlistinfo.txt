@@ -1,0 +1,34 @@
+# The queue. The two song records are captured; the third, a radio stream, is
+# written by hand in the same format — this daemon's queue holds no stream right
+# now, and adding one would have meant editing the user's queue. Its shape is the
+# one `Radios.m3u` produces (`docs/PLAN.md` §3: that playlist is nothing but
+# `https://` URLs), and `queue_paths` has to leave it out: a stream has no path
+# under `music_directory` that a move could ever touch.
+S: OK MPD 0.24.0
+C: playlistinfo
+S: file: hiphop-lofi/mf-doom/MF_DOOM_Lofi_Villain_IV_[8R6riJrP1rU].mp3
+S: Last-Modified: 2026-01-18T21:54:02Z
+S: Added: 2026-01-18T21:54:12Z
+S: Format: 48000:16:2
+S: Artist: Mf Doom
+S: Title: Lofi Villain IV
+S: Time: 3157
+S: duration: 3156.625
+S: Pos: 0
+S: Id: 438
+S: file: hiphop-lofi/mf-doom/MF_DOOM_-_Lofi_Villain_(Lofi_Remix_Full_Album)_[z9_prlDi8L0].mp3
+S: Last-Modified: 2026-01-18T21:57:50Z
+S: Added: 2026-01-18T21:57:56Z
+S: Format: 48000:16:2
+S: Artist: Mf Doom
+S: Title: Lofi Villain
+S: Time: 3164
+S: duration: 3163.765
+S: Pos: 1
+S: Id: 437
+S: file: https://ice1.somafm.com/groovesalad-256-mp3
+S: Title: SomaFM Groove Salad
+S: Name: Groove Salad
+S: Pos: 2
+S: Id: 439
+S: OK

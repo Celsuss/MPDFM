@@ -106,7 +106,9 @@ MPDFM/
 │       │   └── exec.rs           commit(), two-phase with journal
 │       ├── journal/              transaction records, backups, undo
 │       ├── organize/             template parser + plan generator
-│       ├── mpd.rs                minimal line-protocol client
+│       ├── mpd/                  minimal line-protocol client
+│       │   ├── proto.rs          quoting, line/ACK/status parsing — pure
+│       │   └── client.rs         the socket, timeouts, one fn per command
 │       ├── state.rs              MPD state-file queue rewriting
 │       └── doctor.rs             library health checks
 └── src/

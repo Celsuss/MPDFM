@@ -1,0 +1,27 @@
+# `status` with a song loaded and the player paused, byte for byte as MPD 0.24.0
+# sent it. Note the keys MPDFM does not model (volume, mixrampdb, audio …), the
+# empty value of `lastloadedplaylist`, and `time: 2290:3157`, whose value
+# contains the same `:` that separates key from value.
+S: OK MPD 0.24.0
+C: status
+S: volume: 75
+S: repeat: 0
+S: random: 0
+S: single: 0
+S: consume: 0
+S: partition: default
+S: playlist: 644
+S: playlistlength: 2
+S: mixrampdb: 0
+S: state: pause
+S: lastloadedplaylist: 
+S: song: 0
+S: songid: 438
+S: time: 2290:3157
+S: elapsed: 2289.718
+S: bitrate: 112
+S: duration: 3156.625
+S: audio: 48000:16:2
+S: nextsong: 1
+S: nextsongid: 437
+S: OK
