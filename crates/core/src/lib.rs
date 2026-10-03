@@ -66,6 +66,14 @@ pub enum Error {
     #[error(transparent)]
     Commit(#[from] ops::commit::CommitError),
 
+    /// A transaction that could not be reversed.
+    #[error(transparent)]
+    Undo(#[from] journal::undo::UndoError),
+
+    /// A transaction a crash interrupted that could not be recovered.
+    #[error(transparent)]
+    Recover(#[from] journal::recover::RecoverError),
+
     /// An I/O failure, with the path that caused it.
     #[error("{path}: {source}")]
     Io {

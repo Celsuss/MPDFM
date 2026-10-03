@@ -354,6 +354,40 @@ pub struct Facts {
     pub hash: Option<u64>,
 }
 
+impl Facts {
+    /// What the entry at `path` is right now.
+    ///
+    /// [`Facts::hash`] is left `None`: computing one costs a whole pass over the
+    /// file, and undo asks for it ([`hash_file`]) only when the receipt it is
+    /// comparing against has one to compare with.
+    ///
+    /// # Errors
+    ///
+    /// [`FsError::Missing`] when there is nothing there — which is the answer
+    /// undo cares most about — and [`FsError::Io`] for any other failure to
+    /// stat it.
+    pub fn of(path: &Utf8Path) -> Result<Self, FsError> {
+        let meta = std::fs::symlink_metadata(path).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                FsError::Missing {
+                    path: path.to_owned(),
+                }
+            } else {
+                FsError::Io {
+                    path: path.to_owned(),
+                    source,
+                }
+            }
+        })?;
+        Ok(Self {
+            size: meta.len(),
+            mtime: meta.modified().ok(),
+            mode: mode_of(&meta),
+            hash: None,
+        })
+    }
+}
+
 /// [`Facts::mtime`] on the way into and out of a journal record.
 ///
 /// `serde`'s own `SystemTime` representation refuses any time before 1970, which
@@ -1756,7 +1790,16 @@ fn copy_bytes(
 }
 
 /// FNV-1a of a whole file, read in chunks so a FLAC image costs no memory.
-fn hash_file(path: &Utf8Path) -> Result<u64, FsError> {
+///
+/// Public because a [`Facts::hash`] is recorded for undo to check (task 12), and
+/// checking it means reading the file again. Not a cryptographic hash, and not
+/// used as one: it answers "are these the same bytes", not "did someone tamper
+/// with them".
+///
+/// # Errors
+///
+/// [`FsError::Io`] if the file cannot be opened or read.
+pub fn hash_file(path: &Utf8Path) -> Result<u64, FsError> {
     let io = |source| FsError::Io {
         path: path.to_owned(),
         source,

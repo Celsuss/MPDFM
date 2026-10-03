@@ -319,11 +319,14 @@ pub fn run() -> Result<ExitCode> {
                 ("mpdfm tag set", "19-cli-tags.md")
             }
         },
+        // The engine is `mpdfm_core::journal::{undo, recover}` as of task 12;
+        // what is missing is the command around it, which task 15 owns together
+        // with `move` and the confirmation prompt.
         Command::Undo { txid } => {
             cli.trace(format!("undo {}", txid.as_deref().unwrap_or("<latest>")));
-            ("mpdfm undo", "12-undo-and-recover.md")
+            ("mpdfm undo", "15-cli-move-and-doctor.md")
         }
-        Command::Recover => ("mpdfm recover", "12-undo-and-recover.md"),
+        Command::Recover => ("mpdfm recover", "15-cli-move-and-doctor.md"),
     };
 
     Err(Error::not_implemented(what, task).into())

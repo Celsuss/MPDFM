@@ -36,12 +36,23 @@
 //! nothing about where it is kept, [`store`] is the directory layout and the
 //! durability discipline and knows nothing about what a transaction means.
 //! Neither of them executes anything.
+//!
+//! [`undo`] and [`recover`] do. They are here rather than in
+//! [`ops`][crate::ops] because what they act on is a record: `undo` reverses a
+//! transaction that finished, `recover` deals with one that did not, and both
+//! work from the file on disk with nothing in memory to help them. Between them
+//! they are the other half of safety invariant 9 — every committed transaction
+//! is undoable, and undo verifies its preconditions rather than blindly
+//! reversing.
 
 pub mod record;
+pub mod recover;
 pub mod store;
+pub mod undo;
 
-pub use record::{Receipt, Record, Status, StepRecord, TxId, VERSION};
+pub use record::{Direction, Receipt, Record, Status, StepRecord, TxId, VERSION};
 pub use store::{Kept, Pruned, Store};
+pub use undo::{Reversed, UndoError};
 
 use camino::Utf8PathBuf;
 
