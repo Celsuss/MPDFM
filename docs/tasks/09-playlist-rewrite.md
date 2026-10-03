@@ -2,7 +2,7 @@
 
 - **Phase:** M1 · Trustworthy move engine
 - **Depends on:** 06, 07, 08
-- **Status:** not started
+- **Status:** done
 
 ## Goal
 
@@ -44,19 +44,19 @@ Rules, in order of importance:
 
 ## Acceptance criteria
 
-- [ ] moving one track rewrites its line in every playlist that references it
+- [x] moving one track rewrites its line in every playlist that references it
       and leaves every other line byte-identical
-- [ ] moving a whole album directory rewrites all of its tracks' lines
-- [ ] `hiphop/MF DOOM` move does not touch lines under `hiphop/MF DOOM Instrumentals`
-- [ ] CUE virtual-track line is rewritten with its suffix intact
-- [ ] radio URLs, `#EXTINF`, comments and blanks are untouched (diff the bytes)
-- [ ] the symlinked `Radios.m3u` case: target file modified, symlink preserved
-- [ ] deleting a track removes its line *and* its `#EXTINF`, and nothing else
-- [ ] backups are written before the first modification and are byte-identical
+- [x] moving a whole album directory rewrites all of its tracks' lines
+- [x] `hiphop/MF DOOM` move does not touch lines under `hiphop/MF DOOM Instrumentals`
+- [x] CUE virtual-track line is rewritten with its suffix intact
+- [x] radio URLs, `#EXTINF`, comments and blanks are untouched (diff the bytes)
+- [x] the symlinked `Radios.m3u` case: target file modified, symlink preserved
+- [x] deleting a track removes its line *and* its `#EXTINF`, and nothing else
+- [x] backups are written before the first modification and are byte-identical
       to the originals
-- [ ] a failure while writing playlist 3 of 5 leaves playlists 1–2 written,
+- [x] a failure while writing playlist 3 of 5 leaves playlists 1–2 written,
       3–5 untouched, and enough journal state to undo (feeds task 11)
-- [ ] integration test: after a commit, every previously resolvable playlist
+- [x] integration test: after a commit, every previously resolvable playlist
       entry still resolves to an existing file
 
 ## Files

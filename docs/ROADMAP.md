@@ -22,7 +22,7 @@ a CLI that can scan, diagnose, move safely and undo.
 | 06 | [Byte-preserving m3u parser](tasks/06-playlist-parser.md) | 02, 03 | done |
 | 07 | [Playlist index](tasks/07-playlist-index.md) | 06 | done |
 | 08 | [Filesystem move executor](tasks/08-move-executor.md) | 02, 05 | done |
-| 09 | [Playlist rewriting](tasks/09-playlist-rewrite.md) | 06, 07, 08 | not started |
+| 09 | [Playlist rewriting](tasks/09-playlist-rewrite.md) | 06, 07, 08 | done |
 | 10 | [Plan, validation and preview](tasks/10-plan-and-preview.md) | 05, 07, 08, 09 | not started |
 | 11 | [Two-phase commit and journal](tasks/11-journal-and-commit.md) | 08, 09, 10 | not started |
 | 12 | [Undo and recover](tasks/12-undo-and-recover.md) | 11 | not started |
