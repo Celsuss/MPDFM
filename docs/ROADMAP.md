@@ -28,7 +28,7 @@ a CLI that can scan, diagnose, move safely and undo.
 | 12 | [Undo and recover](tasks/12-undo-and-recover.md) | 11 | done |
 | 13 | [Minimal MPD client](tasks/13-mpd-client.md) | 04 | done |
 | 14 | [MPD saved-queue rewriting](tasks/14-mpd-state-queue.md) | 06, 11, 13 | done |
-| 15 | [CLI: scan, doctor, move, undo](tasks/15-cli-move-and-doctor.md) | 04, 05, 07, 10–14 | not started |
+| 15 | [CLI: scan, doctor, move, undo](tasks/15-cli-move-and-doctor.md) | 04, 05, 07, 10–14 | done |
 
 **M1 is done when:** `mpdfm move` on a copy of the real library relocates an
 album, all 231 playlist references still resolve, the saved queue is consistent,
@@ -115,7 +115,10 @@ one of the large ones (08, 10, 11, 22, 27).
 3. **Session 4:** 07, 08 — index and the move executor.
 4. **Session 5:** 09, 10 — playlist rewriting and the preview.
 5. **Session 6:** 11, 12 — commit, journal, undo, with crash-injection tests.
-6. **Session 7:** 13, 14, 15 — MPD client, saved queue, CLI. **M1 complete.**
+6. **Session 7:** 13, 14, 15 — MPD client, saved queue, CLI. **M1 complete:
+   `mpdfm scan`, `doctor`, `move --dry-run`/`--merge`/`--verify`, `undo`,
+   `undo --list` and `recover` all work, verified by hand against the real
+   library (read-only) and against a real copy (writing).**
 
 ## Open questions to revisit
 
@@ -133,6 +136,11 @@ one of the large ones (08, 10, 11, 22, 27).
   time is quadratic (115 s extrapolated for the 4 500 steps a real whole-library
   reorganization produces); one appended line per step is flat and keeps the
   invariant batching would have broken. Measurements in task 11's decisions.
+- ~~Is a scan cache needed to keep the TUI responsive (`PLAN.md` §7,
+  `~/.cache/mpdfm/scan.json`, "only if scanning proves slow")?~~ **No.** Measured
+  in task 15 with the release binary: the real library's 3 132 files across 27 GB
+  scan in **10 ms**. Task 20 can rescan on a keystroke and the cache should stay
+  unbuilt. Numbers in task 15's hand-verification section.
 - FLAC multi-valued fields: `Vec<String>` throughout, or join-and-remember?
   Decide in task 16; it affects the tag editor UI.
 - How much of `--deep` duplicate detection is worth it on a 2 800-file library

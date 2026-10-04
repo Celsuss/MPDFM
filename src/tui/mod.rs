@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use anyhow::Result;
 
 use crate::cli::Cli;
+use crate::output::Exit;
 
 /// Launch the interactive browser. Stub until task 20.
 pub fn run(cli: &Cli) -> Result<ExitCode> {
@@ -13,5 +14,5 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
         "mpdfm {}: the TUI arrives in task 20. Until then, see `mpdfm --help`.",
         env!("CARGO_PKG_VERSION")
     );
-    Ok(crate::cli::EXIT_OK)
+    Ok(Exit::Ok.into())
 }

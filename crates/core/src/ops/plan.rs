@@ -121,16 +121,42 @@ pub struct Live<'a> {
     pub queue: Option<&'a [RelPath]>,
 }
 
-/// See [`Plan::validate_live`][super::op::Plan::validate_live].
+/// What the user asked for *about* the plan, as distinct from the operations in
+/// it.
+///
+/// One field so far, and it earns the type: whether a directory move may land in
+/// a directory that already exists is a decision only the person at the keyboard
+/// can make, it has to reach [`exec_fs::expand_dir_move`] through two layers that
+/// otherwise have no opinion about it, and **commit re-validates** — so the
+/// answer has to travel with the plan rather than be chosen again further down.
+/// [`commit::Options::prefs`][super::commit::Options::prefs] is the other end of
+/// the same wire; passing a different value there is drift, and refuses.
+///
+/// [`Default`] is the cautious answer, which is [`Merge::Refuse`]: `move a b`
+/// when `b` is already there is far more often a typo than a merge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Prefs {
+    /// `mpdfm move --merge`.
+    pub merge: Merge,
+}
+
+/// See [`Plan::validate_with`][super::op::Plan::validate_with].
 pub(super) fn validate(
     plan: &Plan,
     lib: &Library,
     idx: &PlaylistIndex,
     cfg: &Config,
     live: &Live<'_>,
+    prefs: Prefs,
 ) -> Effects {
     let root = cfg.music_dir.as_path();
     let options = exec_fs::Options::from_config(cfg);
+    let inputs = Inputs {
+        lib,
+        root,
+        cfg,
+        prefs,
+    };
 
     let mut effects = Effects::default();
     let (order, cycles) = execution_order(plan.ops());
@@ -146,7 +172,7 @@ pub(super) fn validate(
 
     for index in order {
         let op = &plan.ops()[index];
-        let steps = expand(op, index, lib, root, &vacated, cfg, &mut effects);
+        let steps = expand(op, index, inputs, &vacated, &mut effects);
 
         for step in &steps {
             match exec_fs::check(step, root, &options) {
@@ -378,16 +404,34 @@ fn duplicate_destinations(ops: &[Operation]) -> Vec<Conflict> {
 // ---------------------------------------------------------------------------
 // Pass 2 — expand.
 
+/// Everything an expansion reads: the library as it is, where it is rooted, and
+/// what the user asked for about it.
+///
+/// Bundled because all four travel together through every pass and none of them
+/// changes between operations — leaving `vacated` and `effects`, which do, as
+/// the only arguments that say anything about *this* operation.
+#[derive(Debug, Clone, Copy)]
+struct Inputs<'a> {
+    lib: &'a Library,
+    root: &'a Utf8Path,
+    cfg: &'a Config,
+    prefs: Prefs,
+}
+
 /// Turn one operation into the steps that perform it, reporting what stopped it.
 fn expand(
     op: &Operation,
     index: usize,
-    lib: &Library,
-    root: &Utf8Path,
+    inputs: Inputs<'_>,
     vacated: &[RelPath],
-    cfg: &Config,
     effects: &mut Effects,
 ) -> Vec<FsStep> {
+    let Inputs {
+        lib,
+        root,
+        cfg,
+        prefs,
+    } = inputs;
     match op {
         Operation::MoveFile { from, to } => {
             if lib.get(from).is_none() {
@@ -422,10 +466,14 @@ fn expand(
             // An earlier operation is taking the destination away, so the copy of
             // it still on disk is not in the way. `Merge::Allow` walks past it;
             // the collisions it reports are then filtered against the same set.
+            // `--merge` asks for the same walk for a destination nothing is
+            // vacating, which is the whole of what the flag does: either way not
+            // one file is overwritten, and a per-file collision is still a
+            // `Conflict`.
             let merge = if is_vacated(to, vacated) {
                 Merge::Allow
             } else {
-                Merge::Refuse
+                prefs.merge
             };
             match exec_fs::expand_dir_move(from, to, root, merge) {
                 Ok(expansion) => {

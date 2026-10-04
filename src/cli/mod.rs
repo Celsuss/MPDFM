@@ -1,26 +1,57 @@
 //! Argument definitions and dispatch.
 //!
-//! Command bodies land in later tasks; every one of them currently reports
-//! `not implemented` and the task that owns it, rather than panicking.
+//! One module per command, and this file is the switchboard: it parses the
+//! arguments, resolves the configuration **once** so that every command
+//! downstream shares one canonical library root, and dispatches. The commands
+//! M2 onwards own still report `not implemented` and the task that owns them,
+//! rather than panicking.
+//!
+//! [`crate::output`] holds the exit codes and the output mode, because those are
+//! a contract shared by every command rather than a detail of any one of them.
 
 mod config;
+mod doctor;
+#[path = "move.rs"]
+mod r#move;
+mod mpd;
+mod scan;
+mod undo;
 
 use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{ArgAction, Args, Parser, Subcommand};
 use mpdfm_core::Error;
 use mpdfm_core::config::{ConfigWarning, Env, Overrides};
+use mpdfm_core::paths::{self, RelPath};
 
-/// Success.
-pub const EXIT_OK: ExitCode = ExitCode::SUCCESS;
-/// An unexpected error. Conflict (2) and declined (3) codes arrive with task 15.
-pub const EXIT_ERROR: ExitCode = ExitCode::FAILURE;
+use crate::output::Out;
+
+/// The exit-code table `mpdfm --help` ends with.
+///
+/// The codes are part of the contract, not an implementation detail: a script
+/// has to be able to tell "I refused" from "I broke". [`Exit`] is where they are
+/// defined; this is where a user finds them.
+const EXIT_CODES: &str = "Exit codes:
+  0  success
+  1  unexpected error
+  2  refused before anything was written (a conflict, or the library changed
+     since the preview)
+  3  you declined at the prompt
+
+Commands that change the library ask first. Pass --yes to skip the prompt,
+which is required when stdin is not a terminal.";
 
 /// Edit tags and re-organize an MPD music library without breaking playlists.
 #[derive(Debug, Parser)]
-#[command(name = "mpdfm", version, about, long_about = None)]
+#[command(
+    name = "mpdfm",
+    version,
+    about,
+    long_about = None,
+    after_help = EXIT_CODES
+)]
 pub struct Cli {
     #[command(flatten)]
     pub globals: Globals,
@@ -78,18 +109,7 @@ pub enum Command {
     Doctor,
 
     /// Move or rename a file or directory, rewriting every reference to it.
-    Move {
-        /// Source, relative to the music dir or absolute inside it.
-        src: Utf8PathBuf,
-        /// Destination, relative to the music dir or absolute inside it.
-        dst: Utf8PathBuf,
-        /// Show the preview and write nothing.
-        #[arg(long)]
-        dry_run: bool,
-        /// Skip the confirmation prompt.
-        #[arg(long, short = 'y')]
-        yes: bool,
-    },
+    Move(MoveArgs),
 
     /// Re-file tracks into template-derived paths.
     Organize {
@@ -110,13 +130,85 @@ pub enum Command {
     },
 
     /// Reverse a committed transaction.
-    Undo {
-        /// Transaction to reverse (default: the most recent).
-        txid: Option<String>,
-    },
+    Undo(UndoArgs),
 
     /// Finish or roll back a transaction that a crash left pending.
-    Recover,
+    Recover(RecoverArgs),
+}
+
+/// `mpdfm move <SRC> <DST>`
+///
+/// `SRC` and `DST` are both **relative to the music directory**, or absolute
+/// paths inside it. `DST` is the full destination path and not a directory to
+/// move into: `move a/x b/x`, never `move a/x b`. A trailing slash is ignored,
+/// because shell completion adds them and nobody means anything by them.
+#[derive(Debug, Args)]
+pub struct MoveArgs {
+    /// Source, relative to the music dir or absolute inside it.
+    pub src: Utf8PathBuf,
+
+    /// Destination, relative to the music dir or absolute inside it.
+    pub dst: Utf8PathBuf,
+
+    /// Show the preview and write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Skip the confirmation prompt. Required when stdin is not a terminal.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+
+    /// Let a directory move land in a directory that already exists, moving
+    /// what does not collide. Nothing is ever overwritten either way.
+    #[arg(long)]
+    pub merge: bool,
+
+    /// Hash every cross-device copy and read it back. Costs a second read of
+    /// each copied file.
+    #[arg(long)]
+    pub verify: bool,
+}
+
+/// `mpdfm undo [TXID]`
+#[derive(Debug, Args)]
+pub struct UndoArgs {
+    /// Transaction to reverse (default: the most recent undoable one).
+    pub txid: Option<String>,
+
+    /// List every transaction and whether it can be undone, and do nothing
+    /// else.
+    #[arg(long, conflicts_with_all = ["txid", "force", "yes"])]
+    pub list: bool,
+
+    /// Reverse everything that is still safe to reverse, skipping and reporting
+    /// whatever has changed since.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Skip the confirmation prompt. Required when stdin is not a terminal.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+}
+
+/// `mpdfm recover [TXID]`
+#[derive(Debug, Args)]
+pub struct RecoverArgs {
+    /// Transaction to deal with (default: every unfinished one, newest first).
+    pub txid: Option<String>,
+
+    /// Finish the transaction instead of rolling it back. Rolling back is the
+    /// default because it is the safe one.
+    #[arg(long)]
+    pub forward: bool,
+
+    /// Act on everything that is still safe to act on, skipping and reporting
+    /// whatever cannot be told apart by looking.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Skip the confirmation prompt. Required when stdin is not a terminal.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 /// `mpdfm config …`
@@ -283,21 +375,19 @@ pub fn run() -> Result<ExitCode> {
         return crate::tui::run(&cli);
     };
 
+    // Worked out once, here, so that no command can reach a different answer
+    // than the confirmation prompt did about whether anyone is listening.
+    let out = Out::detect(cli.globals.json);
+
     let (what, task) = match command {
         Command::Config { command } => match command {
             ConfigCommand::Show => return config::show(&cli, &settings, &warnings),
         },
-        Command::Scan => ("mpdfm scan", "15-cli-move-and-doctor.md"),
-        Command::Doctor => ("mpdfm doctor", "15-cli-move-and-doctor.md"),
-        Command::Move {
-            src,
-            dst,
-            dry_run,
-            yes,
-        } => {
-            cli.trace(format!("move {src} -> {dst} (dry_run={dry_run} yes={yes})"));
-            ("mpdfm move", "15-cli-move-and-doctor.md")
-        }
+        Command::Scan => return scan::run(&cli, &settings, &out),
+        Command::Doctor => return doctor::run(&cli, &settings, &out),
+        Command::Move(args) => return r#move::run(&cli, &settings, &out, args),
+        Command::Undo(args) => return undo::run(&cli, &settings, &out, args),
+        Command::Recover(args) => return undo::recover(&cli, &settings, &out, args),
         Command::Organize {
             path,
             template,
@@ -319,17 +409,75 @@ pub fn run() -> Result<ExitCode> {
                 ("mpdfm tag set", "19-cli-tags.md")
             }
         },
-        // The engine is `mpdfm_core::journal::{undo, recover}` as of task 12;
-        // what is missing is the command around it, which task 15 owns together
-        // with `move` and the confirmation prompt.
-        Command::Undo { txid } => {
-            cli.trace(format!("undo {}", txid.as_deref().unwrap_or("<latest>")));
-            ("mpdfm undo", "15-cli-move-and-doctor.md")
-        }
-        Command::Recover => ("mpdfm recover", "15-cli-move-and-doctor.md"),
     };
 
     Err(Error::not_implemented(what, task).into())
+}
+
+/// Turn a `SRC`/`DST` argument into a path relative to the music directory.
+///
+/// Three things the user might type, and what each means:
+///
+/// - `hiphop/MF DOOM` — relative to `music_dir`, **not** to the working
+///   directory. That is what MPD's own paths are relative to, so it is the one
+///   reading that makes `mpdfm move` agree with what is in the playlists;
+/// - `/home/me/Music/hiphop/MF DOOM` — absolute, and accepted when it is inside
+///   the library, because that is what shell completion and a file manager both
+///   produce;
+/// - either of the above with a trailing `/`, which is ignored.
+///
+/// # Errors
+///
+/// A [`PathError`][mpdfm_core::paths::PathError] for a path that cannot name
+/// something inside the library — one with a `..` in it, an absolute path
+/// elsewhere on the disk, a name that is not valid UTF-8. This is a usability
+/// check and not the safety boundary: every filesystem step is guarded again
+/// against the root in [`exec_fs`][mpdfm_core::ops::exec_fs], which is where
+/// safety invariant 5 actually lives.
+fn inside(raw: &Utf8Path, music_dir: &Utf8Path) -> Result<RelPath> {
+    let trimmed = raw.as_str().trim_end_matches('/');
+    anyhow::ensure!(!trimmed.is_empty(), "{raw} does not name anything");
+    let path = Utf8Path::new(trimmed);
+
+    if !path.is_absolute() {
+        return RelPath::parse(trimmed)
+            .with_context(|| format!("{raw} is not a path inside {music_dir}"));
+    }
+
+    // Lexically under the root is the common case, and `music_dir` has already
+    // been canonicalized by `config::resolve`.
+    if let Ok(rel) = RelPath::from_abs(path, music_dir) {
+        return Ok(rel);
+    }
+
+    // Not lexically under it: a path typed through a symlink, or with a `..` in
+    // the middle. Resolve what exists of it and measure again, which is what
+    // `paths::contains` does to decide — so the two cannot disagree.
+    anyhow::ensure!(
+        paths::contains(music_dir, path),
+        "{path} is not inside the music directory {music_dir}"
+    );
+    let resolved = resolve_existing(path);
+    RelPath::from_abs(&resolved, music_dir)
+        .with_context(|| format!("{raw} is not a path inside {music_dir}"))
+}
+
+/// `path` with its existing part canonicalized, so a symlinked or `..`-laden
+/// spelling can be measured against the root.
+///
+/// A destination does not exist yet, so the file name is kept as typed and only
+/// the directory above it is resolved. Anything that cannot be canonicalized at
+/// all comes back unchanged, and the caller's `from_abs` then refuses it.
+fn resolve_existing(path: &Utf8Path) -> Utf8PathBuf {
+    if let Ok(real) = path.canonicalize_utf8() {
+        return real;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => parent
+            .canonicalize_utf8()
+            .map_or_else(|_| path.to_owned(), |real| real.join(name)),
+        _ => path.to_owned(),
+    }
 }
 
 #[cfg(test)]

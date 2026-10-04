@@ -6,6 +6,9 @@ members = ["crates/core"]
 mpdfm-core = { path = "crates/core" }
 
 anyhow = "=1.0.104"
+# Drives the real `mpdfm` binary from the integration tests (task 15): the same
+# path the user takes, rather than calling `cli::run` in-process.
+assert_cmd = "=2.2.2"
 camino = { version = "=1.2.6", features = ["serde1"] }
 clap = { version = "=4.6.7", features = ["derive"] }
 crossterm = "=0.29.0"
@@ -42,6 +45,15 @@ anyhow.workspace = true
 camino.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+
+# `tests/` drives the built binary against a `Fixture`, which lives behind
+# core's `testing` feature. Cargo unifies this with the dependency above, so the
+# lib is still built once — and a `cargo build` resolves no dev-dependency at
+# all, which is what keeps the fixture builder out of a release binary.
+[dev-dependencies]
+mpdfm-core = { workspace = true, features = ["testing"] }
+
+assert_cmd.workspace = true
 
 [profile.release]
 strip = true

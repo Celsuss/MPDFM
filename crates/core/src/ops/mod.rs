@@ -57,5 +57,6 @@ pub mod render;
 
 pub use commit::{CommitError, CommitWarning, Committed, Previewed};
 pub use effects::{Conflict, Effects, OpEffect, Summary, Warning};
+pub use exec_fs::Merge;
 pub use op::{Operation, Plan};
-pub use plan::Live;
+pub use plan::{Live, Prefs};
