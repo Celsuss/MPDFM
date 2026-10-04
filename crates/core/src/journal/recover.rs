@@ -58,9 +58,10 @@
 
 use std::time::SystemTime;
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::config::Config;
+use crate::mpd::state;
 use crate::ops::exec_fs::{Done, Facts, FsStep, Method, RemovedDir, StepReceipt};
 use crate::paths::RelPath;
 use crate::playlist::rewrite;
@@ -737,16 +738,15 @@ pub fn roll_back(
 
 /// Finish a half-finished transaction instead of reversing it.
 ///
-/// Does the steps it had not got to, writes the playlists it had not written,
-/// and marks its own record `complete` — there is no new record, because this is
+/// Does the steps it had not got to, writes the playlists and MPD's saved queue
+/// it had not written, and marks its own record `complete` — there is no new record, because this is
 /// the same transaction carrying on rather than a new one undoing it. Undoing it
 /// afterwards is an ordinary `mpdfm undo`.
 ///
 /// # Errors
 ///
-/// As [`roll_back`], plus [`Error::NotImplemented`] for a record that changes
-/// MPD's saved queue (task 14), and [`Error::Rewrite`] or [`Error::Io`] if a
-/// playlist cannot be written.
+/// As [`roll_back`], plus [`Error::Rewrite`], [`Error::State`] or [`Error::Io`]
+/// if a playlist or MPD's state file cannot be written.
 pub fn roll_forward(
     store: &Store,
     record: &Record,
@@ -761,13 +761,6 @@ pub fn roll_forward(
         }
         .into());
     }
-    if !record.state_edits.is_empty() {
-        return Err(Error::not_implemented(
-            "finishing a transaction that rewrites MPD's saved queue",
-            "14-mpd-state-queue.md",
-        ));
-    }
-
     let mut mine = survey.repair(store, record)?;
     let action = Action::continuing(record.direction);
     // An interrupted undo carries on reversing, and a reversal works from the
@@ -816,12 +809,16 @@ pub fn roll_forward(
     };
 
     match target {
-        // Finish the commit: write the playlists it had not written.
-        None => finish_playlists(record, options.force, &mut warnings)?,
-        // Finish the undo: put the playlists back to what the transaction it was
-        // undoing had copied, and mark that transaction reverted now that its
-        // reversal is complete.
-        Some(target) => finish_reversal(store, record, &target)?,
+        // Finish the commit: write the playlists and the saved queue it had not
+        // written.
+        None => {
+            finish_playlists(record, options.force, &mut warnings)?;
+            finish_state_file(record, config, options.force, &mut warnings)?;
+        }
+        // Finish the undo: put the playlists and the saved queue back to what the
+        // transaction it was undoing had copied, and mark that transaction
+        // reverted now that its reversal is complete.
+        Some(target) => finish_reversal(store, record, config, &target, &mut warnings)?,
     }
 
     mine.finish(Status::Complete, SystemTime::now());
@@ -923,6 +920,83 @@ fn finish_playlists(record: &Record, force: bool, warnings: &mut Vec<UndoWarning
     Ok(())
 }
 
+/// Write MPD's saved queue a commit had not got to.
+///
+/// The same three-way comparison [`finish_playlists`] makes, and for the same
+/// reason: a state file that already holds what the transaction would have
+/// written is left alone, one that still holds the backup's bytes is written, and
+/// one that holds neither has been written by somebody else since — which for
+/// this particular file means MPD, because the daemon saves it on shutdown — and
+/// stops the recovery unless `force` says otherwise.
+///
+/// A record with no state edits is nothing to do, and [`Record::state_edits`] is
+/// the authority exactly as it is for undo: a commit copies the state file
+/// whenever it is configured to rewrite one, and finishing a rewrite no edit ever
+/// named would throw away whatever MPD has written since.
+///
+/// # Errors
+///
+/// [`RecoverError::Blocked`] for a state file that has changed since, unless
+/// `force`; [`Error::Io`] if the backup or the file cannot be read, and
+/// [`Error::State`] if the backup is not what the record says it is.
+fn finish_state_file(
+    record: &Record,
+    config: &Config,
+    force: bool,
+    warnings: &mut Vec<UndoWarning>,
+) -> Result<()> {
+    if record.state_edits.is_empty() {
+        return Ok(());
+    }
+    let Some((state_file, backup)) = config.state_file.as_ref().zip(
+        record
+            .state_backup
+            .as_ref()
+            .map(|name| record.backup_dir.join(name)),
+    ) else {
+        warnings.push(UndoWarning::State(
+            "the transaction changed it but there is no copy to finish from".to_owned(),
+        ));
+        return Ok(());
+    };
+
+    let read = |path: &Utf8Path| {
+        std::fs::read(path).map_err(|source| Error::Io {
+            path: path.to_string(),
+            source,
+        })
+    };
+    let before = read(&backup)?;
+    let after = state::after(state_file, &before, &record.state_edits)?;
+    let current = read(state_file)?;
+    if current == after {
+        return Ok(());
+    }
+    if current != before {
+        let problem = Problem {
+            at: state_file.clone(),
+            what: Trouble::PlaylistChanged,
+            detail: format!(
+                "{} has changed since the transaction's backup was taken; MPD                  writes this file when it shuts down",
+                state_file.file_name().unwrap_or("state"),
+            ),
+            step: None,
+        };
+        if !force {
+            return Err(RecoverError::Blocked {
+                txid: record.txid.clone(),
+                problems: vec![problem],
+            }
+            .into());
+        }
+        warnings.push(UndoWarning::PlaylistOverwritten {
+            file_name: state_file.file_name().unwrap_or("state").to_owned(),
+            kept: record.backup_dir.clone(),
+        });
+    }
+    state::replace(state_file, &after)
+}
+
 /// The transaction an interrupted undo was reversing.
 ///
 /// Its record holds the receipts the reversal was working from and the backups
@@ -954,11 +1028,18 @@ fn reversing(store: &Store, record: &Record) -> Result<Record> {
     })
 }
 
-/// Finish an interrupted undo: the playlists go back to what the transaction it
-/// was undoing had copied, and that transaction is marked reverted now that the
-/// reversal has finished.
-fn finish_reversal(store: &Store, record: &Record, target: &Record) -> Result<()> {
+/// Finish an interrupted undo: the playlists and MPD's saved queue go back to
+/// what the transaction it was undoing had copied, and that transaction is marked
+/// reverted now that the reversal has finished.
+fn finish_reversal(
+    store: &Store,
+    record: &Record,
+    config: &Config,
+    target: &Record,
+    warnings: &mut Vec<UndoWarning>,
+) -> Result<()> {
     rewrite::restore(&target.playlist_edits, &target.backup_dir)?;
+    undo::restore_state_file(target, config, warnings);
 
     let mut reverted = target.clone();
     reverted.status = Status::Reverted;

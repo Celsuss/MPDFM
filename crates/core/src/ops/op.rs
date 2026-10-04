@@ -18,6 +18,7 @@ use crate::paths::RelPath;
 use crate::playlist::PlaylistIndex;
 
 use super::effects::Effects;
+use super::plan::Live;
 
 /// One thing the user asked for.
 ///
@@ -190,7 +191,27 @@ impl Plan {
     /// the first thing.
     #[must_use]
     pub fn validate(&self, lib: &Library, idx: &PlaylistIndex, cfg: &Config) -> Effects {
-        super::plan::validate(self, lib, idx, cfg)
+        self.validate_live(lib, idx, cfg, &Live::default())
+    }
+
+    /// [`Plan::validate`], told what MPD is holding in memory.
+    ///
+    /// The one answer that changes: with a live queue in hand the preview warns
+    /// about MPD's saved queue instead of rewriting its file, because the daemon
+    /// overwrites that file from memory when it stops. See [`Live`].
+    ///
+    /// A caller that does not talk to MPD — every test that is not about this,
+    /// and `--no-mpd` — wants [`Plan::validate`], which is this with
+    /// [`Live::default`].
+    #[must_use]
+    pub fn validate_live(
+        &self,
+        lib: &Library,
+        idx: &PlaylistIndex,
+        cfg: &Config,
+        live: &Live<'_>,
+    ) -> Effects {
+        super::plan::validate(self, lib, idx, cfg, live)
     }
 }
 

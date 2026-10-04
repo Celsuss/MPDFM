@@ -2,7 +2,7 @@
 
 - **Phase:** M1 · Trustworthy move engine
 - **Depends on:** 06, 11, 13
-- **Status:** not started
+- **Status:** done
 
 ## Goal
 
@@ -55,22 +55,54 @@ Safety rules specific to this file:
 - Back up the state file into the transaction backup dir (task 11) and restore
   it wholesale on undo.
 
+**Decided: the recommended default, exactly.** `rewrite_saved_queue = true`
+(unchanged), and the on-disk rewrite happens only when the daemon did not answer.
+The seam is `ops::Live { queue: Option<&[RelPath]> }`, passed to
+`Plan::validate_live` and to `commit::Options`: `Some` means MPD answered, so
+`Effects::state_edits` stays empty and each moved file in that queue becomes a
+`Warning::InMpdQueue` naming it; `None` means it did not, so the file *is* the
+queue and gets rewritten. Core opens no socket to find out — the caller passes
+what it heard, the same arrangement `commit::Updater` uses on the way out. The
+optional "write it anyway while MPD runs" was **not** built: it would hand the
+user a file the daemon is going to overwrite, which is the dishonesty the
+pitfall below warns about. Documented in `docs/config.example.toml` and on
+`mpd::state`.
+
+Two shapes beyond `N:path` turned up in MPD's own writer
+(`QueueSave.cxx`/`PlaylistState.cxx`) and are handled: a queue entry that is not
+a plain database song (a stream, or a song with a start/end time) spans several
+lines in a long format, and any entry may be followed by `Prio: N`. So a line
+inside the section that does not begin `<digits>:` belongs to the entry above it
+and is removed with it; a `N:` line whose remainder is not a library path keeps
+its *number* maintained but is never rewritten. `current:` was confirmed against
+the real file to be a 0-based queue **position** (`OrderToPosition`), not a song
+id.
+
 ## Acceptance criteria
 
-- [ ] parse → serialize of the real state file is byte-identical
-- [ ] a move rewrites only the matching queue lines; `state:`, `current:`,
+- [x] parse → serialize of the real state file is byte-identical
+- [x] a move rewrites only the matching queue lines; `state:`, `current:`,
       `audio_device_state` and unknown keys are untouched
-- [ ] removing an entry renumbers subsequent indices and fixes `current:`
-- [ ] when MPD is reachable, the preview warns for each moved file present in
+- [x] removing an entry renumbers subsequent indices and fixes `current:`
+- [x] when MPD is reachable, the preview warns for each moved file present in
       the live queue, naming them
-- [ ] when MPD is not reachable, the file is rewritten and backed up
-- [ ] undo restores the state file exactly
-- [ ] `rewrite_saved_queue = false` skips the file entirely
-- [ ] a state file with no `playlist_begin` section is handled without error
+- [x] when MPD is not reachable, the file is rewritten and backed up
+- [x] undo restores the state file exactly
+- [x] `rewrite_saved_queue = false` skips the file entirely
+- [x] a state file with no `playlist_begin` section is handled without error
 
 ## Files
 
-`crates/core/src/mpd/state.rs`
+`crates/core/src/mpd/state.rs`, `tests/data/states/`, `tests/mpd_state.rs`
+
+Also touched: `ops/plan.rs` (the `Live` seam and the `saved_queue` pass),
+`ops/op.rs` (`Plan::validate_live`), `ops/effects.rs`
+(`Warning::StateUnreadable`), `ops/commit.rs` (step 2 verifies the state file
+before anything moves, step 5 writes it), `journal/recover.rs`
+(`finish_state_file`), `journal/undo.rs` (restore through the atomic writer).
+`playlist::parse`'s line-splitting and `playlist::write`'s atomic
+temp-file + `rename` are reused rather than reimplemented, so the state file and
+a playlist cannot drift apart on fidelity or on crash safety.
 
 ## Pitfalls
 

@@ -58,14 +58,21 @@
 //! commands. The split is what makes the parser testable from the recorded
 //! transcripts in `tests/transcripts/` with no daemon in CI, and
 //! [`Mpd::handshake`] is the seam: it takes anything that reads and writes.
+//!
+//! [`state`] is the odd one out: MPD's *state file*, which is a file on disk
+//! rather than anything on the wire. It lives here because the saved queue it
+//! holds is MPD's data and because deciding whether to rewrite it depends on
+//! whether the daemon above is answering — see its module documentation.
 
 pub mod client;
 pub mod proto;
+pub mod state;
 
 pub use client::{DEFAULT_TIMEOUT, Mpd, Stream, connect_if_enabled};
 pub use proto::{
     Ack, AckCode, JobId, Line, PlayState, Response, Status, Version, classify, command_line, quote,
 };
+pub use state::{MpdState, StateError, StateLine};
 
 /// Why talking to MPD did not work.
 ///

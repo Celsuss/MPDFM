@@ -50,6 +50,10 @@ pub enum Error {
     #[error(transparent)]
     Playlist(#[from] playlist::ParseError),
 
+    /// MPD's state file could not be parsed, or an edit no longer matches it.
+    #[error(transparent)]
+    State(#[from] mpd::state::StateError),
+
     /// Talking to the MPD daemon did not work. Never fatal on its own — the
     /// filesystem is the source of truth (`docs/PLAN.md` D6) — but it travels as
     /// an `Error` so a command that only talks to MPD can return one.

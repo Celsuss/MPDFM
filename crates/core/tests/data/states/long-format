@@ -1,0 +1,11 @@
+state: play
+current: 1
+playlist_begin
+0:electronic/KREAM - So Hï [c0D2h71bFFI]/01 So Hï.mp3
+Prio: 3
+1:song_begin: https://ice.somafm.com/groovesalad-256-mp3
+Time: -1
+Title: Groove Salad
+song_end
+2:hiphop/MF DOOM - Mm..Food (2004) [V0] scene-tag/01 Beef Rap.mp3
+playlist_end

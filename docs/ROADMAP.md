@@ -27,7 +27,7 @@ a CLI that can scan, diagnose, move safely and undo.
 | 11 | [Two-phase commit and journal](tasks/11-journal-and-commit.md) | 08, 09, 10 | done |
 | 12 | [Undo and recover](tasks/12-undo-and-recover.md) | 11 | done |
 | 13 | [Minimal MPD client](tasks/13-mpd-client.md) | 04 | done |
-| 14 | [MPD saved-queue rewriting](tasks/14-mpd-state-queue.md) | 06, 11, 13 | not started |
+| 14 | [MPD saved-queue rewriting](tasks/14-mpd-state-queue.md) | 06, 11, 13 | done |
 | 15 | [CLI: scan, doctor, move, undo](tasks/15-cli-move-and-doctor.md) | 04, 05, 07, 10–14 | not started |
 
 **M1 is done when:** `mpdfm move` on a copy of the real library relocates an

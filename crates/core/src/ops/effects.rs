@@ -58,9 +58,15 @@ pub struct Effects {
     /// disagree about which lines are affected because they are the same value.
     pub playlist_edits: Vec<PlaylistEdit>,
 
-    /// The same, for MPD's saved queue in `state`. Always empty until task 14,
-    /// which owns reading and writing that file; the field is here because the
-    /// preview's shape must not change when it arrives.
+    /// The same, for MPD's saved queue in `state`, indexed into
+    /// [`MpdState::lines`][crate::mpd::state::MpdState::lines].
+    ///
+    /// Empty whenever there is nothing to do to that file — and also, by design,
+    /// whenever **MPD is reachable**: the daemon rewrites this file from memory
+    /// when it shuts down, so an on-disk edit behind a running MPD would be
+    /// erased. In that case the queue turns up as [`Warning::InMpdQueue`]
+    /// instead, one per moved file that is in it. See
+    /// [`Live`][super::Live] and `crate::mpd::state`.
     pub state_edits: Vec<LineEdit>,
 
     /// Reasons this plan will not be committed. Non-empty means refused.
@@ -246,12 +252,32 @@ pub enum Warning {
         lines: usize,
     },
 
-    /// A file being moved is in MPD's current queue, which holds absolute paths
-    /// MPDFM does not rewrite. Filled in by task 13, which is what can ask MPD.
+    /// A file being moved is in MPD's **live** queue.
+    ///
+    /// The daemon holds that queue in memory and writes it over the state file
+    /// when it stops, so there is nothing MPDFM can edit that would survive:
+    /// those entries point at nothing until they are requeued. Raised instead of
+    /// an [`Effects::state_edits`] whenever MPD answered — see
+    /// [`Live`][super::Live].
     #[error("{path} is in MPD's current queue and will need a requeue")]
     InMpdQueue {
         /// The file.
         path: RelPath,
+    },
+
+    /// MPD's state file is configured and could not be read, so its saved queue
+    /// was neither examined nor rewritten.
+    ///
+    /// Informational rather than refusing: the queue is MPD's cache of what the
+    /// user was listening to, and a move that leaves it stale is a worse outcome
+    /// than a move that does not happen only in the eyes of someone who was not
+    /// asking to move anything.
+    #[error("{path}: MPD's saved queue was not examined: {reason}")]
+    StateUnreadable {
+        /// The state file, as configured.
+        path: String,
+        /// Why it could not be read.
+        reason: String,
     },
 
     /// A playlist entry near the affected paths already does not resolve. Not

@@ -15,6 +15,11 @@
 //! one, never a truncated file, and because the temp file is a sibling the rename
 //! is atomic — across a filesystem boundary it would not be.
 //!
+//! [`replace_file`] is `pub(crate)` because MPD's state file
+//! ([`mpd::state`][crate::mpd::state]) needs exactly this and must not have a
+//! second implementation of it: two atomic writers would be two chances to get
+//! the symlink, the permission bits or the directory `fsync` wrong.
+//!
 //! Three details that are each there for a reason:
 //!
 //! - **The target is never opened for writing.** Truncating the file in place
@@ -72,7 +77,7 @@ const BOM: &str = "\u{feff}";
 /// `fsync`ed, and then the failure the test cannot cause from outside. The
 /// production path passes [`Stop::Never`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Stop {
+pub(crate) enum Stop {
     /// Complete the write.
     Never,
     /// Fail after the temp file is written and synced, before the rename.
@@ -91,7 +96,7 @@ const TEMP_ATTEMPTS: u32 = 16;
 /// Replace `target` with `bytes`, atomically, preserving `target`'s mode.
 ///
 /// `target` must be a real file, not a symlink: see the [module docs][self].
-pub(super) fn replace_file(target: &Utf8Path, bytes: &[u8], stop: Stop) -> Result<()> {
+pub(crate) fn replace_file(target: &Utf8Path, bytes: &[u8], stop: Stop) -> Result<()> {
     let io = |source: std::io::Error| Error::Io {
         path: target.to_string(),
         source,
@@ -101,8 +106,8 @@ pub(super) fn replace_file(target: &Utf8Path, bytes: &[u8], stop: Stop) -> Resul
         Ok(metadata) if metadata.is_symlink() => {
             return Err(io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "refusing to write through a symlink; load the playlist with \
-                 Playlist::load, which resolves it",
+                "refusing to write through a symlink; load the file with \
+                 Playlist::load or MpdState::load, which resolve it",
             )));
         }
         Ok(metadata) => Some(metadata),
@@ -116,7 +121,7 @@ pub(super) fn replace_file(target: &Utf8Path, bytes: &[u8], stop: Stop) -> Resul
     let dir = dir.ok_or_else(|| {
         io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "playlist path has no directory to write a temp file in",
+            "the path has no directory to write a temp file in",
         ))
     })?;
 

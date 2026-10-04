@@ -115,7 +115,7 @@ pub(super) fn parse(path: &Utf8Path, bytes: &[u8]) -> Result<Parsed, ParseError>
 /// Deciding this by counting, rather than from the first terminator, is what
 /// keeps a mixed file byte-exact: the odd `\r` then belongs to its line's text
 /// instead of to a terminator the writer would re-emit in the wrong places.
-fn line_ending_of(text: &str) -> LineEnding {
+pub(crate) fn line_ending_of(text: &str) -> LineEnding {
     let newlines = text.matches('\n').count();
     if newlines > 0 && newlines == text.matches("\r\n").count() {
         LineEnding::Crlf
@@ -129,7 +129,7 @@ fn line_ending_of(text: &str) -> LineEnding {
 /// A terminated line in a CRLF file gives up its `\r`, because the writer puts
 /// one back. An **unterminated** final line is taken verbatim, `\r` and all,
 /// because the writer will not — `Windows.m3u` ends this way.
-fn split_lines(text: &str, line_ending: LineEnding) -> impl Iterator<Item = &str> {
+pub(crate) fn split_lines(text: &str, line_ending: LineEnding) -> impl Iterator<Item = &str> {
     let mut rest = text;
     std::iter::from_fn(move || {
         if rest.is_empty() {

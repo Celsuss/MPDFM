@@ -58,9 +58,9 @@
 //! [`crate::paths::contains`] is that check.
 
 mod index;
-mod parse;
+pub(crate) mod parse;
 pub mod rewrite;
-mod write;
+pub(crate) mod write;
 
 pub use index::{IndexWarning, PlaylistIndex, Ref};
 pub use parse::ParseError;
@@ -424,7 +424,11 @@ pub fn is_playlist_name(file_name: &str) -> bool {
 /// The parent is canonicalized separately from the file name: canonicalizing the
 /// whole path would fail for a playlist that does not exist yet, which a caller
 /// creating one has every right to hand us.
-fn real_path_of(path: &Utf8Path) -> Result<Utf8PathBuf> {
+///
+/// `pub(crate)` for [`mpd::state`][crate::mpd::state], which has the same
+/// problem with the same answer: MPD's state file can be a symlink into a
+/// dotfiles repository, and the atomic write must replace its target.
+pub(crate) fn real_path_of(path: &Utf8Path) -> Result<Utf8PathBuf> {
     let io = |source: std::io::Error| Error::Io {
         path: path.to_string(),
         source,

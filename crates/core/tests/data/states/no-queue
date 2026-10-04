@@ -1,0 +1,5 @@
+sw_volume: 100
+state: stop
+random: 1
+future_key_from_a_newer_mpd: 7
+audio_device_state:0:ALSA
