@@ -4,7 +4,10 @@ A terminal application for managing an [MPD](https://www.musicpd.org/) music
 library: edit metadata, and re-organize directories **without breaking your
 playlists**.
 
-> Status: design complete, implementation not started.
+> Status: **M1 complete** — the move engine and its CLI work and are tested.
+> `mpdfm scan`, `mpdfm doctor`, `mpdfm move` (with `--dry-run`, a confirmation
+> prompt and `--json`), `mpdfm undo` and `mpdfm recover` are usable today. Tag
+> editing (M2) and the TUI (M3) are next.
 > See [`docs/PLAN.md`](docs/PLAN.md) and [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Why

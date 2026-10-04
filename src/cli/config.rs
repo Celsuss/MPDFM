@@ -10,7 +10,8 @@ use std::process::ExitCode;
 use anyhow::Result;
 use mpdfm_core::config::{Config, ConfigWarning};
 
-use super::{Cli, EXIT_OK};
+use super::Cli;
+use crate::output::Exit;
 
 /// Print the resolved configuration.
 pub fn show(cli: &Cli, config: &Config, warnings: &[ConfigWarning]) -> Result<ExitCode> {
@@ -19,7 +20,7 @@ pub fn show(cli: &Cli, config: &Config, warnings: &[ConfigWarning]) -> Result<Ex
     } else {
         print_table(config, warnings);
     }
-    Ok(EXIT_OK)
+    Ok(Exit::Ok.into())
 }
 
 fn print_table(config: &Config, warnings: &[ConfigWarning]) {

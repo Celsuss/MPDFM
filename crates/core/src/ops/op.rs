@@ -18,7 +18,7 @@ use crate::paths::RelPath;
 use crate::playlist::PlaylistIndex;
 
 use super::effects::Effects;
-use super::plan::Live;
+use super::plan::{Live, Prefs};
 
 /// One thing the user asked for.
 ///
@@ -191,7 +191,7 @@ impl Plan {
     /// the first thing.
     #[must_use]
     pub fn validate(&self, lib: &Library, idx: &PlaylistIndex, cfg: &Config) -> Effects {
-        self.validate_live(lib, idx, cfg, &Live::default())
+        self.validate_with(lib, idx, cfg, &Live::default(), Prefs::default())
     }
 
     /// [`Plan::validate`], told what MPD is holding in memory.
@@ -211,7 +211,26 @@ impl Plan {
         cfg: &Config,
         live: &Live<'_>,
     ) -> Effects {
-        super::plan::validate(self, lib, idx, cfg, live)
+        self.validate_with(lib, idx, cfg, live, Prefs::default())
+    }
+
+    /// [`Plan::validate_live`], told what the user asked for about the plan as a
+    /// whole — today that is `--merge`. See [`Prefs`].
+    ///
+    /// Whatever is passed here must also be passed to
+    /// [`commit::Options::prefs`][super::commit::Options::prefs], because commit
+    /// re-validates and a different answer there is
+    /// [`Drift`][super::commit::Drift].
+    #[must_use]
+    pub fn validate_with(
+        &self,
+        lib: &Library,
+        idx: &PlaylistIndex,
+        cfg: &Config,
+        live: &Live<'_>,
+        prefs: Prefs,
+    ) -> Effects {
+        super::plan::validate(self, lib, idx, cfg, live, prefs)
     }
 }
 

@@ -98,7 +98,7 @@ use crate::{Error, Result};
 use super::effects::{Conflict, Effects};
 use super::exec_fs::{self, FsError, FsStep, FsWarning};
 use super::op::Plan;
-use super::plan::{Live, PENDING_TX};
+use super::plan::{Live, PENDING_TX, Prefs};
 
 /// Everything the preview was computed from, and what it produced.
 ///
@@ -159,6 +159,14 @@ pub struct Options<'a> {
     /// honest outcome for a daemon that started up while the user was reading
     /// the preview.
     pub live: Live<'a>,
+
+    /// What the user asked for about the plan as a whole — `--merge`.
+    ///
+    /// **It must be the same value the preview was given**, for the same reason
+    /// as `live`: re-validating with [`Merge::Refuse`][super::exec_fs::Merge]
+    /// a plan the user previewed with `--merge` expands into a different number
+    /// of steps, which is [`Drift::Steps`].
+    pub prefs: Prefs,
 }
 
 impl std::fmt::Debug for Options<'_> {
@@ -169,6 +177,7 @@ impl std::fmt::Debug for Options<'_> {
             .field("inject", &self.inject)
             .field("update", &self.update.map(|_| "<fn>"))
             .field("live", &self.live)
+            .field("prefs", &self.prefs)
             .finish()
     }
 }
@@ -429,9 +438,13 @@ pub fn commit_with(
     let root = config.require_music_dir()?.to_owned();
     let fresh_library = Library::scan(&root)?;
     let (fresh_index, _warnings) = PlaylistIndex::load(&config.playlist_dir);
-    let fresh = previewed
-        .plan
-        .validate_live(&fresh_library, &fresh_index, config, &options.live);
+    let fresh = previewed.plan.validate_with(
+        &fresh_library,
+        &fresh_index,
+        config,
+        &options.live,
+        options.prefs,
+    );
     let drift = drift(previewed, &fresh_library, &fresh);
     if !drift.is_empty() {
         return Err(CommitError::Stale { drift }.into());
