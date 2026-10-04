@@ -43,6 +43,12 @@
 # Rewrite the saved queue in the state file when a move changes a path it
 # references. Turn this off if you would rather lose the queue than have MPDFM
 # edit MPD's own file.
+#
+# This only ever happens when MPD is **not** reachable, because the daemon
+# overwrites the state file from its in-memory queue when it shuts down, so an
+# edit made behind a running MPD would be thrown away. With MPD running, the
+# preview instead warns about each moved file that is in the live queue: those
+# entries point at nothing until you requeue them.
 # rewrite_saved_queue = true
 
 # Ask MPD to rescan the affected directories after a commit.

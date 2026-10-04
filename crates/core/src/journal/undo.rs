@@ -87,6 +87,7 @@ use std::time::SystemTime;
 use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::config::Config;
+use crate::mpd::state;
 use crate::ops::commit::{self, Updater};
 use crate::ops::exec_fs::{self, Done, Facts, FsError, FsStep, FsWarning, Method, StepReceipt};
 use crate::playlist::rewrite;
@@ -1395,7 +1396,17 @@ fn back_up_state_file(
 /// A warning rather than a failure: the library and the playlists are already
 /// consistent by the time this runs, and MPD rereads its state file when it is
 /// restarted either way.
-fn restore_state_file(record: &Record, config: &Config, warnings: &mut Vec<UndoWarning>) {
+///
+/// Unconditional, like [`rewrite::restore`], and wholesale: the backup is a copy
+/// of the entire file, so what goes back is every byte the transaction found —
+/// the renumbered entries, the `current:` line, and the keys MPDFM never looked
+/// at. `pub(super)` for [`recover`][super::recover], which does the same thing
+/// when it finishes an interrupted undo.
+pub(super) fn restore_state_file(
+    record: &Record,
+    config: &Config,
+    warnings: &mut Vec<UndoWarning>,
+) {
     if record.state_edits.is_empty() {
         return;
     }
@@ -1411,8 +1422,19 @@ fn restore_state_file(record: &Record, config: &Config, warnings: &mut Vec<UndoW
         ));
         return;
     };
-    if let Err(source) = std::fs::copy(record.backup_dir.join(name), state_file) {
-        warnings.push(UndoWarning::State(format!("{state_file}: {source}")));
+    // Through the state module's atomic writer rather than `fs::copy`: it
+    // resolves a state file that is a symlink into a dotfiles repository, and it
+    // leaves either the whole old queue or the whole new one if this is the
+    // moment the power goes.
+    let backup = record.backup_dir.join(name);
+    let restored = std::fs::read(&backup)
+        .map_err(|source| Error::Io {
+            path: backup.to_string(),
+            source,
+        })
+        .and_then(|bytes| state::replace(state_file, &bytes));
+    if let Err(err) = restored {
+        warnings.push(UndoWarning::State(err.to_string()));
     }
 }
 

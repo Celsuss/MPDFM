@@ -40,8 +40,8 @@
 //!    pending, fsync the file and the dir
 //! 4  execute the fs steps, flushing the       the library changes
 //!    journal after each one
-//! 5  apply the playlist edits (task 09)       the playlists change
-//!    and the state edits (task 14)
+//! 5  apply the playlist edits (task 09)       the playlists and MPD's
+//!    and the state edits (task 14)             saved queue change
 //! 6  status: complete, fsync                  nothing mutated
 //! 7  ask MPD to rescan                        a warning at worst
 //! ```
@@ -89,15 +89,16 @@ use crate::config::Config;
 use crate::journal::record::{Record, Status, StepRecord, TxId};
 use crate::journal::store::{Kept, Pruned, Store};
 use crate::library::{DirPath, Entry, Library};
+use crate::mpd::state;
 use crate::paths::RelPath;
 use crate::playlist::PlaylistIndex;
-use crate::playlist::rewrite;
+use crate::playlist::rewrite::{self, LineEdit};
 use crate::{Error, Result};
 
 use super::effects::{Conflict, Effects};
 use super::exec_fs::{self, FsError, FsStep, FsWarning};
 use super::op::Plan;
-use super::plan::PENDING_TX;
+use super::plan::{Live, PENDING_TX};
 
 /// Everything the preview was computed from, and what it produced.
 ///
@@ -148,6 +149,16 @@ pub struct Options<'a> {
     /// both on. `None` means there is nothing to ask with, which is not a
     /// failure.
     pub update: Option<Updater<'a>>,
+
+    /// What MPD was holding when the preview was made.
+    ///
+    /// **It must be the same value the preview was given.** Step 1 re-validates
+    /// the plan, and whether MPD answered decides whether the saved queue is
+    /// rewritten or merely warned about — so passing a different answer here
+    /// shows up as [`Drift::Playlists`] and refuses the commit, which is the
+    /// honest outcome for a daemon that started up while the user was reading
+    /// the preview.
+    pub live: Live<'a>,
 }
 
 impl std::fmt::Debug for Options<'_> {
@@ -157,6 +168,7 @@ impl std::fmt::Debug for Options<'_> {
             .field("verify", &self.verify)
             .field("inject", &self.inject)
             .field("update", &self.update.map(|_| "<fn>"))
+            .field("live", &self.live)
             .finish()
     }
 }
@@ -413,22 +425,13 @@ pub fn commit_with(
     if previewed.effects.fs_steps.is_empty() {
         return Err(CommitError::Nothing.into());
     }
-    if !previewed.effects.state_edits.is_empty() {
-        // Nothing has been touched, so refusing here costs the user nothing but
-        // the message. Silently skipping them would lose the saved queue.
-        return Err(Error::not_implemented(
-            "rewriting MPD's saved queue",
-            "14-mpd-state-queue.md",
-        ));
-    }
-
     // Step 1 — re-validate against a fresh scan.
     let root = config.require_music_dir()?.to_owned();
     let fresh_library = Library::scan(&root)?;
     let (fresh_index, _warnings) = PlaylistIndex::load(&config.playlist_dir);
     let fresh = previewed
         .plan
-        .validate(&fresh_library, &fresh_index, config);
+        .validate_live(&fresh_library, &fresh_index, config, &options.live);
     let drift = drift(previewed, &fresh_library, &fresh);
     if !drift.is_empty() {
         return Err(CommitError::Stale { drift }.into());
@@ -452,6 +455,10 @@ pub fn commit_with(
     // before the first file moves.
     let playlists = rewrite::prepare(&fresh.playlist_edits)?;
     playlists.back_up(&backup_dir)?;
+    // The same reasoning for MPD's saved queue: a state file the daemon has
+    // saved since the preview must stop the transaction here, with nothing moved,
+    // rather than at step 5 with the library already rearranged.
+    let saved_queue = prepare_state_file(config, &fresh.state_edits)?;
     let state_backup = back_up_state_file(config, &backup_dir)?;
 
     // Step 3 — the record, durable, before anything is mutated.
@@ -512,12 +519,19 @@ pub fn commit_with(
         return Err(injected(&txid, "after the filesystem steps"));
     }
 
-    // Step 5 — the playlists, and the saved queue once task 14 exists.
+    // Step 5 — the playlists, and MPD's saved queue.
     let inject = match options.inject {
         Inject::BeforePlaylistWrite(at) => rewrite::Inject::FailBeforeWriting(at),
         _ => rewrite::Inject::Nothing,
     };
-    if let Err(err) = playlists.write_with(inject) {
+    // The saved queue goes last of the two: its bytes were computed and verified
+    // at step 2, so the only thing that can fail here is the write itself, and a
+    // failed state-file write with every playlist already correct is the smaller
+    // half to recover.
+    let edits = playlists
+        .write_with(inject)
+        .and_then(|()| saved_queue.as_ref().map_or(Ok(()), state::Prepared::write));
+    if let Err(err) = edits {
         // An injected failure is a crash, not a failure: it leaves the record
         // exactly as a power cut would, which is the state task 12 has to cope
         // with. A real one is recorded.
@@ -769,11 +783,37 @@ fn create_backup_parents(steps: &[FsStep]) -> Result<()> {
     Ok(())
 }
 
+/// Read MPD's saved queue and work out the bytes `state_edits` leaves in it,
+/// writing nothing.
+///
+/// `None` when there is nothing to do: no edits (which is also what a reachable
+/// daemon produces — see [`Live`]), the rewrite switched off, or no `state_file`
+/// configured. A non-empty edit list with no state file to apply it to cannot
+/// happen, since the edits were planned from that very file; it is treated as
+/// nothing to do rather than as a reason to fail a transaction.
+///
+/// # Errors
+///
+/// [`Error::Io`] if the file cannot be read and [`Error::State`] if an edit no
+/// longer matches it — MPD saved its state between the preview and the commit.
+fn prepare_state_file(
+    config: &Config,
+    state_edits: &[LineEdit],
+) -> Result<Option<state::Prepared>> {
+    if state_edits.is_empty() || !config.rewrite_saved_queue {
+        return Ok(None);
+    }
+    let Some(state_file) = &config.state_file else {
+        return Ok(None);
+    };
+    state::prepare(state_file, state_edits).map(Some)
+}
+
 /// Copy MPD's state file into the transaction's backup directory.
 ///
 /// Taken whenever [`Config::rewrite_saved_queue`] is on and the file is there,
-/// which is before MPDFM knows whether task 14 will have anything to change in it
-/// — a few kilobytes of insurance against the file MPDFM is configured to edit.
+/// whether or not there is anything to change in it — a few kilobytes of
+/// insurance against the file MPDFM is configured to edit.
 /// [`Record::state_edits`] stays the authority on whether it was actually
 /// changed, and undo must not restore a state file that no edit named.
 ///

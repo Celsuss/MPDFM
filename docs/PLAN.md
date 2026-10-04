@@ -108,8 +108,8 @@ MPDFM/
 │       ├── organize/             template parser + plan generator
 │       ├── mpd/                  minimal line-protocol client
 │       │   ├── proto.rs          quoting, line/ACK/status parsing — pure
-│       │   └── client.rs         the socket, timeouts, one fn per command
-│       ├── state.rs              MPD state-file queue rewriting
+│       │   ├── client.rs         the socket, timeouts, one fn per command
+│       │   └── state.rs          MPD state-file saved-queue rewriting
 │       └── doctor.rs             library health checks
 └── src/
     ├── main.rs                   clap subcommands; `mpdfm` with no args → TUI

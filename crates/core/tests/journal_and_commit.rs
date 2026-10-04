@@ -1218,26 +1218,38 @@ fn an_empty_plan_is_refused_rather_than_journaled() {
     assert_eq!(world.store().list().expect("lists"), Vec::new());
 }
 
+/// MPD's saved queue is backed up and journaled exactly like a playlist, which
+/// is what makes step 2's ordering hold for it too: the copy exists before the
+/// record that promises it, and the record is what `undo` believes. Task 14's own
+/// tests are in `tests/mpd_state.rs`; this one is here because the *sequence* is
+/// this file's subject.
 #[test]
-fn a_plan_that_would_change_mpds_saved_queue_is_refused_until_task_14_exists() {
+fn a_commit_backs_up_mpds_saved_queue_before_it_writes_the_record() {
     let world = World::realistic();
     let plan = album_move();
-    let mut effects = world.effects(&plan);
-    // What task 14 will fill in. Until it does, skipping these silently would
-    // lose the saved queue's lines.
-    effects.state_edits.push(rewrite::LineEdit {
-        entry: 0,
-        old: names::MF_DOOM_TRACK.to_owned(),
-        new: Some("hiphop/MF DOOM/Mm..Food (2004)/01 Beef Rap.mp3".to_owned()),
-    });
+    let before = std::fs::read(world.fx.state_file()).expect("the fixture has one");
 
-    let err = commit::commit(&world.previewed(&plan, &effects), &world.config)
-        .expect_err("the saved queue cannot be rewritten yet");
+    let committed = world.commit(&plan).expect("the album moves");
+
+    let record = &committed.record;
     assert!(
-        err.to_string().contains("14-mpd-state-queue.md"),
-        "the message should point at the task that owns it:\n{err}"
+        !record.state_edits.is_empty(),
+        "the queued MF DOOM track moved, so the saved queue had to change"
     );
-    assert_eq!(world.store().list().expect("lists"), Vec::new());
+    let name = record
+        .state_backup
+        .as_ref()
+        .expect("the state file was copied into the backup directory");
+    assert_eq!(
+        std::fs::read(record.backup_dir.join(name)).expect("the copy is readable"),
+        before,
+        "the backup holds the file as it was before the commit"
+    );
+    assert_ne!(
+        std::fs::read(world.fx.state_file()).expect("still there"),
+        before,
+        "and the file itself was rewritten"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -11,9 +11,9 @@
 //!    exist in exactly one place;
 //! 3. **check** — hand every step to [`exec_fs::check`], which is the same code
 //!    commit will run, and turn what it says into [`Conflict`]s and [`Warning`]s;
-//! 4. **derive** — the playlist edits, the library-level warnings and the
-//!    [`Summary`], all from the steps produced in pass 2 rather than from the
-//!    operations, so the preview counts what commit does.
+//! 4. **derive** — the playlist edits, MPD's saved queue, the library-level
+//!    warnings and the [`Summary`], all from the steps produced in pass 2 rather
+//!    than from the operations, so the preview counts what commit does.
 //!
 //! # Nothing is written
 //!
@@ -23,6 +23,16 @@
 //! check creates a file in the directory and removes it again, which is a write,
 //! so it stays in commit. The preview therefore says a directory looks writable;
 //! only commit knows.
+//!
+//! # The one thing MPD gets a say in
+//!
+//! Everything above is worked out from the filesystem. The exception is MPD's
+//! saved queue: whether rewriting `~/.config/mpd/state` is worth anything depends
+//! on whether the daemon is running, because it overwrites that file from memory
+//! when it stops. So the answer comes in as a [`Live`] — the queue MPD reported,
+//! or `None` for a daemon that was not reachable, not enabled, or not asked — and
+//! core never opens a socket to find out. [`Updater`][super::commit::Updater] is
+//! the same arrangement on the way out.
 //!
 //! # Chained moves
 //!
@@ -45,6 +55,7 @@ use camino::Utf8Path;
 
 use crate::config::Config;
 use crate::library::{DirPath, Library, ScanWarning};
+use crate::mpd::state::{self, MpdState};
 use crate::paths::RelPath;
 use crate::playlist::PlaylistIndex;
 use crate::playlist::rewrite::{self, PathMove};
@@ -62,8 +73,62 @@ use super::op::{Operation, Plan};
 /// substitutes the id for this segment when it takes the steps over.
 pub const PENDING_TX: &str = "pending";
 
-/// See [`Plan::validate`][super::op::Plan::validate].
-pub(super) fn validate(plan: &Plan, lib: &Library, idx: &PlaylistIndex, cfg: &Config) -> Effects {
+/// What MPD said when it was asked — the one input to a preview that does not
+/// come from a disk.
+///
+/// Core owns no connection (`docs/PLAN.md` D6), so the caller that has one passes
+/// what it heard and the caller that has none passes [`Live::default`]. The
+/// distinction is not cosmetic: it decides whether MPDFM edits MPD's state file
+/// or warns about it, because the daemon overwrites that file from memory when it
+/// shuts down.
+///
+/// ```no_run
+/// use mpdfm_core::mpd::{self, DEFAULT_TIMEOUT};
+/// use mpdfm_core::ops::{Live, Plan};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let (config, _) = mpdfm_core::config::resolve(&Default::default(),
+/// #                                               &mpdfm_core::config::Env::from_process());
+/// # let library = mpdfm_core::library::Library::scan(config.require_music_dir()?)?;
+/// # let (index, _) = mpdfm_core::playlist::PlaylistIndex::load(&config.playlist_dir);
+/// # let plan = Plan::new();
+/// // Best effort: a daemon that is not there is not a failure.
+/// let queue = mpd::connect_if_enabled(&config, DEFAULT_TIMEOUT, None)
+///     .ok()
+///     .flatten()
+///     .and_then(|mut mpd| mpd.queue_paths().ok());
+///
+/// let effects = plan.validate_live(
+///     &library,
+///     &index,
+///     &config,
+///     &Live { queue: queue.as_deref() },
+/// );
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Live<'a> {
+    /// MPD's live queue, in queue order, when the daemon answered.
+    ///
+    /// `Some` — **MPD is running**. Its in-memory queue is what survives a
+    /// restart, so the state file is left alone and every moved file that is in
+    /// this list becomes a [`Warning::InMpdQueue`].
+    ///
+    /// `None` — MPD was not reachable, `mpd_enabled` is false, `--no-mpd` was
+    /// passed, or nobody asked. The state file on disk *is* the queue, so it is
+    /// rewritten (when [`Config::rewrite_saved_queue`] allows) and backed up.
+    pub queue: Option<&'a [RelPath]>,
+}
+
+/// See [`Plan::validate_live`][super::op::Plan::validate_live].
+pub(super) fn validate(
+    plan: &Plan,
+    lib: &Library,
+    idx: &PlaylistIndex,
+    cfg: &Config,
+    live: &Live<'_>,
+) -> Effects {
     let root = cfg.music_dir.as_path();
     let options = exec_fs::Options::from_config(cfg);
 
@@ -172,6 +237,8 @@ pub(super) fn validate(plan: &Plan, lib: &Library, idx: &PlaylistIndex, cfg: &Co
         }
     }
 
+    saved_queue(&mut effects, cfg, live, &moves);
+
     let sources: Vec<RelPath> = moves.iter().map(|m| m.from.clone()).collect();
     effects.warnings.extend(split_albums(lib, &sources));
     effects.warnings.extend(broken_nearby(lib, idx, &sources));
@@ -180,6 +247,59 @@ pub(super) fn validate(plan: &Plan, lib: &Library, idx: &PlaylistIndex, cfg: &Co
 
     effects.summary = Summary::of(&effects.fs_steps, &effects.playlist_edits, bytes);
     effects
+}
+
+/// MPD's saved queue: the state file's edits, or the warning that stands in for
+/// them.
+///
+/// Three outcomes, and which one happens is the whole of this task's safety rule
+/// (`docs/tasks/14-mpd-state-queue.md`):
+///
+/// - **the daemon answered** — its queue is in memory and it will overwrite the
+///   state file with it on shutdown, so editing the file now would be erased.
+///   Every moved file that is in that queue becomes a [`Warning::InMpdQueue`],
+///   naming it, and the file is not touched;
+/// - **the daemon did not answer** — the file on disk *is* the queue. It is
+///   parsed and the lines that have to change become
+///   [`Effects::state_edits`], which commit backs up and applies;
+/// - **it is switched off or not there** — [`Config::rewrite_saved_queue`] is
+///   false, no `state_file` is configured, or the path is not a file. Nothing
+///   happens and nothing is said; a user who turned it off has decided.
+///
+/// A state file that is there and cannot be read is a
+/// [`Warning::StateUnreadable`], never a conflict: nothing about the library
+/// stops being movable because MPD's cache of a queue could not be opened.
+fn saved_queue(effects: &mut Effects, cfg: &Config, live: &Live<'_>, moves: &[PathMove]) {
+    if !cfg.rewrite_saved_queue {
+        return;
+    }
+    let Some(path) = &cfg.state_file else {
+        return;
+    };
+
+    if let Some(queue) = live.queue {
+        for path_move in moves {
+            if queue.contains(&path_move.from) {
+                effects.warnings.push(Warning::InMpdQueue {
+                    path: path_move.from.clone(),
+                });
+            }
+        }
+        return;
+    }
+
+    // Not an error and not worth a warning: a daemon that has never run has no
+    // state file, and there is no queue to lose.
+    if !path.is_file() {
+        return;
+    }
+    match MpdState::load(path) {
+        Ok(mut saved) => effects.state_edits = state::rewrite(&mut saved, moves),
+        Err(err) => effects.warnings.push(Warning::StateUnreadable {
+            path: path.to_string(),
+            reason: err.to_string(),
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
