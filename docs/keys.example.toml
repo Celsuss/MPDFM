@@ -1,0 +1,154 @@
+# MPDFM keymap — ~/.config/mpdfm/keys.toml
+#
+# Every binding is optional, and this file as shipped changes nothing: the
+# built-in keys are vim-style and meant to need no configuration. Copy it,
+# uncomment what you want to change.
+#
+# What is in here is merged *over* the defaults, so a section that mentions one
+# key leaves the other thirty alone. Press `?` inside MPDFM to see the keymap you
+# actually have — that overlay is generated from it, so it is never out of date.
+#
+# A line that MPDFM cannot use is a warning at start-up and nothing more: the rest
+# of the file still applies, and the program still starts. An unknown action name
+# gets a warning that lists the names there are.
+#
+#
+# SECTIONS are modes. A key can mean different things in different ones, which is
+# why `ctrl-u` is half a page up in the browser and clear-the-line in the command
+# line.
+#
+#   [browser]   the library browser
+#   [pending]   the staged-operations view
+#   [tagedit]   the tag editor
+#   [search]    the search / filter line
+#   [command]   the `:` line
+#
+# KEYS are written as the help overlay writes them:
+#
+#   j  G  /  -  ?            a single character is itself, capital included
+#   enter esc tab space      and so are these, plus: backtab, backspace, delete,
+#   up down left right       insert, home, end, pageup, pagedown, f1 … f12
+#   ctrl-d  alt-x  shift-j   modifiers are spelled out in full, lower case
+#   gg  ctrl-x s             two keys in a row: written together when both are
+#                            plain characters, with a space otherwise
+#
+# `shift` on a letter is the same thing as the capital: "J" and "shift-j" are one
+# binding, because terminals disagree about which of the two they report. Stick to
+# ctrl, alt and plain capitals for anything you want to work everywhere —
+# `ctrl-shift-x` is reported inconsistently, and while MPDFM normalizes the two
+# spellings it has no way to make a terminal send one at all.
+#
+# ACTIONS are the names below. `= "none"` removes a binding instead of adding one,
+# which is the only way to free a key up.
+
+
+# -- the browser ------------------------------------------------------------
+#
+# [browser]
+#
+# An extra key for something that already has one. `R` still rescans; this is in
+# addition, not instead.
+# "ctrl-r" = "rescan"
+#
+# A key that was not bound at all.
+# "J" = "half_page_down"
+# "K" = "half_page_up"
+#
+# Moving a key: the new one works and the old one does not.
+# "x" = "none"
+# "D" = "discard_pending"
+#
+# A two-key sequence. Beware of binding its first key on its own — `"g" = "top"`
+# makes `gg` unreachable, and MPDFM says so at start-up rather than letting you
+# wonder.
+# "g e" = "edit_tags"
+
+
+# -- the staged-operations view (task 24) -----------------------------------
+#
+# [pending]
+# "D" = "discard_pending"
+# "enter" = "commit"
+
+
+# -- the tag editor (task 23) -----------------------------------------------
+#
+# A form with text fields in it, so no bare letter is bound by default: every one
+# of them has to reach the field being edited. Bind one here and it stops being
+# typeable.
+#
+# [tagedit]
+# "ctrl-s" = "submit"
+
+
+# -- the search line (task 25) ----------------------------------------------
+#
+# [search]
+# "ctrl-j" = "search_next"
+# "ctrl-k" = "search_prev"
+
+
+# -- the command line -------------------------------------------------------
+#
+# [command]
+# "ctrl-k" = "clear_line"
+
+
+# -- every action -----------------------------------------------------------
+#
+# Moving around
+#   down                 move down
+#   up                   move up
+#   left                 left / out
+#   right                right / in
+#   top                  first row
+#   bottom               last row
+#   half_page_down       half page down
+#   half_page_up         half page up
+#   open                 enter dir / open
+#   parent               parent dir
+#   switch_pane          switch pane
+#
+# Marking
+#   toggle_mark          mark / unmark
+#   visual_select        visual-select range
+#   mark_all             mark all in view
+#   unmark_all           unmark all
+#
+# Changing things
+#   edit_tags            edit tags
+#   stage_move           stage a move of the marks
+#   rename               rename
+#   stage_delete         stage a delete
+#   unstage              unstage this operation
+#   organize             organize by template
+#   show_pending         show pending ops
+#   commit               commit pending
+#   discard_pending      discard pending
+#   undo                 undo last transaction
+#
+# Finding things
+#   search               search
+#   search_next          next match
+#   search_prev          prev match
+#   filter               filter
+#
+# Typing
+#   submit               accept
+#   delete_char          delete a character
+#   clear_line           clear the line
+#
+# The rest
+#   cancel               clear filter / close overlay
+#   command_mode         command mode
+#   help                 help overlay
+#   rescan               rescan library
+#   quit                 quit (warns if ops pending)
+#   force_quit           quit, discarding pending ops
+#
+#   none                 not an action: removes the binding
+#
+#
+# `ctrl-c` is not in the table and cannot be rebound. It quits — asking first if
+# anything is staged, and leaving regardless on the second press. An escape hatch
+# that can be remapped away is not one.

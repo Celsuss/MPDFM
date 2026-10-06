@@ -56,7 +56,7 @@ losing one malformed frame `lofty` will not re-emit. Numbers in task 17.
 | # | Task | Depends on | Status |
 | --- | --- | --- | --- |
 | 20 | [TUI shell and event loop](tasks/20-tui-shell.md) | 01, 04 | done |
-| 21 | [Configurable vim keymap](tasks/21-keymap.md) | 20 | not started |
+| 21 | [Configurable vim keymap](tasks/21-keymap.md) | 20 | done |
 | 22 | [Library browser view](tasks/22-browser-view.md) | 05, 16, 20, 21 | not started |
 | 23 | [Tag editor view](tasks/23-tagedit-view.md) | 16–18, 21, 22 | not started |
 | 24 | [Pending ops view](tasks/24-pending-view.md) | 10–12, 20, 21 | not started |

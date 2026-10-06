@@ -79,3 +79,8 @@
 # The default path template for `mpdfm organize`. Override per run with
 # `--template`.
 # organize_template = "{genre}/{albumartist}/{year} - {album}/{track:02} {title}"
+
+# The TUI's key bindings are *not* in this file: they live in `keys.toml`, in this
+# same directory, and `docs/keys.example.toml` documents them. Two files because
+# they are two things — this one is read by every command, that one only by the
+# interactive browser, and a typo in one should not cost you the other.

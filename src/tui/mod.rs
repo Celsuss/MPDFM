@@ -9,12 +9,15 @@
 //! | `event` | the channel, and the threads that feed it |
 //! | `msg` | everything the loop can be told |
 //! | `work` | everything that must not happen on the drawing thread |
+//! | `action` | everything the user can ask for, named |
+//! | `keys` | which keys, in which mode, ask for it |
+//! | `command` | the `:` line, and the commands it takes |
 //! | `app` | the state, the loop, and the frame |
 //! | `log` | where diagnostics go, which is never the screen |
 //!
-//! Tasks 21–26 fill in the keymap and the views. This task owns the shell they
-//! live in, and the one guarantee that is hard to add later: **the terminal is
-//! always restored.** See `terminal.rs` for the three paths that enforce it.
+//! Tasks 22–26 fill in the views. Task 20 owns the shell they live in and the one
+//! guarantee that is hard to add later — **the terminal is always restored**, see
+//! `terminal.rs` — and task 21 owns the vocabulary they dispatch through.
 //!
 //! # Start-up order
 //!
@@ -48,8 +51,11 @@
 //! accident is end the process with a panic that restores the terminal first —
 //! which is the behaviour under test.
 
+mod action;
 mod app;
+mod command;
 mod event;
+mod keys;
 mod log;
 mod msg;
 mod terminal;
@@ -59,7 +65,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::Result;
-use mpdfm_core::config::Config;
+use camino::{Utf8Path, Utf8PathBuf};
+use mpdfm_core::config::{Config, Env, keys_file_path};
 
 use crate::cli::Cli;
 use crate::output::Exit;
@@ -90,6 +97,23 @@ impl PanicAt {
     }
 }
 
+/// Where `keys.toml` is, given what was on the command line.
+///
+/// Normally `$XDG_CONFIG_HOME/mpdfm/keys.toml`, next to `config.toml`. When
+/// `--config` named a file somewhere else, the keymap is looked for beside *that*
+/// file: a user pointing MPDFM at a second configuration means the whole
+/// configuration, and a test can then put both in one temporary directory.
+fn keys_path(cli: &Cli) -> Option<Utf8PathBuf> {
+    match &cli.globals.config {
+        Some(path) => Some(
+            path.parent()
+                .unwrap_or(Utf8Path::new("."))
+                .join("keys.toml"),
+        ),
+        None => keys_file_path(&Env::from_process()),
+    }
+}
+
 /// Launch the interactive browser.
 ///
 /// # Errors
@@ -112,19 +136,29 @@ pub fn run(cli: &Cli, config: &Config) -> Result<ExitCode> {
     ));
     cli.trace(format!(
         "tui: starting (log={})",
-        cli.tui
-            .log
-            .as_deref()
-            .map_or("off", camino::Utf8Path::as_str)
+        cli.tui.log.as_deref().map_or("off", Utf8Path::as_str)
     ));
 
-    // 2. The threads, signal handlers included, before raw mode.
+    // 2. The keymap, which is the other file that can be wrong in a way worth
+    //    reporting. Before raw mode for the same reason the log is: a warning
+    //    about it has to be able to reach the user, and after this point the only
+    //    way to reach them is a panel on a screen that does not exist yet.
+    let (keymap, key_warnings) = match keys_path(cli) {
+        Some(path) => {
+            cli.trace(format!("tui: keys from {path}"));
+            keys::load(&path)
+        }
+        None => (keys::KeyMap::defaults(), Vec::new()),
+    };
+
+    // 3. The threads, signal handlers included, before raw mode.
     let (events, tx) = Events::start(event::TICK)?;
 
-    // 3. The terminal. From here to the guard's drop, nothing prints.
+    // 4. The terminal. From here to the guard's drop, nothing prints.
     let (guard, mut screen) = TerminalGuard::enter(!cli.tui.no_alt_screen)?;
 
-    let mut app = App::new(config.clone(), tx, Arc::clone(&log));
+    let mut app = App::new(config.clone(), keymap, tx, Arc::clone(&log));
+    app.report_key_warnings(&key_warnings);
     let result = app.run(&mut screen, &events);
 
     // Explicit, so that whatever is printed after this — the `Err` on its way to
