@@ -522,6 +522,23 @@ impl Counts {
     }
 }
 
+/// How far a scan has got, as [`Library::scan_reporting`] reports it.
+///
+/// A snapshot of a walk in flight and not a result: the numbers only grow, and
+/// the last one a caller is handed is the total. There is deliberately no
+/// percentage in it — the walk does not know how many files there are until it
+/// has found them, and a bar that lies is worse than a count that does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanProgress {
+    /// Files modelled so far.
+    pub files: usize,
+    /// Directories seen so far, the root included.
+    pub dirs: usize,
+    /// The directory the walk had reached, so a progress line can say which part
+    /// of the library is being read.
+    pub dir: DirPath,
+}
+
 /// Something the scan could not model, reported rather than raised.
 ///
 /// A library with one unreadable directory in it is still a library, and
@@ -617,7 +634,26 @@ impl Library {
     /// Only if `root` itself is missing or is not a directory. Every other
     /// problem is a [`ScanWarning`].
     pub fn scan(root: &Utf8Path) -> crate::Result<Self> {
-        super::scan::scan(root)
+        super::scan::scan(root, &mut |_| {})
+    }
+
+    /// [`Library::scan`], reporting how far it has got as it goes.
+    ///
+    /// The walk is one synchronous call however it is invoked; this exists so
+    /// that a caller running it on a worker thread can draw a progress line
+    /// instead of a frozen screen (`docs/tasks/20-tui-shell.md`). `progress` is
+    /// called on the scanning thread, every few hundred files and once at the
+    /// end, and is expected to be cheap — the TUI's forwards the counts to a
+    /// channel and returns.
+    ///
+    /// # Errors
+    ///
+    /// The same one [`Library::scan`] raises, for the same reason.
+    pub fn scan_reporting(
+        root: &Utf8Path,
+        progress: &mut dyn FnMut(&ScanProgress),
+    ) -> crate::Result<Self> {
+        super::scan::scan(root, progress)
     }
 
     /// Assemble a library from what the walk collected: sort the entries into a

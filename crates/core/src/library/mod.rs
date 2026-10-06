@@ -37,7 +37,8 @@ mod model;
 mod scan;
 
 pub use model::{
-    AlbumDir, Counts, Dir, DirPath, Entry, Format, Kind, Library, ScanWarning, disc_number,
+    AlbumDir, Counts, Dir, DirPath, Entry, Format, Kind, Library, ScanProgress, ScanWarning,
+    disc_number,
 };
 
 use std::sync::atomic::{AtomicU64, Ordering};

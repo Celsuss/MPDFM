@@ -19,7 +19,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::time::{Duration, Instant};
 
 use camino::Utf8Path;
-use mpdfm_core::library::{DirPath, Format, Kind, Library, ScanWarning};
+use mpdfm_core::library::{DirPath, Format, Kind, Library, ScanProgress, ScanWarning};
 use mpdfm_core::testing::{Fixture, names};
 
 /// Scan a fixture's music directory, failing the test if the root itself is
@@ -524,4 +524,56 @@ fn a_three_thousand_file_library_scans_in_well_under_a_second() {
         "a warm scan of {} files took {elapsed:?}, which is not well under a second",
         library.len()
     );
+}
+
+/// Task 20 draws a progress line while the scan runs on a worker thread. The
+/// property it needs is that the counts arrive *during* the walk and that the
+/// last one is the truth — not that any particular number of calls happens.
+#[test]
+fn a_scan_reports_its_progress_as_it_goes_and_ends_on_the_total() {
+    let fx = Fixture::realistic();
+
+    let mut seen: Vec<ScanProgress> = Vec::new();
+    let library = Library::scan_reporting(fx.music_dir(), &mut |progress| {
+        seen.push(progress.clone());
+    })
+    .expect("the fixture's music directory should scan");
+
+    let last = seen
+        .last()
+        .expect("a non-empty library should report progress");
+    assert_eq!(last.files, library.len());
+    assert_eq!(last.dirs, library.dir_count());
+    // Every report names a directory that is really in the library, which is
+    // what makes it safe to put on screen.
+    for progress in &seen {
+        assert!(
+            library.dir(&progress.dir).is_some(),
+            "progress named {} , which is not a directory of the library",
+            progress.dir
+        );
+    }
+
+    // Monotonic, so a progress line never counts backwards.
+    for pair in seen.windows(2) {
+        assert!(
+            pair[1].files > pair[0].files,
+            "{:?} then {:?}",
+            pair[0],
+            pair[1]
+        );
+        assert!(pair[1].dirs >= pair[0].dirs);
+    }
+}
+
+/// The counterpart: a walk with nothing to report says nothing, rather than
+/// reporting a zero that would make a progress line flash up and vanish.
+#[test]
+fn an_empty_library_reports_no_progress_at_all() {
+    let fx = Fixture::builder().build();
+    let mut calls = 0usize;
+    let library = Library::scan_reporting(fx.music_dir(), &mut |_| calls += 1)
+        .expect("an empty fixture should scan");
+    assert!(library.is_empty());
+    assert_eq!(calls, 0);
 }

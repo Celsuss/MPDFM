@@ -17,6 +17,11 @@ lofty = "=0.25.4"
 ratatui = "=0.30.2"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
+# `SIGTERM` has to reach the TUI's event loop rather than the kernel's default
+# disposition, or a `kill` leaves the user in raw mode on the alternate screen
+# (task 20). Already in the tree — `crossterm` uses it for `SIGWINCH` — so this
+# is a direct name for a crate that was being compiled anyway.
+signal-hook = "=0.3.18"
 tempfile = "=3.27.0"
 thiserror = "=2.0.21"
 toml = "=1.1.6"
@@ -44,7 +49,13 @@ mpdfm-core.workspace = true
 anyhow.workspace = true
 camino.workspace = true
 clap.workspace = true
+# The terminal, and the widgets drawn on it (task 20). Both live here and not in
+# core: the dependency direction is one-way, and `crates/core/tests/manifest_deps.rs`
+# keeps it that way.
+crossterm.workspace = true
+ratatui.workspace = true
 serde_json.workspace = true
+signal-hook.workspace = true
 
 # `tests/` drives the built binary against a `Fixture`, which lives behind
 # core's `testing` feature. Cargo unifies this with the dependency above, so the
@@ -54,6 +65,9 @@ serde_json.workspace = true
 mpdfm-core = { workspace = true, features = ["testing"] }
 
 assert_cmd.workspace = true
+# `src/tui/log.rs` writes a real log file in its own tests, and `tests/` needs a
+# scratch directory for the pty checks.
+tempfile.workspace = true
 
 [profile.release]
 strip = true

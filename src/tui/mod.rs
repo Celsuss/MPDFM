@@ -1,18 +1,138 @@
-//! Terminal UI. Built in milestone M3 (tasks 20–26).
+//! The terminal UI: the shell, the event loop, and the promise that the terminal
+//! survives it.
+//!
+//! `mpdfm` with no subcommand lands here. The division of labour is:
+//!
+//! | module | answers |
+//! | --- | --- |
+//! | `terminal` | taking the terminal and — three ways — giving it back |
+//! | `event` | the channel, and the threads that feed it |
+//! | `msg` | everything the loop can be told |
+//! | `work` | everything that must not happen on the drawing thread |
+//! | `app` | the state, the loop, and the frame |
+//! | `log` | where diagnostics go, which is never the screen |
+//!
+//! Tasks 21–26 fill in the keymap and the views. This task owns the shell they
+//! live in, and the one guarantee that is hard to add later: **the terminal is
+//! always restored.** See `terminal.rs` for the three paths that enforce it.
+//!
+//! # Start-up order
+//!
+//! Deliberate, and the reason this function is not just `App::new().run()`:
+//!
+//! 1. **the log is opened first.** `--log /nonexistent/x` has to be reportable on
+//!    the user's shell, which means before the shell is taken away;
+//! 2. **then the event threads**, including the signal handlers. A `SIGTERM`
+//!    between entering raw mode and installing them would be the one window where
+//!    the promise does not hold, so the window is closed before it opens;
+//! 3. **then the terminal**, and from that point to the guard's drop nothing in
+//!    this module writes to stdout or stderr;
+//! 4. **then the first scan**, from inside the loop, after the first frame is on
+//!    screen.
+//!
+//! # Testing seams
+//!
+//! Two environment variables, in the spirit of
+//! [`ASSUME_TTY`][crate::output::ASSUME_TTY]: an interactive path that cannot be
+//! tested is one that will eventually stop working.
+//!
+//! - **the loop takes its messages from an [`Events`]**, and
+//!   `Events::scripted` builds one from a `Vec<Msg>` with no thread and no tty.
+//!   That is how the loop's own tests drive it: a script of keys, resizes and
+//!   worker results, and assertions on the buffer a `TestBackend` was drawn into;
+//! - **[`PANIC_AT`]** induces a panic at a named point, which is how the
+//!   panic-hook half of the restore promise is tested against a real terminal
+//!   (`just verify-tui`, recorded in `docs/tasks/20-tui-shell.md`).
+//!
+//! `PANIC_AT` does nothing on an ordinary run, and the worst it can do when set by
+//! accident is end the process with a panic that restores the terminal first —
+//! which is the behaviour under test.
+
+mod app;
+mod event;
+mod log;
+mod msg;
+mod terminal;
+mod work;
 
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::Result;
+use mpdfm_core::config::Config;
 
 use crate::cli::Cli;
 use crate::output::Exit;
+use app::App;
+use event::Events;
+use log::Log;
+use terminal::TerminalGuard;
 
-/// Launch the interactive browser. Stub until task 20.
-pub fn run(cli: &Cli) -> Result<ExitCode> {
-    cli.trace("tui: would enter the alternate screen");
-    println!(
-        "mpdfm {}: the TUI arrives in task 20. Until then, see `mpdfm --help`.",
-        env!("CARGO_PKG_VERSION")
-    );
-    Ok(Exit::Ok.into())
+/// Induce a panic at a named point, to prove the panic hook restores the terminal.
+///
+/// Values: `draw` panics inside the draw callback — the worst moment, with the
+/// cursor hidden and the alternate screen active — and `event` panics while
+/// handling the first message. Anything else is ignored.
+pub const PANIC_AT: PanicAt = PanicAt("MPDFM_TUI_PANIC");
+
+/// The name of [`PANIC_AT`]'s variable, with the one question anybody asks of it.
+pub struct PanicAt(&'static str);
+
+impl PanicAt {
+    /// Whether the variable names `point`.
+    pub fn is(&self, point: &str) -> bool {
+        std::env::var(self.0).is_ok_and(|value| value == point)
+    }
+
+    /// The variable's name, for a message that explains itself.
+    pub fn name(&self) -> &'static str {
+        self.0
+    }
+}
+
+/// Launch the interactive browser.
+///
+/// # Errors
+///
+/// If the log file cannot be opened, if the signal handlers cannot be installed,
+/// if the terminal cannot be taken, or if a draw fails. Nothing that happens to
+/// the *library* is an error here: a `music_directory` that does not exist opens
+/// the browser with an error panel on it, because the user's next move is to look
+/// at the configuration, and a TUI that refuses to start is a worse place to do
+/// that from than one that says what is wrong.
+pub fn run(cli: &Cli, config: &Config) -> Result<ExitCode> {
+    // 1. The log, before there is anywhere else for a complaint to go.
+    let log = Arc::new(match &cli.tui.log {
+        Some(path) => Log::to_file(path)?,
+        None => Log::off(),
+    });
+    log.line(format!(
+        "start: music_dir={} playlist_dir={} alt_screen={}",
+        config.music_dir, config.playlist_dir, !cli.tui.no_alt_screen
+    ));
+    cli.trace(format!(
+        "tui: starting (log={})",
+        cli.tui
+            .log
+            .as_deref()
+            .map_or("off", camino::Utf8Path::as_str)
+    ));
+
+    // 2. The threads, signal handlers included, before raw mode.
+    let (events, tx) = Events::start(event::TICK)?;
+
+    // 3. The terminal. From here to the guard's drop, nothing prints.
+    let (guard, mut screen) = TerminalGuard::enter(!cli.tui.no_alt_screen)?;
+
+    let mut app = App::new(config.clone(), tx, Arc::clone(&log));
+    let result = app.run(&mut screen, &events);
+
+    // Explicit, so that whatever is printed after this — the `Err` on its way to
+    // `main`, or nothing — reaches a terminal that is already a terminal again.
+    // The drop would do it too; this only makes the ordering something a reader
+    // can see rather than infer.
+    drop(guard);
+    log.line("stop");
+
+    result.map(|()| Exit::Ok.into())
 }

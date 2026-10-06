@@ -57,6 +57,9 @@ pub struct Cli {
     #[command(flatten)]
     pub globals: Globals,
 
+    #[command(flatten)]
+    pub tui: TuiArgs,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -89,6 +92,31 @@ pub struct Globals {
     /// Machine-readable JSON output.
     #[arg(long, global = true)]
     pub json: bool,
+}
+
+/// Flags for the TUI, which is what `mpdfm` with no subcommand runs.
+///
+/// Not `global = true`, unlike [`Globals`]: they mean nothing to a subcommand, and
+/// a `--log` that silently did nothing on `mpdfm scan` would be worse than one
+/// that is rejected. Both exist for debugging a program that owns the screen and
+/// therefore cannot be debugged by printing to it.
+#[derive(Debug, Args)]
+#[command(next_help_heading = "TUI options")]
+pub struct TuiArgs {
+    /// Draw in the current screen instead of the alternate one.
+    ///
+    /// The frames stay in scrollback, so the last one before a crash can be read
+    /// afterwards — which is exactly what the alternate screen throws away.
+    #[arg(long)]
+    pub no_alt_screen: bool,
+
+    /// Append the TUI's diagnostics to FILE.
+    ///
+    /// A file and never the terminal: while the TUI is drawing, anything written to
+    /// stdout or stderr lands in the middle of a frame. `-v` is silent inside the
+    /// TUI for the same reason.
+    #[arg(long, value_name = "FILE")]
+    pub log: Option<Utf8PathBuf>,
 }
 
 /// Subcommands. `mpdfm` with none launches the TUI.
@@ -449,7 +477,7 @@ pub fn run() -> Result<ExitCode> {
     ));
 
     let Some(command) = &cli.command else {
-        return crate::tui::run(&cli);
+        return crate::tui::run(&cli, &settings);
     };
 
     // Worked out once, here, so that no command can reach a different answer
@@ -646,6 +674,29 @@ mod tests {
             panic!("expected `tag diff`");
         };
         assert_eq!(args.fields.edits(), ["genre=Jazz"]);
+    }
+
+    #[test]
+    fn the_tui_flags_parse_and_default_to_the_quiet_alternate_screen() {
+        let bare = Cli::try_parse_from(["mpdfm"]).unwrap();
+        assert!(bare.command.is_none(), "no subcommand means the TUI");
+        assert!(!bare.tui.no_alt_screen);
+        assert!(bare.tui.log.is_none());
+
+        let debugging =
+            Cli::try_parse_from(["mpdfm", "--no-alt-screen", "--log", "/tmp/mpdfm.log"]).unwrap();
+        assert!(debugging.tui.no_alt_screen);
+        assert_eq!(debugging.tui.log, Some(Utf8PathBuf::from("/tmp/mpdfm.log")));
+    }
+
+    #[test]
+    fn the_tui_flags_are_not_global_so_a_subcommand_rejects_them() {
+        // They would do nothing on a subcommand, and a flag that silently does
+        // nothing is worse than one that is refused.
+        Cli::try_parse_from(["mpdfm", "scan", "--log", "/tmp/x"])
+            .expect_err("--log belongs to the TUI");
+        Cli::try_parse_from(["mpdfm", "scan", "--no-alt-screen"])
+            .expect_err("--no-alt-screen belongs to the TUI");
     }
 
     #[test]
