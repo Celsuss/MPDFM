@@ -608,6 +608,12 @@ impl Record {
         if summary.files_deleted > 0 {
             parts.push(format!("{} deleted", summary.files_deleted));
         }
+        if summary.tags_written > 0 {
+            parts.push(format!(
+                "{} file(s) retagged ({} field(s))",
+                summary.tags_written, summary.fields_changed
+            ));
+        }
         if summary.playlists_affected > 0 {
             parts.push(format!("{} playlist(s)", summary.playlists_affected));
         }

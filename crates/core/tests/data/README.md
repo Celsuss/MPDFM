@@ -21,15 +21,23 @@ result.
 All five are a 0.2–0.3 s 440 Hz mono sine — under 2.5 KB each, and audible if
 you ever need to check one by ear.
 
-## What is deliberately missing
+## What is deliberately missing, and where it went
 
-Cases that need a tag *writer* to construct, and that tasks 16–18 should add
-when they gain one (`lofty` is not a dependency of core until then):
+Cases that need a tag *writer* to construct. `lofty` became a dependency of core
+in task 16, so these are now built at test time from a copy of a template by
+`mpdfm_core::testing::tags`:
 
-- a multi-valued FLAC `ARTIST` (three values in one file)
-- a numeric `TCON` genre reference, e.g. `(17)`
-- a truncated / corrupt file, and an mp3 renamed `.flac`
+| Case | Helper |
+| --- | --- |
+| a multi-valued FLAC `ARTIST` | `tags::set_multi_valued` |
+| a numeric `TCON` genre reference, e.g. `(17)` | `tags::set_frame` |
+| an embedded cover, for task 17 | `tags::embed_cover` |
+| a truncated / corrupt file | `tags::truncate` |
+| an mp3 named `.flac` | `tags::write_as` |
 
-The last two need no tag writer at all — `Fixture` can truncate or mislabel a
-copy of a template — but the *assertions* about them belong to task 16, so the
-helpers live there.
+Built rather than committed because each one is a template plus one call, and a
+sixth and seventh committed binary would be two more files nobody can diff.
+`tags::dump` and `tags::audio_digest` are there too: the before-and-after
+comparison task 17 needs, and the audio stream on its own so that "the audio is
+bit-identical" can be asserted without the tag — which is supposed to change —
+being part of the comparison.

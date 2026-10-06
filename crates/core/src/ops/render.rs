@@ -25,6 +25,25 @@
 //! so in the header — the user should not have to read to the bottom to find out
 //! that nothing is going to happen.
 //!
+//! # Tag edits are collapsed by field
+//!
+//! A bulk edit is one [`Operation::WriteTags`] per file, because the unit of
+//! reversal is the file. Fourteen rows that all say the same thing is not a
+//! preview, so they are rendered as one row per changed **field**, with the count
+//! of files it is written to and the paths left out:
+//!
+//! ```text
+//! PENDING (14 ops)
+//! TAG     genre = "Hip Hop"          14 files
+//! TAG     albumartist = "MF DOOM"    14 files
+//! TAG     comment = <cleared>        14 files
+//! ```
+//!
+//! Which field and which value is what the user is checking; which fourteen files
+//! they already know, because they selected them. A tag edit that is *not*
+//! uniform — different values for the same field, as `renumber tracks` produces —
+//! says so rather than picking one of them to show.
+//!
 //! # Width
 //!
 //! `width` is a hard limit: no line comes back longer, at any width down to the
@@ -41,6 +60,10 @@ const MIN_WIDTH: usize = 40;
 /// How far the detail line under an operation is indented.
 const INDENT: &str = "        ";
 
+/// How many distinct values of one field a `TAG` row will list before it gives
+/// up and says `<per file>`.
+const MAX_TAG_VALUES: usize = 3;
+
 impl Effects {
     /// Render the preview at `width` columns.
     ///
@@ -53,12 +76,17 @@ impl Effects {
 
         out.push(self.header());
         for op in &self.ops {
+            // Tag edits get their own section, by field rather than by file.
+            if matches!(op.op, super::op::Operation::WriteTags { .. }) {
+                continue;
+            }
             out.push(op_line(op, width));
             out.push(format!(
                 "{INDENT}{}",
                 fit(&detail(op), width - INDENT.len())
             ));
         }
+        out.extend(self.tag_rows(width));
 
         if !self.conflicts.is_empty() {
             out.push(String::new());
@@ -102,6 +130,76 @@ impl Effects {
                 plural(self.conflicts.len(), "conflict", "conflicts")
             )
         }
+    }
+
+    /// One row per changed field across every staged tag edit, with how many
+    /// files it is written to.
+    ///
+    /// Collapsed by `(field, edit)`, in the order fields are displayed, so an
+    /// album-wide `--genre` is one line however many tracks it touches. A field
+    /// whose value differs between files — `renumber tracks`, `title from
+    /// filename` — collapses to one row per distinct value, and once there are
+    /// more than [`MAX_TAG_VALUES`] of them it says `<per file>` instead of
+    /// listing four hundred numbers.
+    fn tag_rows(&self, width: usize) -> Vec<String> {
+        use super::op::Operation;
+
+        // `(field, rendered edit)` → how many files, keeping field order and
+        // then first-seen order within a field.
+        let mut counts: Vec<((crate::tags::Field, String), usize)> = Vec::new();
+        let mut refused = false;
+        for effect in &self.ops {
+            let Operation::WriteTags { changes, .. } = &effect.op else {
+                continue;
+            };
+            refused |= effect.refused;
+            for (field, edit) in changes.edits() {
+                let key = (*field, edit.rendered());
+                match counts.iter_mut().find(|(seen, _)| *seen == key) {
+                    Some((_, count)) => *count += 1,
+                    None => counts.push((key, 1)),
+                }
+            }
+        }
+        if counts.is_empty() {
+            return Vec::new();
+        }
+        counts.sort_by_key(|((field, _), _)| *field);
+
+        let mut rows = Vec::new();
+        let mut field = None;
+        let mut group: Vec<(String, usize)> = Vec::new();
+        let mut flush = |field: crate::tags::Field, group: &mut Vec<(String, usize)>| {
+            let files: usize = group.iter().map(|(_, count)| count).sum();
+            let body = if group.len() > MAX_TAG_VALUES {
+                format!("{field} <per file>")
+            } else {
+                group
+                    .iter()
+                    .map(|(value, _)| format!("{field} = {value}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let label = format!("{:<7}", "TAG");
+            let note = plural(files, "file", "files");
+            let room = width.saturating_sub(label.chars().count() + note.len() + 4);
+            rows.push(format!("{label}{}  {note}", fit(&body, room.max(8))));
+            group.clear();
+        };
+        for ((this, value), count) in counts {
+            if field.is_some_and(|seen| seen != this) {
+                flush(field.expect("just checked"), &mut group);
+            }
+            field = Some(this);
+            group.push((value, count));
+        }
+        if let Some(field) = field {
+            flush(field, &mut group);
+        }
+        if refused {
+            rows.push(format!("{INDENT}REFUSED"));
+        }
+        rows
     }
 
     /// One row per affected playlist, plus MPD's saved queue when task 14 has
@@ -162,6 +260,10 @@ fn op_line(effect: &OpEffect, width: usize) -> String {
             format!("{left} → {right}")
         }
         Operation::Delete { target } => tail(target.as_str(), room),
+        // Rendered by `tag_rows`, which collapses them by field; this arm is
+        // unreachable from `render` and is here so that a caller formatting one
+        // operation on its own still gets something true.
+        Operation::WriteTags { target, .. } => tail(target.as_str(), room),
     };
 
     format!("{label}{body}")
@@ -314,9 +416,10 @@ impl std::fmt::Display for Summary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}, {}, {} across {}",
+            "{}, {}, {}, {} across {}",
             plural(self.files_moved, "file moved", "files moved"),
             plural(self.files_deleted, "file deleted", "files deleted"),
+            plural(self.tags_written, "file retagged", "files retagged"),
             plural(self.lines_rewritten, "line rewritten", "lines rewritten"),
             plural(self.playlists_affected, "playlist", "playlists"),
         )

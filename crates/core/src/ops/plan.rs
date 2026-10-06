@@ -63,6 +63,7 @@ use crate::playlist::rewrite::{self, PathMove};
 use super::effects::{Conflict, Effects, OpEffect, Summary, Warning};
 use super::exec_fs::{self, FsError, FsStep, FsWarning, Merge};
 use super::op::{Operation, Plan};
+use crate::tags::TagError;
 
 /// The directory a delete's backup goes in, under
 /// [`Config::data_dir`][crate::config::Config::data_dir].
@@ -162,6 +163,7 @@ pub(super) fn validate(
     let (order, cycles) = execution_order(plan.ops());
     effects.conflicts.extend(cycles);
     effects.conflicts.extend(duplicate_destinations(plan.ops()));
+    effects.conflicts.extend(duplicate_edits(plan.ops()));
 
     // Everything the operations placed so far take out of the way. A destination
     // inside this set is free by the time its own step runs, however occupied it
@@ -210,6 +212,10 @@ pub(super) fn validate(
                     moves.push(PathMove::deleted(target.clone()));
                     target
                 }
+                // A tag write changes no path, so no playlist line and no queue
+                // entry is affected by it — it is not a `PathMove`. It is still
+                // a file this operation touches, which is what the row counts.
+                FsStep::WriteTags { target, .. } => target,
                 FsStep::MkDir { .. } | FsStep::RmDirIfEmpty { .. } => continue,
             };
             mine.files += 1;
@@ -344,12 +350,22 @@ fn execution_order(ops: &[Operation]) -> (Vec<usize>, Vec<Conflict>) {
     // `blockers[y]` — operations that must run before `y`.
     let mut blockers: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); ops.len()];
     for (y, op) in ops.iter().enumerate() {
-        let Some(dest) = op.destination() else {
-            continue;
-        };
-        for (x, other) in ops.iter().enumerate() {
-            if x != y && other.vacates(dest) {
-                blockers[y].insert(x);
+        if let Some(dest) = op.destination() {
+            for (x, other) in ops.iter().enumerate() {
+                if x != y && other.vacates(dest) {
+                    blockers[y].insert(x);
+                }
+            }
+        }
+        // A tag write has to happen while the file is still where it is: staging
+        // "tag a/x.mp3" and "move a/x.mp3 to b/x.mp3" means both, in that order,
+        // and the other order would leave the tag write with nothing to open.
+        // This is the only edge that is not about a destination being freed.
+        if let Operation::WriteTags { target, .. } = op {
+            for (x, other) in ops.iter().enumerate() {
+                if x != y && other.vacates(target) {
+                    blockers[x].insert(y);
+                }
             }
         }
     }
@@ -376,6 +392,29 @@ fn execution_order(ops: &[Operation]) -> (Vec<usize>, Vec<Conflict>) {
     let stuck: Vec<usize> = (0..ops.len()).filter(|&i| !done[i]).collect();
     let paths = stuck.iter().map(|&i| ops[i].source().clone()).collect();
     (order, vec![Conflict::Cycle { ops: stuck, paths }])
+}
+
+/// Two operations that want to edit the same file's tags. See
+/// [`Conflict::DuplicateEdit`] for why that is refused rather than ordered.
+fn duplicate_edits(ops: &[Operation]) -> Vec<Conflict> {
+    let mut seen: BTreeMap<&RelPath, usize> = BTreeMap::new();
+    let mut conflicts = Vec::new();
+    for (index, op) in ops.iter().enumerate() {
+        let Operation::WriteTags { target, .. } = op else {
+            continue;
+        };
+        match seen.get(target) {
+            Some(&first) => conflicts.push(Conflict::DuplicateEdit {
+                first,
+                second: index,
+                at: target.clone(),
+            }),
+            None => {
+                seen.insert(target, index);
+            }
+        }
+    }
+    conflicts
 }
 
 /// Two operations that want to create the same path. Reported once per pair,
@@ -499,6 +538,36 @@ fn expand(
             }
         }
 
+        Operation::WriteTags { target, changes } => {
+            if lib.get(target).is_none() {
+                effects.conflicts.push(Conflict::SourceMissing {
+                    op: index,
+                    at: target.clone(),
+                });
+                return Vec::new();
+            }
+            // A delta that changes nothing expands to nothing, which is how a
+            // bulk edit with one untouched field produces no step for it rather
+            // than a step that rewrites a file to the bytes it already has.
+            if changes.is_empty() {
+                return Vec::new();
+            }
+            vec![FsStep::WriteTags {
+                target: target.clone(),
+                delta: changes.clone(),
+                // Mirrored under the backup root the same way a delete's is, in
+                // its own subtree so that deleting and tagging the same path in
+                // one transaction keeps both copies.
+                backup: Some(
+                    cfg.data_dir
+                        .join("backups")
+                        .join(PENDING_TX)
+                        .join("tags")
+                        .join(target.as_str()),
+                ),
+            }]
+        }
+
         Operation::Delete { target } => {
             if lib.get(target).is_none() {
                 effects.conflicts.push(Conflict::SourceMissing {
@@ -580,6 +649,18 @@ fn from_fs_error(
             reason: format!("it is not under {root}"),
         }),
         FsError::NotWritable { dir } => Some(Conflict::NotWritable { op, dir }),
+        FsError::Tag(err) => Some(match RelPath::from_abs(err.path(), root) {
+            Ok(at) => Conflict::NotTaggable {
+                op,
+                at,
+                reason: tag_reason(&err),
+            },
+            Err(reason) => Conflict::OutsideRoot {
+                op,
+                path: err.path().to_string(),
+                reason: reason.to_string(),
+            },
+        }),
         FsError::DeleteDisabled { path } => Some(Conflict::DeleteDisabled {
             op,
             target: RelPath::from_abs(&path, root).ok()?,
@@ -588,6 +669,28 @@ fn from_fs_error(
             op,
             message: other.to_string(),
         }),
+    }
+}
+
+/// Why a file cannot be tagged, as a phrase for [`Conflict::NotTaggable`].
+///
+/// The path is already in the conflict, so the message must not repeat it — and
+/// `TagError`'s own `Display` leads with it.
+fn tag_reason(err: &TagError) -> String {
+    match err {
+        TagError::Unsupported {
+            detected: Some(what),
+            ..
+        } => {
+            format!("it is not a container MPDFM can edit (it looks like {what})")
+        }
+        TagError::Unsupported { detected: None, .. } => {
+            "it is not an audio file MPDFM can edit".to_owned()
+        }
+        TagError::Corrupt { reason, .. } => format!("its tag is damaged ({reason})"),
+        TagError::ReadOnly { .. } => "write permission is missing".to_owned(),
+        TagError::BadEdit { reason, .. } => reason.clone(),
+        other => other.to_string(),
     }
 }
 

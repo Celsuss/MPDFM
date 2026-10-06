@@ -338,7 +338,13 @@ impl AsRef<Utf8Path> for RelPath {
 /// is reported as *not* contained, because the cost of a false `true` is writing
 /// outside the library.
 ///
-/// - `root` is canonicalized; if it cannot be, the answer is `false`.
+/// - `root` is resolved the same way `candidate` is — its longest existing
+///   ancestor is canonicalized and the rest appended. A root that does not exist
+///   **yet** is the normal case for MPDFM's own data directory, which
+///   [`config::resolve`][crate::config::resolve] deliberately leaves
+///   uncanonicalized because commit creates it on first use; refusing every path
+///   under it until then would refuse every preview on a machine that has not
+///   committed anything.
 /// - `candidate` must be absolute (pass [`RelPath::to_abs`] output). A relative
 ///   path would silently be resolved against the process's working directory,
 ///   so it is rejected instead.
@@ -353,18 +359,21 @@ impl AsRef<Utf8Path> for RelPath {
 /// make the guard give the wrong answer.
 #[must_use]
 pub fn contains(root: &Utf8Path, candidate: &Utf8Path) -> bool {
-    let Ok(root) = root.as_std_path().canonicalize() else {
-        return false;
-    };
     let candidate = candidate.as_std_path();
-    if !candidate.is_absolute() {
+    if !root.as_std_path().is_absolute() || !candidate.is_absolute() {
         return false;
     }
-    match resolve_longest_existing(candidate) {
+    // Both sides through the same resolution, so a symlink in the part that
+    // exists is followed on both and a part that does not exist yet — which
+    // cannot hold a symlink, because it is not there — is compared lexically.
+    match (
+        resolve_longest_existing(root.as_std_path()),
+        resolve_longest_existing(candidate),
+    ) {
         // `Path::starts_with` is component-wise, so `/music` does not contain
         // `/musicbox`.
-        Some(resolved) => resolved.starts_with(&root),
-        None => false,
+        (Some(root), Some(resolved)) => resolved.starts_with(&root),
+        _ => false,
     }
 }
 
@@ -705,11 +714,50 @@ mod tests {
         }
 
         #[test]
-        fn rejects_a_root_that_cannot_be_resolved() {
+        fn a_root_that_does_not_exist_yet_still_contains_what_is_under_it() {
+            // MPDFM's own data directory is created on first use and is
+            // deliberately not canonicalized by `config::resolve`, so this is the
+            // normal case on a machine that has not committed anything yet.
+            // Refusing it would refuse every preview that plans a backup.
             let root_dir = tempfile::tempdir().unwrap();
-            let missing = utf8(root_dir.path()).join("gone");
+            let missing = utf8(root_dir.path()).join("mpdfm");
 
-            assert!(!contains(&missing, &missing.join("01.mp3")));
+            assert!(contains(&missing, &missing));
+            assert!(contains(
+                &missing,
+                &missing.join("backups/pending/tags/a.mp3")
+            ));
+
+            // And it contains only what is under it: a sibling that does not
+            // exist either is still outside.
+            let sibling = utf8(root_dir.path()).join("elsewhere");
+            assert!(!contains(&missing, &sibling.join("a.mp3")));
+            assert!(!contains(&missing, utf8(root_dir.path())));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_symlink_above_a_root_that_does_not_exist_yet_is_resolved() {
+            // The part of a root that exists is resolved even when the root
+            // itself does not, so a data directory reached through a symlinked
+            // `~/.local/share` is measured against where it really is.
+            let real = tempfile::tempdir().unwrap();
+            let link_dir = tempfile::tempdir().unwrap();
+            let link = utf8(link_dir.path()).join("share");
+            std::os::unix::fs::symlink(real.path(), link.as_std_path()).unwrap();
+
+            let through_link = link.join("mpdfm");
+            let direct = utf8(real.path()).join("mpdfm");
+            assert!(contains(&through_link, &direct.join("backups/a.mp3")));
+            assert!(contains(&direct, &through_link.join("backups/a.mp3")));
+        }
+
+        #[test]
+        fn rejects_a_root_that_is_not_absolute() {
+            assert!(!contains(
+                Utf8Path::new("relative/root"),
+                Utf8Path::new("/relative/root/a.mp3")
+            ));
         }
     }
 }

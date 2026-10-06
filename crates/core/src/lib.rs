@@ -13,6 +13,7 @@ pub mod mpdconf;
 pub mod ops;
 pub mod paths;
 pub mod playlist;
+pub mod tags;
 
 // The fixture library (task 03). Behind a feature so a release build carries
 // none of it, and so the embedded audio templates cost nothing in production.
@@ -84,6 +85,10 @@ pub enum Error {
     /// A transaction a crash interrupted that could not be recovered.
     #[error(transparent)]
     Recover(#[from] journal::recover::RecoverError),
+
+    /// A file's tags could not be read, or could not be written.
+    #[error(transparent)]
+    Tag(#[from] tags::TagError),
 
     /// An I/O failure, with the path that caused it.
     #[error("{path}: {source}")]

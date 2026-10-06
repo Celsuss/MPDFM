@@ -839,6 +839,35 @@ fn inspect_reverse(
             });
             return;
         }
+        // A tag write stayed where it was, so there is nothing to put back *to*
+        // — only the file itself to check. Its receipt's facts describe the file
+        // as the write left it, which is what makes "somebody has edited this
+        // track since" visible here.
+        (
+            FsStep::WriteTags {
+                target,
+                backup: Some(_),
+                ..
+            },
+            Done::TagsWritten { .. },
+        ) => (target.to_abs(root), None),
+        (
+            FsStep::WriteTags {
+                target,
+                backup: None,
+                ..
+            },
+            Done::TagsWritten { .. },
+        ) => {
+            problems.push(Problem {
+                at: target.to_abs(root),
+                what: Trouble::Missing,
+                detail: "its tags were written with no backup, so the originals are gone"
+                    .to_owned(),
+                step: Some(position),
+            });
+            return;
+        }
         // A directory step has no contents to compare, and whether one can be
         // removed is not knowable yet: the steps reversed before it are what
         // empty it. `DirKept` is the answer, and the revert itself is the only
@@ -857,8 +886,10 @@ fn inspect_reverse(
     };
 
     let facts = match &receipt.done {
-        Done::Moved { facts, .. } | Done::Removed { facts, .. } => facts,
-        // Unreachable: the match above only produced a path for these two.
+        Done::Moved { facts, .. }
+        | Done::Removed { facts, .. }
+        | Done::TagsWritten { facts, .. } => facts,
+        // Unreachable: the match above only produced a path for the other three.
         Done::DirsCreated { .. } | Done::DirsRemoved { .. } => return,
     };
 

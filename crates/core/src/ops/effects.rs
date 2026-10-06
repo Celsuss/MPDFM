@@ -153,6 +153,22 @@ pub enum Conflict {
         paths: Vec<RelPath>,
     },
 
+    /// Two staged operations want to edit the same file's tags.
+    ///
+    /// Refused rather than run in order, because the second one's backup would
+    /// overwrite the first's and the transaction would no longer be able to put
+    /// the file back as it was. A user who wants both edits puts them in one
+    /// operation, which is what the bulk view produces anyway.
+    #[error("operations {first} and {second} both edit the tags of {at}")]
+    DuplicateEdit {
+        /// The earlier operation.
+        first: usize,
+        /// The later one.
+        second: usize,
+        /// The file they both edit.
+        at: RelPath,
+    },
+
     /// The source is not in the library. Either it never was, or the model is
     /// stale and a rescan is due.
     #[error("operation {op}: {at} is not in the library")]
@@ -189,6 +205,19 @@ pub enum Conflict {
         dir: Utf8PathBuf,
     },
 
+    /// A tag edit was staged against something MPDFM cannot tag — a `.cue`, a
+    /// `.nfo`, a file whose bytes are not a container it edits, or one it may
+    /// not write to.
+    #[error("operation {op}: {at} cannot be tagged: {reason}")]
+    NotTaggable {
+        /// Index into the plan's operations.
+        op: usize,
+        /// The file.
+        at: RelPath,
+        /// Why not.
+        reason: String,
+    },
+
     /// A delete was staged while [`Config::delete_enabled`][crate::config::Config::delete_enabled]
     /// is false. The configuration is the answer, not a prompt.
     #[error("operation {op}: refusing to delete {target}: delete_enabled is false")]
@@ -222,9 +251,11 @@ impl Conflict {
             | Self::SourceMissing { op, .. }
             | Self::OutsideRoot { op, .. }
             | Self::NotWritable { op, .. }
+            | Self::NotTaggable { op, .. }
             | Self::DeleteDisabled { op, .. }
             | Self::Unreadable { op, .. } => vec![*op],
-            Self::DuplicateDestination { first, second, .. } => vec![*first, *second],
+            Self::DuplicateDestination { first, second, .. }
+            | Self::DuplicateEdit { first, second, .. } => vec![*first, *second],
             Self::Cycle { ops, .. } => ops.clone(),
         }
     }
@@ -353,6 +384,12 @@ pub struct Summary {
     pub audio_moved: usize,
     /// Files removed into the backup directory.
     pub files_deleted: usize,
+    /// Files whose tags are rewritten.
+    #[serde(default)]
+    pub tags_written: usize,
+    /// Field edits across those files — three files with two fields each is six.
+    #[serde(default)]
+    pub fields_changed: usize,
     /// Directories that will be created. An upper bound: `MkDir` is idempotent,
     /// so one whose directory already exists is a no-op at commit time.
     pub dirs_created: usize,
@@ -387,6 +424,10 @@ impl Summary {
                     }
                 }
                 FsStep::RemoveFile { .. } => summary.files_deleted += 1,
+                FsStep::WriteTags { delta, .. } => {
+                    summary.tags_written += 1;
+                    summary.fields_changed += delta.len();
+                }
                 FsStep::RmDirIfEmpty { .. } => summary.dirs_removed += 1,
             }
         }

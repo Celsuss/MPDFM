@@ -16,6 +16,7 @@ use crate::config::Config;
 use crate::library::Library;
 use crate::paths::RelPath;
 use crate::playlist::PlaylistIndex;
+use crate::tags::TagDelta;
 
 use super::effects::Effects;
 use super::plan::{Live, Prefs};
@@ -26,13 +27,6 @@ use super::plan::{Live, Prefs};
 /// operation however many files are in it. [`Plan::validate`] expands it into
 /// [`FsStep`][super::exec_fs::FsStep]s, which is where the per-file detail — and
 /// the journal's per-file reversibility — comes from.
-///
-/// # Not here yet
-///
-/// `WriteTags { target, changes: TagDelta }` belongs in this enum and is left
-/// out until M2 defines `TagDelta` (tasks 16–18). Adding a placeholder now would
-/// mean guessing at the shape of a multi-valued FLAC field, which is an open
-/// question in the roadmap. The preview's `TAG` row arrives with it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Operation {
     /// Move one file. Aux files stay where they are: this is a file move, and
@@ -61,6 +55,25 @@ pub enum Operation {
         /// The file to remove.
         target: RelPath,
     },
+
+    /// Rewrite one file's tags, changing only the fields in `changes`.
+    ///
+    /// The only operation that changes a file's *contents* rather than its path,
+    /// which makes it the only one that no playlist line and no queue entry cares
+    /// about. Everything else about it is ordinary: it previews, it commits in the
+    /// same transaction as a move, and it is undone with one
+    /// (`docs/tasks/17-tag-write.md`).
+    ///
+    /// One per file, even for a bulk edit across four hundred of them — the unit
+    /// of reversal is the file, so the unit of the operation is too. The preview
+    /// is what collapses them into one `TAG` row per changed field
+    /// ([`render`][super::render]).
+    WriteTags {
+        /// The file to rewrite.
+        target: RelPath,
+        /// Which fields change, and to what.
+        changes: TagDelta,
+    },
 }
 
 impl Operation {
@@ -69,17 +82,17 @@ impl Operation {
     pub fn source(&self) -> &RelPath {
         match self {
             Self::MoveFile { from, .. } | Self::MoveDir { from, .. } => from,
-            Self::Delete { target } => target,
+            Self::Delete { target } | Self::WriteTags { target, .. } => target,
         }
     }
 
     /// The path this operation writes to — the one that has to be free. `None`
-    /// for a delete, which creates nothing.
+    /// for a delete and for a tag write, neither of which creates anything.
     #[must_use]
     pub fn destination(&self) -> Option<&RelPath> {
         match self {
             Self::MoveFile { to, .. } | Self::MoveDir { to, .. } => Some(to),
-            Self::Delete { .. } => None,
+            Self::Delete { .. } | Self::WriteTags { .. } => None,
         }
     }
 
@@ -95,6 +108,8 @@ impl Operation {
         match self {
             Self::MoveFile { from, .. } | Self::Delete { target: from } => from == path,
             Self::MoveDir { from, .. } => path == from || path.starts_with_dir(from),
+            // A tag write leaves the file exactly where it is.
+            Self::WriteTags { .. } => false,
         }
     }
 
@@ -105,6 +120,7 @@ impl Operation {
             Self::MoveFile { .. } => "MOVE",
             Self::MoveDir { .. } => "MOVE",
             Self::Delete { .. } => "DELETE",
+            Self::WriteTags { .. } => "TAG",
         }
     }
 }
@@ -115,6 +131,7 @@ impl std::fmt::Display for Operation {
             Self::MoveFile { from, to } => write!(f, "move {from} -> {to}"),
             Self::MoveDir { from, to } => write!(f, "move {from}/ -> {to}/"),
             Self::Delete { target } => write!(f, "delete {target}"),
+            Self::WriteTags { target, changes } => write!(f, "tag {target}: {changes}"),
         }
     }
 }
@@ -273,6 +290,21 @@ mod tests {
         assert!(op.vacates(&rel("a/one.mp3")));
         assert!(!op.vacates(&rel("a")));
         assert!(!op.vacates(&rel("a/one.mp3.bak")));
+    }
+
+    #[test]
+    fn a_tag_write_moves_nothing_and_creates_nothing() {
+        let op = Operation::WriteTags {
+            target: rel("a/one.mp3"),
+            changes: crate::tags::TagDelta::new().set(crate::tags::Field::Genre, "Jazz"),
+        };
+
+        assert_eq!(op.source(), &rel("a/one.mp3"));
+        assert_eq!(op.destination(), None);
+        // Nothing is freed up by it, so nothing may be ordered after it on that
+        // basis — and a move of the same file must run *after* it, not before.
+        assert!(!op.vacates(&rel("a/one.mp3")));
+        assert_eq!(op.verb(), "TAG");
     }
 
     #[test]

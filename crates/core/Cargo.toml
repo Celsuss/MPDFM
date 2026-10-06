@@ -17,6 +17,10 @@ testing = ["dep:tempfile"]
 # dependency direction is one-way. `tests/manifest_deps.rs` enforces it.
 [dependencies]
 camino.workspace = true
+# Tag read and write for mp3, flac and m4a with no C dependency (`docs/PLAN.md`
+# D1). Container detection is by content, not extension, which is what task 16
+# needs for the mislabelled files in this library.
+lofty.workspace = true
 serde.workspace = true
 # The journal is JSON on disk (task 11, `docs/PLAN.md` §7): one record per
 # transaction, read back after a crash by a build that may be newer than the one

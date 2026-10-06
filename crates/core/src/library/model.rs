@@ -27,7 +27,10 @@ use crate::paths::{PathError, RelPath};
 /// The three MPD is fed on this machine: 2 440 mp3, 357 flac, 5 m4a
 /// (`docs/PLAN.md` §3). A format MPDFM cannot write tags to has no business
 /// being in this enum — it is [`Kind::Other`], scanned and moved but not edited.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Format {
     /// MPEG-1 Layer III, ID3v2.3 or v2.4.
     Mp3,
