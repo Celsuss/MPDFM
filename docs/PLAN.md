@@ -96,8 +96,9 @@ MPDFM/
 │       │   ├── write.rs          atomic write, symlink-aware
 │       │   └── index.rs          RelPath → [reference] map
 │       ├── tags/
-│       │   ├── read.rs           lofty → TagSet
-│       │   ├── write.rs          TagSet → file, preserving unknown frames
+│       │   ├── model.rs          TagSet, Field, AudioInfo — no lofty in it
+│       │   ├── read.rs           lofty → TagSet, container by content
+│       │   ├── write.rs          TagDelta → file, preserving unknown frames
 │       │   └── bulk.rs           multi-file common/<multiple> semantics
 │       ├── ops/
 │       │   ├── exec_fs.rs        one filesystem step at a time, each reversible

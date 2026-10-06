@@ -39,14 +39,17 @@ including crash injection at every commit phase.
 
 | # | Task | Depends on | Status |
 | --- | --- | --- | --- |
-| 16 | [Tag reading](tasks/16-tag-read.md) | 05 | not started |
-| 17 | [Tag writing](tasks/17-tag-write.md) | 11, 16 | not started |
-| 18 | [Bulk tag semantics](tasks/18-tag-bulk.md) | 16, 17 | not started |
-| 19 | [Tag CLI](tasks/19-cli-tags.md) | 15–18 | not started |
+| 16 | [Tag reading](tasks/16-tag-read.md) | 05 | done |
+| 17 | [Tag writing](tasks/17-tag-write.md) | 11, 16 | done |
+| 18 | [Bulk tag semantics](tasks/18-tag-bulk.md) | 16, 17 | done |
+| 19 | [Tag CLI](tasks/19-cli-tags.md) | 15–18 | done |
 
 **M2 is done when:** mp3 and FLAC tags can be read and written single and in
 bulk, nothing else in the file changes (embedded art and ReplayGain survive), and
-a bad bulk edit is fully undoable.
+a bad bulk edit is fully undoable. **Done.** Verified against every one of the
+2 808 real audio files, on copies: 2 792 written with only the named field changed
+and the audio stream bit-identical, 16 refused in preflight as damaged, and 25
+losing one malformed frame `lofty` will not re-emit. Numbers in task 17.
 
 ## M3 — TUI
 
@@ -141,8 +144,16 @@ one of the large ones (08, 10, 11, 22, 27).
   in task 15 with the release binary: the real library's 3 132 files across 27 GB
   scan in **10 ms**. Task 20 can rescan on a keystroke and the cache should stay
   unbuilt. Numbers in task 15's hand-verification section.
-- FLAC multi-valued fields: `Vec<String>` throughout, or join-and-remember?
-  Decide in task 16; it affects the tag editor UI.
+- ~~FLAC multi-valued fields: `Vec<String>` throughout, or join-and-remember?~~
+  **Decided in task 16: an ordered list in every text field** (`tags::Values`).
+  Join-and-remember needs the same two pieces of information and then has to
+  guess which semicolons were separators on the way back out. The tag editor still
+  shows one row per field, through `Values::joined`; 16 of the 2 808 real files
+  are multi-valued.
+- Whether `doctor` should report the 25 files holding frames no ID3v2 writer will
+  emit — an invalid `TDRC`, a `WXXX` with no description, a v2.4-only frame in a
+  v2.3 tag. Task 17 measured them and leaves them alone; naming them is task 29's
+  business, not the writer's.
 - How much of `--deep` duplicate detection is worth it on a 2 800-file library
   (task 29) — measure before building the hash pass.
 - Whether to add a `mpdfm find` CLI command mirroring the TUI query parser

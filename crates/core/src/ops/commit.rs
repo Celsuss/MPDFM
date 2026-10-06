@@ -83,7 +83,7 @@
 
 use std::time::SystemTime;
 
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::config::Config;
 use crate::journal::record::{Record, Status, StepRecord, TxId};
@@ -696,7 +696,7 @@ fn sources(steps: &[FsStep]) -> Vec<RelPath> {
         .iter()
         .filter_map(|step| match step {
             FsStep::RenameFile { from, .. } | FsStep::CopyDelete { from, .. } => Some(from),
-            FsStep::RemoveFile { target, .. } => Some(target),
+            FsStep::RemoveFile { target, .. } | FsStep::WriteTags { target, .. } => Some(target),
             FsStep::MkDir { .. } | FsStep::RmDirIfEmpty { .. } => None,
         })
         .filter(|path| seen.insert((*path).clone()))
@@ -750,38 +750,55 @@ fn retarget_backups(steps: &[FsStep], config: &Config, backup_dir: &Utf8Path) ->
     let pending = config.data_dir.join("backups").join(PENDING_TX);
     steps
         .iter()
-        .map(|step| match step {
-            FsStep::RemoveFile {
-                target,
-                backup: Some(backup),
-            } => FsStep::RemoveFile {
-                target: target.clone(),
-                backup: Some(match backup.strip_prefix(&pending) {
-                    Ok(rest) => backup_dir.join(rest),
-                    Err(_) => backup.clone(),
-                }),
-            },
-            other => other.clone(),
+        .map(|step| {
+            let retarget = |backup: &Utf8PathBuf| match backup.strip_prefix(&pending) {
+                Ok(rest) => backup_dir.join(rest),
+                Err(_) => backup.clone(),
+            };
+            match step {
+                FsStep::RemoveFile {
+                    target,
+                    backup: Some(backup),
+                } => FsStep::RemoveFile {
+                    target: target.clone(),
+                    backup: Some(retarget(backup)),
+                },
+                FsStep::WriteTags {
+                    target,
+                    delta,
+                    backup: Some(backup),
+                } => FsStep::WriteTags {
+                    target: target.clone(),
+                    delta: delta.clone(),
+                    backup: Some(retarget(backup)),
+                },
+                other => other.clone(),
+            }
         })
         .collect()
 }
 
-/// Create the directories a delete's backup needs.
+/// Create the directories a delete's or a tag write's backup needs.
 ///
-/// A backup mirrors the library path under `<backup_dir>/files/`, so deleting
-/// `hiphop/x/cover.jpg` needs `<backup_dir>/files/hiphop/x/` to exist —
-/// [`exec_fs`] deliberately does not create it, because a step that invents
-/// directories outside the library is a step that can put one in the wrong place.
+/// A backup mirrors the library path under `<backup_dir>/files/` or
+/// `<backup_dir>/tags/`, so deleting `hiphop/x/cover.jpg` needs
+/// `<backup_dir>/files/hiphop/x/` to exist — [`exec_fs`] deliberately does not
+/// create it, because a step that invents directories outside the library is a
+/// step that can put one in the wrong place.
 ///
 /// # Errors
 ///
 /// [`Error::Io`] if one cannot be created.
 fn create_backup_parents(steps: &[FsStep]) -> Result<()> {
     for step in steps {
-        let FsStep::RemoveFile {
+        let (FsStep::RemoveFile {
             backup: Some(backup),
             ..
-        } = step
+        }
+        | FsStep::WriteTags {
+            backup: Some(backup),
+            ..
+        }) = step
         else {
             continue;
         };
@@ -870,7 +887,9 @@ pub fn affected_dirs(steps: &[FsStep]) -> Vec<DirPath> {
                 dirs.push(DirPath::of(from));
                 dirs.push(DirPath::of(to));
             }
-            FsStep::RemoveFile { target, .. } => dirs.push(DirPath::of(target)),
+            FsStep::RemoveFile { target, .. } | FsStep::WriteTags { target, .. } => {
+                dirs.push(DirPath::of(target));
+            }
             // The directory may well be gone; its parent covers it.
             FsStep::RmDirIfEmpty { at } => {
                 dirs.push(

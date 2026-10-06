@@ -42,6 +42,7 @@ mod audio;
 mod mpd;
 mod playlists;
 mod snapshot;
+pub mod tags;
 
 pub use audio::AudioTemplate;
 pub use mpd::{Transcript, TranscriptStream};
@@ -305,6 +306,7 @@ impl Fixture {
             delete_enabled: true,
             backup_keep: DEFAULT_BACKUP_KEEP,
             organize_template: DEFAULT_ORGANIZE_TEMPLATE.to_owned(),
+            id3_version: crate::tags::Id3Version::default(),
             sources: Sources {
                 music_dir: Source::Default,
                 playlist_dir: Source::Default,
@@ -317,6 +319,7 @@ impl Fixture {
                 delete_enabled: Source::Default,
                 backup_keep: Source::Default,
                 organize_template: Source::Default,
+                id3_version: Source::Default,
             },
         }
     }

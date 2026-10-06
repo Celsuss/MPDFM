@@ -30,6 +30,7 @@ fn options(fx: &Fixture) -> Options {
         delete_enabled: true,
         verify: false,
         backup_root: Some(fx.data_dir().to_owned()),
+        id3_version: Default::default(),
         inject: Inject::Nothing,
     }
 }

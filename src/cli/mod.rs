@@ -2,9 +2,9 @@
 //!
 //! One module per command, and this file is the switchboard: it parses the
 //! arguments, resolves the configuration **once** so that every command
-//! downstream shares one canonical library root, and dispatches. The commands
-//! M2 onwards own still report `not implemented` and the task that owns them,
-//! rather than panicking.
+//! downstream shares one canonical library root, and dispatches. The one command
+//! that is not built yet — `organize`, task 28 — reports `not implemented` and
+//! the task that owns it, rather than panicking.
 //!
 //! [`crate::output`] holds the exit codes and the output mode, because those are
 //! a contract shared by every command rather than a detail of any one of them.
@@ -15,6 +15,7 @@ mod doctor;
 mod r#move;
 mod mpd;
 mod scan;
+mod tag;
 mod undo;
 
 use std::process::ExitCode;
@@ -223,21 +224,56 @@ pub enum ConfigCommand {
 #[derive(Debug, Subcommand)]
 pub enum TagCommand {
     /// Print the tags of a file, or of every audio file in a directory.
-    Show {
-        /// File or directory to read.
-        path: Utf8PathBuf,
-    },
+    Show(TagShowArgs),
 
     /// Write tags.
-    Set {
-        /// File or directory to write.
-        path: Utf8PathBuf,
-        #[command(flatten)]
-        fields: TagFields,
-    },
+    Set(TagSetArgs),
+
+    /// Show what `tag set` would change, and write nothing.
+    Diff(TagSetArgs),
 }
 
-/// The fields `tag set` can write. Task 19 owns the full set.
+/// `mpdfm tag show <PATH>...`
+///
+/// Each `PATH` is a file or a directory, relative to the music directory or
+/// absolute inside it. A directory contributes its own audio files; `-r` goes
+/// below it as well.
+#[derive(Debug, Args)]
+pub struct TagShowArgs {
+    /// Files or directories to read.
+    #[arg(required = true)]
+    pub paths: Vec<Utf8PathBuf>,
+
+    /// Include audio files in subdirectories.
+    #[arg(long, short = 'r')]
+    pub recursive: bool,
+}
+
+/// `mpdfm tag set <PATH>...`, and `mpdfm tag diff <PATH>...`, which takes the
+/// same arguments and writes nothing.
+#[derive(Debug, Args)]
+pub struct TagSetArgs {
+    /// Files or directories to write.
+    #[arg(required = true)]
+    pub paths: Vec<Utf8PathBuf>,
+
+    #[command(flatten)]
+    pub fields: TagFields,
+
+    /// Include audio files in subdirectories.
+    #[arg(long, short = 'r')]
+    pub recursive: bool,
+
+    /// Show the preview and write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Skip the confirmation prompt. Required when stdin is not a terminal.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+}
+
+/// The fields `tag set` can write, and the actions it can run.
 #[derive(Debug, Args)]
 pub struct TagFields {
     /// Track title.
@@ -247,7 +283,7 @@ pub struct TagFields {
     #[arg(long, value_name = "VALUE")]
     pub artist: Option<String>,
     /// Album artist.
-    #[arg(long, value_name = "VALUE")]
+    #[arg(long, alias = "albumartist", value_name = "VALUE")]
     pub album_artist: Option<String>,
     /// Album name.
     #[arg(long, value_name = "VALUE")]
@@ -273,9 +309,50 @@ pub struct TagFields {
     /// Remove a field entirely; repeatable.
     #[arg(long, value_name = "FIELD")]
     pub clear: Vec<String>,
+
+    /// Number the selected files 1..n in the order they are listed, and set the
+    /// total on each.
+    #[arg(long)]
+    pub renumber_tracks: bool,
+
+    /// Take each file's title from its own name, stripping a leading track
+    /// number and the extension.
+    #[arg(long)]
+    pub title_from_filename: bool,
+
+    /// Give each file its own artist as its album artist.
+    #[arg(long)]
+    pub album_artist_from_artist: bool,
+
+    /// Remove the comment from every selected file.
+    #[arg(long)]
+    pub strip_comment: bool,
+
+    /// Strip leading and trailing space from every text field that has any.
+    #[arg(long)]
+    pub trim_whitespace: bool,
 }
 
 impl TagFields {
+    /// Whether nothing at all was asked for.
+    pub fn is_empty(&self) -> bool {
+        self.edits().is_empty() && self.actions().is_empty()
+    }
+
+    /// The named actions that were asked for, as the flags spell them.
+    pub fn actions(&self) -> Vec<&'static str> {
+        [
+            (self.renumber_tracks, "--renumber-tracks"),
+            (self.title_from_filename, "--title-from-filename"),
+            (self.album_artist_from_artist, "--album-artist-from-artist"),
+            (self.strip_comment, "--strip-comment"),
+            (self.trim_whitespace, "--trim-whitespace"),
+        ]
+        .into_iter()
+        .filter_map(|(asked, name)| asked.then_some(name))
+        .collect()
+    }
+
     /// The requested edits as `field=value` (or `field=<cleared>`) pairs, in the
     /// order they are displayed.
     pub fn edits(&self) -> Vec<String> {
@@ -400,14 +477,9 @@ pub fn run() -> Result<ExitCode> {
             ("mpdfm organize", "28-organize-command.md")
         }
         Command::Tag { command } => match command {
-            TagCommand::Show { path } => {
-                cli.trace(format!("tag show {path}"));
-                ("mpdfm tag show", "19-cli-tags.md")
-            }
-            TagCommand::Set { path, fields } => {
-                cli.trace(format!("tag set {path}: {}", fields.edits().join(" ")));
-                ("mpdfm tag set", "19-cli-tags.md")
-            }
+            TagCommand::Show(args) => return tag::show(&cli, &settings, &out, args),
+            TagCommand::Set(args) => return tag::set(&cli, &settings, &out, args, false),
+            TagCommand::Diff(args) => return tag::set(&cli, &settings, &out, args, true),
         },
     };
 
@@ -539,6 +611,44 @@ mod tests {
     }
 
     #[test]
+    fn tag_set_takes_several_paths_and_the_named_actions() {
+        let cli = Cli::try_parse_from([
+            "mpdfm",
+            "tag",
+            "set",
+            "a/1.mp3",
+            "a/2.mp3",
+            "--renumber-tracks",
+            "-r",
+            "--yes",
+        ])
+        .unwrap();
+        let Some(Command::Tag {
+            command: TagCommand::Set(args),
+        }) = cli.command
+        else {
+            panic!("expected `tag set`");
+        };
+        assert_eq!(args.paths.len(), 2);
+        assert!(args.recursive && args.yes);
+        assert_eq!(args.fields.actions(), ["--renumber-tracks"]);
+        assert!(args.fields.edits().is_empty());
+    }
+
+    #[test]
+    fn tag_diff_takes_the_same_arguments_as_tag_set() {
+        let cli =
+            Cli::try_parse_from(["mpdfm", "tag", "diff", "a/1.mp3", "--genre", "Jazz"]).unwrap();
+        let Some(Command::Tag {
+            command: TagCommand::Diff(args),
+        }) = cli.command
+        else {
+            panic!("expected `tag diff`");
+        };
+        assert_eq!(args.fields.edits(), ["genre=Jazz"]);
+    }
+
+    #[test]
     fn json_is_global_so_it_works_after_a_subcommand() {
         let cli = Cli::try_parse_from(["mpdfm", "scan", "--json"]).unwrap();
         assert!(cli.globals.json);
@@ -559,11 +669,12 @@ mod tests {
         ])
         .unwrap();
         let Some(Command::Tag {
-            command: TagCommand::Set { fields, .. },
+            command: TagCommand::Set(args),
         }) = cli.command
         else {
             panic!("expected `tag set`");
         };
-        assert_eq!(fields.edits(), ["genre=Hip Hop", "comment=<cleared>"]);
+        assert_eq!(args.fields.edits(), ["genre=Hip Hop", "comment=<cleared>"]);
+        assert_eq!(args.paths, [Utf8PathBuf::from("rock/a.mp3")]);
     }
 }

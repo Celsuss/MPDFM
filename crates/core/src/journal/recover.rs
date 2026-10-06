@@ -544,6 +544,29 @@ fn landed(record: &Record, step: &StepRecord) -> Landed {
             }
         }
 
+        // A tag write cannot be told apart by looking at paths: the file is
+        // there whether or not it ran. Its **backup** can, and that is enough,
+        // because the backup is the whole original file — so rolling back from
+        // it is correct either way (a write that never happened is restored to
+        // the bytes it already has) and rolling forward is correct either way
+        // too (the write is idempotent). The one state that is knowable and
+        // matters is "the backup is not there", which means the write did not
+        // get past its first step and the file is untouched.
+        FsStep::WriteTags { target, backup, .. } => {
+            let Some(backup) = backup else {
+                return Landed::CannotTell(
+                    Trouble::Missing,
+                    target.to_abs(root),
+                    "wrote tags with no backup, so the originals cannot be put back",
+                );
+            };
+            if there(backup) {
+                Landed::Yes
+            } else {
+                Landed::No
+            }
+        }
+
         FsStep::RmDirIfEmpty { at } => {
             if there(&at.to_abs(root)) {
                 Landed::No
@@ -572,11 +595,16 @@ fn reconstruct(record: &Record, step: &StepRecord) -> std::result::Result<StepRe
             },
             warnings: Vec::new(),
         }),
-        // Neither is reachable: `look` sends an unbacked delete to
-        // `CannotTell`, and a `MkDir` never gets this far.
-        FsStep::RemoveFile { backup: None, .. } | FsStep::MkDir { .. } => {
-            Err("its receipt cannot be reconstructed".to_owned())
-        }
+        FsStep::WriteTags {
+            target,
+            backup: Some(backup),
+            delta: _,
+        } => tags_receipt(step, &target.to_abs(root), backup),
+        // None is reachable: `look` sends an unbacked delete and an unbacked tag
+        // write to `CannotTell`, and a `MkDir` never gets this far.
+        FsStep::RemoveFile { backup: None, .. }
+        | FsStep::WriteTags { backup: None, .. }
+        | FsStep::MkDir { .. } => Err("its receipt cannot be reconstructed".to_owned()),
     }
 }
 
@@ -619,6 +647,25 @@ fn removed_receipt(
             method: Method::Copy,
             facts,
         },
+        warnings: Vec::new(),
+    })
+}
+
+/// The receipt for a tag write that ran without being journaled.
+///
+/// The facts come from the file as it is now, which is the state a later undo has
+/// to recognize, and the original's size from the backup — both observed rather
+/// than remembered, which is all a reconstruction can ever be.
+fn tags_receipt(
+    step: &StepRecord,
+    target: &Utf8PathBuf,
+    backup: &Utf8PathBuf,
+) -> std::result::Result<StepReceipt, String> {
+    let facts = Facts::of(target).map_err(|err| err.to_string())?;
+    let original = Facts::of(backup).map_err(|err| err.to_string())?.size;
+    Ok(StepReceipt {
+        step: step.step.clone(),
+        done: Done::TagsWritten { facts, original },
         warnings: Vec::new(),
     })
 }

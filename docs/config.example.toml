@@ -61,6 +61,21 @@
 # How many committed transactions to keep backups and undo records for.
 # backup_keep = 50
 
+# Which ID3v2 revision a tag write leaves an mp3 in.
+#
+#   "keep"  leave the file in the revision it is already in (the default)
+#   "v23"   always write ID3v2.3
+#   "v24"   always write ID3v2.4
+#
+# "keep" is the default because the choice is not MPDFM's to make: a library that
+# plays through an old receiver or a libid3tag build wants v2.3, and downgrading a
+# v2.4 file to v2.3 discards the frames v2.3 cannot hold (TSOP, TSOA, TSOT, TMOO,
+# TDRL and the rest), which is a loss nobody asked for. An ID3v2.2 file is written
+# as v2.4 whatever this says, because v2.2 cannot be written at all.
+#
+# FLAC and m4a are unaffected.
+# id3_version = "keep"
+
 # The default path template for `mpdfm organize`. Override per run with
 # `--template`.
 # organize_template = "{genre}/{albumartist}/{year} - {album}/{track:02} {title}"

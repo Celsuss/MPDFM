@@ -98,6 +98,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::config::Config;
 use crate::paths::{self, PathError, RelPath};
+use crate::tags::{self, Id3Version, TagBackup, TagDelta, TagError, WriteOpts};
 
 /// One filesystem change: the unit that is executed, journaled and reverted.
 ///
@@ -160,6 +161,28 @@ pub enum FsStep {
         backup: Option<Utf8PathBuf>,
     },
 
+    /// Rewrite one audio file's tags, changing only the fields in `delta`.
+    ///
+    /// The odd one out: it changes a file's *contents* rather than its path, so
+    /// it is the only step whose destination exists before it runs and still
+    /// exists after. That is why its receipt records the file as the write
+    /// **left** it rather than as it found it — [`Facts`] is what undo compares
+    /// against to notice somebody else editing the track afterwards — and why
+    /// reversing it replaces the file from `backup` instead of renaming anything.
+    ///
+    /// `backup` is the whole original file, in the transaction's backup
+    /// directory, which is what makes undo byte-for-byte (see
+    /// [`tags::write`][crate::tags::write]). `None` writes with no way back,
+    /// which [`FsWarning::NoBackup`] warns about and [`revert`] refuses.
+    WriteTags {
+        /// The file to rewrite.
+        target: RelPath,
+        /// Which fields change, and to what.
+        delta: TagDelta,
+        /// Where the original is kept so undo can restore it.
+        backup: Option<Utf8PathBuf>,
+    },
+
     /// Remove `at` if it is empty, then its parent if that is now empty, and so
     /// on up — stopping at the first directory that is not empty, and never
     /// touching `root` itself.
@@ -184,6 +207,7 @@ impl std::fmt::Display for FsStep {
                 target,
                 backup: None,
             } => write!(f, "remove {target} (no backup)"),
+            Self::WriteTags { target, delta, .. } => write!(f, "tag {target} ({delta})"),
             Self::RmDirIfEmpty { at } => write!(f, "rmdir-if-empty {at}"),
         }
     }
@@ -214,6 +238,10 @@ pub struct Options {
     /// roots safety invariant 5 allows MPDFM to write to.
     pub backup_root: Option<Utf8PathBuf>,
 
+    /// [`Config::id3_version`]: which ID3v2 revision a [`FsStep::WriteTags`]
+    /// leaves an mp3 in. Irrelevant to every other step.
+    pub id3_version: Id3Version,
+
     /// Failure injection, for the two failures a test cannot cause from outside.
     /// Production passes [`Inject::Nothing`].
     pub inject: Inject,
@@ -228,6 +256,7 @@ impl Options {
             delete_enabled: config.delete_enabled,
             verify: false,
             backup_root: Some(config.data_dir.clone()),
+            id3_version: config.id3_version,
             inject: Inject::Nothing,
         }
     }
@@ -311,6 +340,17 @@ pub enum Done {
         method: Method,
         /// What the file was.
         facts: Facts,
+    },
+
+    /// [`FsStep::WriteTags`]: the file's tags are the delta's.
+    TagsWritten {
+        /// The file **as the write left it**, not as it found it. A tag write
+        /// necessarily changes the size and the mtime, so recording the original
+        /// would make undo think every tagged file had been edited since;
+        /// recording the result is what lets it notice when one actually has.
+        facts: Facts,
+        /// How big the original was, which is what its backup must still be.
+        original: u64,
     },
 
     /// [`FsStep::RmDirIfEmpty`]: the directories removed, innermost first.
@@ -679,6 +719,11 @@ pub enum FsError {
     #[error(transparent)]
     Path(#[from] PathError),
 
+    /// A tag write was refused, or failed. The original is untouched in every
+    /// case but the one [`TagError::NotWritten`] names.
+    #[error(transparent)]
+    Tag(#[from] Box<TagError>),
+
     /// [`Inject::CrashAfterCopy`] fired. Never raised in production.
     #[error("simulated crash after the copy of {path}, before the rename")]
     Injected {
@@ -751,6 +796,11 @@ pub fn execute_with(
         FsStep::RemoveFile { target, backup } => {
             remove_file(root, target, backup.as_deref(), options)?
         }
+        FsStep::WriteTags {
+            target,
+            delta,
+            backup,
+        } => write_tags(root, target, delta, backup.as_deref(), options)?,
         FsStep::RmDirIfEmpty { at } => rmdir_upward(root, at)?,
     };
 
@@ -810,6 +860,26 @@ pub fn revert(receipt: &StepReceipt, root: &Utf8Path) -> Result<(), FsError> {
                 });
             };
             move_back(backup, &target_abs, *method, facts)
+        }
+
+        (FsStep::WriteTags { target, backup, .. }, Done::TagsWritten { original, .. }) => {
+            let target_abs = guard(root, target)?;
+            let Some(backup) = backup else {
+                return Err(FsError::NotRevertible {
+                    step: receipt.step.to_string(),
+                    why: "the tags were written with no backup, so the originals are gone",
+                });
+            };
+            // The backup is the whole original file, so putting it back is
+            // byte-for-byte by construction — and idempotent, which is what lets
+            // `recover` roll a tag write back without having to know whether it
+            // ran.
+            tags::restore(&TagBackup {
+                target: target_abs,
+                copy: backup.clone(),
+                size: *original,
+            })
+            .map_err(|err| FsError::Tag(Box::new(err)))
         }
 
         (FsStep::RmDirIfEmpty { .. }, Done::DirsRemoved { dirs }) => recreate(root, dirs),
@@ -1081,6 +1151,59 @@ fn inspect(step: &FsStep, root: &Utf8Path, options: &Options) -> Result<Vec<FsWa
             writable_by_mode(&parent_of(root, target))?;
         }
 
+        FsStep::WriteTags {
+            target,
+            delta,
+            backup,
+        } => {
+            let target_abs = guard(root, target)?;
+            // Everything about the file and the delta that can be refused
+            // without writing: that it is there, that it is a container MPDFM
+            // edits (by its bytes, not its name), that it is writable, and that
+            // the delta asks for something a tag can hold. It costs one small
+            // read per file, which is what makes an unwritable track in a
+            // 400-file bulk edit a *preview* conflict rather than a commit that
+            // dies at file 213.
+            tags::write::preflight(&target_abs, delta).map_err(|err| match err {
+                TagError::Unreadable { .. } => FsError::Missing {
+                    path: target_abs.clone(),
+                },
+                TagError::ReadOnly { path } => FsError::NotWritable { dir: path },
+                other => FsError::Tag(Box::new(other)),
+            })?;
+            match backup {
+                Some(backup) => {
+                    let Some(backup_root) = &options.backup_root else {
+                        return Err(FsError::NoBackupRoot { path: target_abs });
+                    };
+                    if !paths::contains(backup_root, backup) {
+                        return Err(FsError::Outside {
+                            path: backup.clone(),
+                            root: backup_root.clone(),
+                        });
+                    }
+                    // Unlike a delete's backup, an existing one here is **not**
+                    // refused: the copy is of the original and the write takes it
+                    // again, so the step is idempotent. That is what lets `undo
+                    // --force` and `recover --forward` replay a tag write whose
+                    // reversal left the backup where it was.
+                    let parent = backup.parent().ok_or_else(|| FsError::Missing {
+                        path: backup.clone(),
+                    })?;
+                    if !parent.is_dir() {
+                        return Err(FsError::Missing {
+                            path: parent.to_owned(),
+                        });
+                    }
+                    writable_by_mode(parent)?;
+                }
+                None => warnings.push(FsWarning::NoBackup {
+                    target: target.clone(),
+                }),
+            }
+            writable_by_mode(&parent_of(root, target))?;
+        }
+
         FsStep::RmDirIfEmpty { at } => {
             let abs = guard(root, at)?;
             // Already gone — a previous step's upward walk took it. Nothing to
@@ -1114,6 +1237,16 @@ fn probe(step: &FsStep, root: &Utf8Path) -> Result<(), FsError> {
             probe_writable(&deepest_existing_parent(root, to))
         }
         FsStep::RemoveFile { target, backup } => {
+            probe_writable(&parent_of(root, target))?;
+            match backup.as_deref().and_then(Utf8Path::parent) {
+                Some(dir) => probe_writable(dir),
+                None => Ok(()),
+            }
+        }
+        FsStep::WriteTags { target, backup, .. } => {
+            // The temp file a tag write publishes through lands beside the
+            // original, so the directory is what has to be writable — the file's
+            // own mode has already been checked by `preflight`.
             probe_writable(&parent_of(root, target))?;
             match backup.as_deref().and_then(Utf8Path::parent) {
                 Some(dir) => probe_writable(dir),
@@ -1594,6 +1727,36 @@ fn recreate(root: &Utf8Path, dirs: &[RemovedDir]) -> Result<(), FsError> {
 
 /// Move an entry back where it came from, restoring its mode and mtime if the way
 /// back is a copy.
+/// [`FsStep::WriteTags`]: back the file up, rewrite its tags, and record what it
+/// became.
+///
+/// The work is [`tags::write`]'s; what belongs here is the receipt. [`Facts`] are
+/// taken **after** the write, because that is the state undo has to recognize, and
+/// the original's size is kept alongside so the backup can be checked before it
+/// is put back.
+fn write_tags(
+    root: &Utf8Path,
+    target: &RelPath,
+    delta: &TagDelta,
+    backup: Option<&Utf8Path>,
+    options: &Options,
+) -> Result<Done, FsError> {
+    let abs = guard(root, target)?;
+    let original = Facts::of(&abs)?.size;
+
+    let opts = WriteOpts {
+        id3_version: options.id3_version,
+        backup: backup.map(Utf8Path::to_owned),
+        inject: tags::write::Inject::Nothing,
+    };
+    tags::write(&abs, delta, &opts).map_err(|err| FsError::Tag(Box::new(err)))?;
+
+    Ok(Done::TagsWritten {
+        facts: Facts::of(&abs)?,
+        original,
+    })
+}
+
 fn move_back(
     current: &Utf8Path,
     original: &Utf8Path,
