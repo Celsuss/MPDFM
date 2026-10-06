@@ -4,11 +4,14 @@ A terminal application for managing an [MPD](https://www.musicpd.org/) music
 library: edit metadata, and re-organize directories **without breaking your
 playlists**.
 
-> Status: **M1 and M2 complete** — the move engine, the tag editor and their CLI
-> work and are tested. `mpdfm scan`, `mpdfm doctor`, `mpdfm move`,
+> Status: **M1 and M2 complete, M3 started** — the move engine, the tag editor and
+> their CLI work and are tested. `mpdfm scan`, `mpdfm doctor`, `mpdfm move`,
 > `mpdfm tag show/set/diff`, `mpdfm undo` and `mpdfm recover` are usable today,
 > all with `--dry-run` where they write, a confirmation prompt, `--json` and one
-> journaled, reversible transaction per commit. The TUI (M3) is next.
+> journaled, reversible transaction per commit. `mpdfm` with no subcommand now
+> opens the TUI shell: it scans on a worker thread and always restores your
+> terminal, including on a panic or a `kill`, but the browser it draws cannot do
+> anything yet — the keymap and the views are tasks 21–26.
 > See [`docs/PLAN.md`](docs/PLAN.md) and [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ```console
@@ -58,8 +61,10 @@ Planned:
   `{genre}/{albumartist}/{year} - {album}/{track:02} {title}`
 - **Library doctor** — broken references, missing tags, inconsistent albums
 - **Cover art** — view, extract and embed
-- Vim-style keybindings and a TUI built on ratatui, over the same core the CLI
-  uses
+- Vim-style keybindings and the TUI's views — browsing, tag editing, staging and
+  committing — over the same core the CLI uses. The shell they live in is built:
+  `mpdfm` opens, scans on a worker thread, and gives the terminal back whatever
+  happens to it.
 
 ## Design
 

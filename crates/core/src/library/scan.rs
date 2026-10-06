@@ -31,11 +31,25 @@
 use camino::Utf8Path;
 use walkdir::WalkDir;
 
-use super::model::{DirPath, Entry, Kind, Library, ScanWarning};
+use super::model::{DirPath, Entry, Kind, Library, ScanProgress, ScanWarning};
 use crate::paths::{PathError, RelPath};
 use crate::{Error, Result};
 
-/// Walk `root` and build the [`Library`].
+/// How many files the walk models between two calls to the progress callback.
+///
+/// A compromise between a progress line that moves and a channel the walk floods:
+/// the TUI's scan worker turns every call into a message (`docs/tasks/20-tui-shell.md`),
+/// so 2 800 files is eleven messages rather than 2 800. Small enough that the
+/// first one arrives long before a user wonders whether anything is happening.
+const PROGRESS_EVERY: usize = 256;
+
+/// Walk `root` and build the [`Library`], telling `progress` how far it has got.
+///
+/// `progress` is called every [`PROGRESS_EVERY`] files and once more when the
+/// walk is over, so a caller that only wants the total can read the last call.
+/// It is not called for a library with no files in it at all — there is no
+/// progress to report — and it is never called from another thread: the walk is
+/// synchronous, and whoever wants it off the UI thread puts the whole call there.
 ///
 /// # Errors
 ///
@@ -43,7 +57,7 @@ use crate::{Error, Result};
 /// — the one failure that is not worth continuing past, since every later
 /// question is about the tree underneath it. Everything else is a
 /// [`ScanWarning`] on the returned library.
-pub(super) fn scan(root: &Utf8Path) -> Result<Library> {
+pub(super) fn scan(root: &Utf8Path, progress: &mut dyn FnMut(&ScanProgress)) -> Result<Library> {
     // Checked before the walk so that "there is no library there" is an error
     // with the root's name in it, rather than an empty model and a warning that
     // reads like one file went missing. `metadata` follows a symlinked root, as
@@ -146,9 +160,35 @@ pub(super) fn scan(root: &Utf8Path) -> Result<Library> {
             size: metadata.len(),
             mtime,
         });
+
+        if entries.len() % PROGRESS_EVERY == 0 {
+            report(progress, &entries, &dirs);
+        }
+    }
+
+    // The last partial batch, so the final number the caller saw is the real
+    // total rather than whatever the last multiple of 256 happened to be.
+    if !entries.is_empty() && entries.len() % PROGRESS_EVERY != 0 {
+        report(progress, &entries, &dirs);
     }
 
     Ok(Library::assemble(root, entries, dirs, warnings))
+}
+
+/// Hand the caller the counts so far, named by the directory the walk is in.
+///
+/// The [`DirPath`] is derived here rather than tracked through the loop: it costs
+/// one allocation per call, which is one per 256 files, and nothing on the hot
+/// path.
+fn report(progress: &mut dyn FnMut(&ScanProgress), entries: &[Entry], dirs: &[DirPath]) {
+    let Some(last) = entries.last() else {
+        return;
+    };
+    progress(&ScanProgress {
+        files: entries.len(),
+        dirs: dirs.len(),
+        dir: last.dir(),
+    });
 }
 
 /// A [`ScanWarning::Unreadable`] from a `walkdir` error.
@@ -198,7 +238,7 @@ mod tests {
         let root = camino::Utf8Path::from_path(temp.path()).expect("temp dir path is UTF-8");
 
         let missing = root.join("gone");
-        let err = scan(&missing).expect_err("a missing root should not scan");
+        let err = scan(&missing, &mut |_| {}).expect_err("a missing root should not scan");
         assert!(
             err.to_string().contains(missing.as_str()),
             "the error should name the root: {err}"
@@ -206,7 +246,7 @@ mod tests {
 
         let file = root.join("not-a-dir");
         std::fs::write(&file, b"x").expect("write");
-        let err = scan(&file).expect_err("a file is not a library");
+        let err = scan(&file, &mut |_| {}).expect_err("a file is not a library");
         assert!(err.to_string().contains("not a directory"), "{err}");
     }
 
@@ -215,7 +255,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = camino::Utf8Path::from_path(temp.path()).expect("temp dir path is UTF-8");
 
-        let library = scan(root).expect("an empty directory is a valid library");
+        let library = scan(root, &mut |_| {}).expect("an empty directory is a valid library");
         assert!(library.is_empty());
         assert!(library.warnings().is_empty());
         // The root itself is always a directory of the library, so a browser has

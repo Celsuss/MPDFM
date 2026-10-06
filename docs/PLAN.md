@@ -116,6 +116,11 @@ MPDFM/
     ├── main.rs                   clap subcommands; `mpdfm` with no args → TUI
     ├── cli/                      thin command wrappers, output formatting
     └── tui/
+        ├── terminal.rs           raw mode + alt screen, restored three ways
+        ├── event.rs              the channel; input, tick and signal threads
+        ├── msg.rs                every message the loop can be handed
+        ├── work.rs               scan and MPD poll, off the drawing thread
+        ├── log.rs                --log; diagnostics never go to the screen
         ├── app.rs                state machine, event loop
         ├── keys.rs               configurable keymap → Action
         └── views/                browser · tagedit · pending · help · search
@@ -134,6 +139,7 @@ we would not control. See task `13`.
 | --- | --- | --- |
 | `ratatui` | 0.30 | TUI widgets and layout |
 | `crossterm` | 0.29 | terminal backend, events |
+| `signal-hook` | 0.3 | `SIGTERM` as a message, so a `kill` restores the terminal |
 | `lofty` | 0.25 | tag read/write for mp3, flac, m4a |
 | `clap` | 4.6 | CLI, derive feature |
 | `camino` | 1.2 | `Utf8Path` — paths are UTF-8 by contract here |

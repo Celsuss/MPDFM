@@ -83,18 +83,41 @@ impl World {
     /// every machine.
     pub fn cmd(&self, args: &[&str]) -> Command {
         let mut cmd = Command::cargo_bin("mpdfm").expect("the binary is built by `cargo test`");
-        cmd.env_clear()
-            .env("HOME", self.fx.root())
-            .env("XDG_CONFIG_HOME", self.fx.root().join("xdg-config"))
-            .env("XDG_DATA_HOME", self.fx.root().join("xdg-data"))
-            .env("XDG_CACHE_HOME", self.fx.root().join("xdg-cache"))
-            .env("NO_COLOR", "1")
-            .env("TERM", "dumb")
-            .env("COLUMNS", "100")
-            .arg("--config")
-            .arg(self.config_file.as_str())
-            .args(args);
+        cmd.env_clear().args(args);
+        for (name, value) in self.env() {
+            cmd.env(name, value);
+        }
+        cmd.arg("--config").arg(self.config_file.as_str());
         cmd
+    }
+
+    /// The hermetic environment every run gets.
+    ///
+    /// Shared with [`World::cmd`] rather than duplicated, because a pty test
+    /// (`tests/tui_terminal.rs`) cannot use `assert_cmd` — it drives the binary
+    /// through `script` — and a second copy of this list would be a second place
+    /// for a path to escape the fixture.
+    pub fn env(&self) -> Vec<(&'static str, String)> {
+        let root = self.fx.root();
+        vec![
+            ("HOME", root.to_string()),
+            ("XDG_CONFIG_HOME", root.join("xdg-config").to_string()),
+            ("XDG_DATA_HOME", root.join("xdg-data").to_string()),
+            ("XDG_CACHE_HOME", root.join("xdg-cache").to_string()),
+            ("NO_COLOR", "1".to_owned()),
+            ("TERM", "dumb".to_owned()),
+            ("COLUMNS", "100".to_owned()),
+        ]
+    }
+
+    /// The `--config` file every run is pointed at.
+    pub fn config_file(&self) -> &Utf8Path {
+        &self.config_file
+    }
+
+    /// The fixture itself, for a test that needs a scratch path inside it.
+    pub fn fixture(&self) -> &Fixture {
+        &self.fx
     }
 
     /// Run a command with no stdin at all — a pipe, as a script would give it.
