@@ -56,6 +56,14 @@ crossterm.workspace = true
 ratatui.workspace = true
 serde_json.workspace = true
 signal-hook.workspace = true
+# The TUI's own error types: a bad `keys.toml` line and an unrunnable `:` command
+# are both things the user reads, so their `Display` is the message and belongs
+# next to the variant (task 21).
+thiserror.workspace = true
+# `src/tui/keys.rs` reads `keys.toml`. Already in the tree for core's `config.toml`;
+# the keymap is parsed here and not there because a key binding is `crossterm`'s
+# vocabulary, which core does not have (`crates/core/tests/manifest_deps.rs`).
+toml.workspace = true
 
 # `tests/` drives the built binary against a `Fixture`, which lives behind
 # core's `testing` feature. Cargo unifies this with the dependency above, so the

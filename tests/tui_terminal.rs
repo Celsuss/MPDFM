@@ -466,3 +466,144 @@ fn the_log_file_gets_the_session_and_the_terminal_gets_none_of_it() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The keymap, as a user actually reaches it (task 21)
+// ---------------------------------------------------------------------------
+//
+// `keys.toml` has unit tests in `src/tui/keys.rs` for everything about parsing and
+// merging. What only a real run can check is the part in between: that the file is
+// *found*, that what it says reaches the keymap the loop is using, and that a line
+// MPDFM cannot use is reported on screen instead of stopping the program. All three
+// are startup behaviour, so a frame and an exit code are enough to see them.
+
+/// Write a `keys.toml` where `--config` makes MPDFM look for one: beside the
+/// configuration file it was pointed at.
+fn write_keys(world: &World, text: &str) -> Utf8PathBuf {
+    let path = world
+        .config_file()
+        .parent()
+        .expect("the config file is in a directory")
+        .join("keys.toml");
+    std::fs::write(&path, text).expect("the fixture root is writable");
+    path
+}
+
+#[test]
+fn a_keys_toml_beside_the_config_file_is_found_and_applied() {
+    if !have_script() {
+        skip("a_keys_toml_beside_the_config_file_is_found_and_applied");
+        return;
+    }
+    let world = World::realistic();
+    world.assert_hermetic();
+    // `Z` quits as well as `q` does. In addition and not instead, so that a keymap
+    // this test got wrong cannot leave the binary with no way out and the test
+    // waiting on it.
+    write_keys(&world, "[browser]\n\"Z\" = \"quit\"\n");
+
+    let run = pty(
+        &world,
+        &scratch(&world, "keys-applied"),
+        "\"$BIN\" --config \"$CONFIG\" --no-mpd",
+        "Z\n",
+    );
+
+    assert_eq!(
+        run.code,
+        0,
+        "`Z` should have quit, which means the file was read: {}",
+        run.visible()
+    );
+    run.assert_terminal_restored();
+    let visible = run.visible();
+    assert!(
+        visible.contains("MPDFM"),
+        "it drew a frame first: {visible}"
+    );
+    // Nothing was wrong with the file, so nothing was said about it.
+    assert!(!visible.contains("keys.toml"), "{visible}");
+}
+
+#[test]
+fn an_unknown_action_in_keys_toml_is_a_panel_at_startup_and_not_a_refusal_to_start() {
+    if !have_script() {
+        skip("an_unknown_action_in_keys_toml_is_a_panel_at_startup_and_not_a_refusal_to_start");
+        return;
+    }
+    let world = World::realistic();
+    // One line MPDFM cannot use, one it can.
+    write_keys(
+        &world,
+        "[browser]\n\"ctrl-r\" = \"rescann\"\n\"Z\" = \"quit\"\n",
+    );
+
+    let run = pty(
+        &world,
+        &scratch(&world, "keys-warning"),
+        "\"$BIN\" --config \"$CONFIG\" --no-mpd",
+        "Z\n",
+    );
+
+    // It started, and the good line still worked.
+    assert_eq!(run.code, 0, "{}", run.visible());
+    run.assert_terminal_restored();
+
+    let visible = run.visible();
+    assert!(visible.contains("keys.toml"), "{visible}");
+    assert!(visible.contains("rescann"), "{visible}");
+    // "listing valid actions": the names are on screen, which is why this is a
+    // panel and not a line on the message queue.
+    assert!(visible.contains("rescan"), "{visible}");
+    assert!(visible.contains("half_page_down"), "{visible}");
+    // One word at a time: ratatui positions each run of text with its own escape
+    // sequence, so `esc to dismiss` is three words with cursor moves between them
+    // in the recording even though it is one line on the screen.
+    assert!(visible.contains("dismiss"), "{visible}");
+}
+
+#[test]
+fn the_help_overlay_documents_the_keymap_the_run_is_actually_using() {
+    if !have_script() {
+        skip("the_help_overlay_documents_the_keymap_the_run_is_actually_using");
+        return;
+    }
+    let world = World::realistic();
+    // `ctrl-d` is unbound for the duration, and the reason is the harness rather
+    // than the feature: stdin here is a file, and when `script` reaches the end of
+    // it the pty delivers the EOF character — which in raw mode is a literal
+    // `ctrl-d` keypress, i.e. half a page down, i.e. the help scrolled away from
+    // under an assertion about what it says. Unbinding it is also one more thing
+    // this test proves works through the real binary.
+    write_keys(
+        &world,
+        "[browser]\n\"j\" = \"none\"\n\"ctrl-j\" = \"down\"\n\"ctrl-d\" = \"none\"\n",
+    );
+
+    // Ended by a signal rather than by a `q`, for the reason the log test gives:
+    // the loop folds everything already waiting in the pty's buffer into one
+    // frame, so a `?q` would quit before the overlay was ever drawn.
+    let run = pty(
+        &world,
+        &scratch(&world, "keys-help"),
+        "\"$BIN\" --config \"$CONFIG\" --no-mpd & \
+         pid=$!; sleep 1; kill -TERM $pid; wait $pid",
+        "?",
+    );
+
+    assert_eq!(run.code, 0, "{}", run.visible());
+    run.assert_terminal_restored();
+
+    // The overlay is generated from the live keymap, so the key this run has is
+    // the key it documents — and the one it was given away from is not there.
+    let visible = run.visible();
+    assert!(visible.contains("ctrl-j"), "{visible}");
+    assert!(
+        !visible.contains("j / down"),
+        "the help documented a binding this run does not have:\n{visible}"
+    );
+    // The action's own help line, next to it — and the overlay is still on its
+    // first page, which is what makes the negative assertion above mean something.
+    assert!(visible.contains("move"), "{visible}");
+    assert!(visible.contains("first"), "{visible}");
+}

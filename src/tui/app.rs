@@ -34,9 +34,23 @@
 //! show that an overlay does not lose it, a status bar to show that the tick
 //! reaches it.
 //!
-//! Keys are hardcoded here and belong to task 21, which replaces this `match` with
-//! a keymap. The ones that exist are the ones the criteria need: `q`, `?`, `esc`,
-//! `R`, and the cursor.
+//! # Keys, and what answers them
+//!
+//! Nothing here matches on a `KeyCode`. A keypress goes through
+//! [`super::keys::Keys`] — normalize, resolve the mode's table, maybe wait for
+//! the second half of a sequence — and comes out as an [`Action`], which
+//! [`App::dispatch`] answers. Three consequences:
+//!
+//! - the bindings are data, so `keys.toml` can change them (task 21);
+//! - `:q` and `q` are the same code path, because command mode produces the same
+//!   `Action`;
+//! - `dispatch`'s `match` is exhaustive, so an action cannot be added to the
+//!   vocabulary without this file deciding what it does — and the verbs tasks 22–25
+//!   own answer with the task that owns them rather than with silence.
+//!
+//! Two keys are deliberately *not* in the keymap: `ctrl-c`, and the `y`/`n` of a
+//! confirmation prompt. Both are escape hatches, and an escape hatch a user can
+//! remap away is not one.
 //!
 //! # No `println!`
 //!
@@ -61,7 +75,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
+use super::action::Action;
+use super::command::{self, Command, CommandLine};
 use super::event::Events;
+use super::keys::{KeyChord, KeyMap, KeyWarning, Keys, Mode, Resolution};
 use super::log::Log;
 use super::msg::{MpdSnapshot, Msg, ScanOutcome, TaskOutcome};
 use super::terminal::{MIN_SIZE, fits};
@@ -117,9 +134,30 @@ impl Focus {
 pub enum View {
     /// The library browser. Task 22.
     Browser,
-    /// The key help. Task 26 generates it from the keymap; this is the stack's
-    /// first customer and exists to prove the stack.
-    Help,
+    /// The key help, generated from the live keymap for the mode it was opened
+    /// from. Task 26 adds the other modes' sections and the grouping.
+    Help {
+        /// The mode whose bindings are listed.
+        mode: Mode,
+        /// How far down the list has been scrolled. There are more bindings than
+        /// rows on an 80×24 terminal, so this is not optional.
+        scroll: u16,
+    },
+    /// The `:` line. Drawn on the bottom line rather than over the body, which is
+    /// where a command line belongs and why it is on the stack anyway: it is the
+    /// thing `esc` closes, and it decides the mode.
+    Command(CommandLine),
+    /// A question the app will not go past. The keys that answer it are not in the
+    /// keymap; see [`App::on_confirm_key`].
+    Confirm(Confirm),
+    /// Something the user should read once, which is not an error — what was wrong
+    /// with `keys.toml`, for instance.
+    Notice {
+        /// The panel's title, including its surrounding spaces.
+        title: String,
+        /// The whole text. Wrapped, never truncated.
+        body: String,
+    },
     /// Something went wrong, and it is not going away on a timer. Task 26 turns
     /// this into the full panel with the path and the suggested next step.
     Error(String),
@@ -131,14 +169,43 @@ impl View {
         !matches!(self, Self::Browser)
     }
 
+    /// Whether this view has the keyboard to itself.
+    ///
+    /// A panel is something to read and dismiss, so letting `j` move a cursor
+    /// behind it would be a surprise. The command line is not modal in this sense —
+    /// it handles the editing actions and passes the rest on, so `ctrl-r` bound
+    /// under `[command]` still rescans.
+    fn is_modal(&self) -> bool {
+        matches!(
+            self,
+            Self::Help { .. } | Self::Confirm(_) | Self::Notice { .. } | Self::Error(_)
+        )
+    }
+
     /// The name the status bar shows and the log records.
     fn name(&self) -> &'static str {
         match self {
             Self::Browser => "browser",
-            Self::Help => "help",
+            Self::Help { .. } => "help",
+            Self::Command(_) => "command",
+            Self::Confirm(_) => "confirm",
+            Self::Notice { .. } => "notice",
             Self::Error(_) => "error",
         }
     }
+}
+
+/// A yes/no question, and what a yes means.
+///
+/// The only one so far is `q` with staged operations, which is an acceptance
+/// criterion: losing a plan to a keystroke is exactly the kind of quiet damage this
+/// program exists to avoid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Confirm {
+    /// What the user is being asked.
+    question: String,
+    /// The action a `y` dispatches.
+    on_yes: Action,
 }
 
 /// How serious a message is, and therefore whether it expires.
@@ -194,6 +261,8 @@ pub struct App {
     plan: Plan,
     /// Which pane the keyboard is in.
     focus: Focus,
+    /// The bindings, and the half-finished sequence waiting for its second key.
+    keys: Keys,
     /// The view stack. Never empty; `views[0]` is the base.
     views: Vec<View>,
     /// Messages waiting for the bottom line, oldest first.
@@ -224,13 +293,14 @@ pub struct App {
 
 impl App {
     /// A new app, with nothing scanned yet.
-    pub fn new(config: Config, tx: Sender<Msg>, log: Arc<Log>) -> Self {
+    pub fn new(config: Config, keys: KeyMap, tx: Sender<Msg>, log: Arc<Log>) -> Self {
         Self {
             config,
             library: None,
             index: None,
             plan: Plan::new(),
             focus: Focus::Tree,
+            keys: Keys::new(keys),
             views: vec![View::Browser],
             toasts: VecDeque::new(),
             scan: ScanState::Idle,
@@ -261,6 +331,11 @@ impl App {
         B: Backend,
         B::Error: std::error::Error + Send + Sync + 'static,
     {
+        // Before the first frame, so that a half-page jump has a page to measure
+        // itself against even if no resize ever arrives.
+        if let Ok(size) = terminal.size() {
+            self.size = (size.width, size.height);
+        }
         self.rescan();
 
         let mut dirty = true;
@@ -344,41 +419,300 @@ impl App {
         }
     }
 
-    /// A keypress. Task 21 replaces this with a keymap; the bindings here are the
-    /// ones task 20's criteria need, and `docs/tasks/21-keymap.md` is the list they
-    /// will become.
+    /// A keypress, resolved through the keymap.
     fn on_key(&mut self, key: KeyEvent) -> bool {
-        // In raw mode the terminal does not turn `ctrl-c` into a signal, so it
-        // arrives as a key. Honouring it is kindness: a user who wants out reaches
-        // for it before they read the help.
+        // `ctrl-c` is not in the keymap and cannot be remapped away. In raw mode the
+        // terminal does not turn it into a signal, so it arrives as a key, and a
+        // user who wants out reaches for it before they read the help. It means the
+        // same thing `q` does — so it asks about staged operations — and a second
+        // one, from the prompt it raises, leaves regardless. Two presses always
+        // get out, and neither of them throws a plan away silently.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.quit = true;
-            return false;
+            let action = if matches!(self.views.last(), Some(View::Confirm(_))) {
+                Action::ForceQuit
+            } else {
+                Action::Quit
+            };
+            return self.dispatch(action);
         }
 
+        // A prompt reads its own keys, for the same reason: a question nobody can
+        // answer is worse than one that was never asked.
+        if let Some(View::Confirm(confirm)) = self.views.last() {
+            let confirm = confirm.clone();
+            return self.on_confirm_key(&confirm, key);
+        }
+
+        let mode = self.mode();
+        match self.keys.press(mode, key, Instant::now()) {
+            Resolution::Act(action) => self.dispatch(action),
+            // Worth a frame: the bottom line shows the half-finished sequence, so
+            // a `g` that is waiting for something looks like it is waiting.
+            Resolution::Partial => true,
+            Resolution::Nothing => self.on_unbound(key),
+        }
+    }
+
+    /// Which set of bindings is in force.
+    ///
+    /// Tasks 23–25 add the views that reach the other three modes. Until then an
+    /// overlay is something to dismiss rather than a mode, which is why a panel
+    /// resolves as [`Mode::Browser`] and then has its keys filtered in
+    /// [`App::dispatch`].
+    fn mode(&self) -> Mode {
+        match self.views.last() {
+            Some(View::Command(_)) => Mode::Command,
+            _ => Mode::Browser,
+        }
+    }
+
+    /// `y` or `n`, and nothing else.
+    fn on_confirm_key(&mut self, confirm: &Confirm, key: KeyEvent) -> bool {
         match key.code {
-            KeyCode::Char('q') => {
-                // Task 21 asks here when the plan is not empty. Nothing can stage
-                // an operation yet, so there is nothing to ask about.
-                self.quit = true;
-                false
-            }
-            KeyCode::Char('?') => self.push(View::Help),
-            KeyCode::Esc => self.pop(),
-            KeyCode::Char('R') => {
-                self.rescan();
+            KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
+                self.views.pop();
+                self.dispatch(confirm.on_yes);
                 true
             }
-            KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
-            KeyCode::Char('g') => self.set_cursor(0),
-            KeyCode::Char('G') => self.set_cursor(self.row_count().saturating_sub(1)),
-            KeyCode::Tab => {
+            KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc => {
+                self.log.line("confirm: declined");
+                self.views.pop();
+                true
+            }
+            // Anything else leaves the question on screen, which is what makes it
+            // a question rather than a notification.
+            _ => false,
+        }
+    }
+
+    /// A key nothing is bound to. Only a view that takes text wants one.
+    fn on_unbound(&mut self, key: KeyEvent) -> bool {
+        let Some(c) = KeyChord::from_event(key).typed() else {
+            return false;
+        };
+        match self.views.last_mut() {
+            Some(View::Command(line)) => line.insert(c),
+            _ => false,
+        }
+    }
+
+    // -- actions -----------------------------------------------------------
+
+    /// Do what the user asked for, however they asked for it.
+    ///
+    /// Returns whether the screen would now look different.
+    ///
+    /// The `match` at the bottom is exhaustive on purpose: adding an action to the
+    /// vocabulary does not compile until this decides what it does. The verbs tasks
+    /// 22–25 own say which task owns them, because a binding that silently did
+    /// nothing would be indistinguishable from one that is broken.
+    pub fn dispatch(&mut self, action: Action) -> bool {
+        self.log.line(format!("action: {action}"));
+
+        // In command mode the editing verbs are about the line rather than the
+        // library. Anything the line does not claim falls through, so a `ctrl-r`
+        // bound under `[command]` still rescans.
+        if let Some(dirty) = self.command_action(action) {
+            return dirty;
+        }
+
+        // A panel has the keyboard: only the things that get rid of it work — and,
+        // for the help, the ones that move around inside it.
+        if self.views.last().is_some_and(View::is_modal) {
+            if let Some(dirty) = self.help_action(action) {
+                return dirty;
+            }
+            return match action {
+                Action::Cancel => self.pop(),
+                Action::Help => self.toggle_help(),
+                Action::Quit | Action::ForceQuit => self.quit_action(action),
+                _ => false,
+            };
+        }
+
+        match action {
+            // -- the shell answers these ------------------------------------
+            Action::Down => self.move_cursor(1),
+            Action::Up => self.move_cursor(-1),
+            Action::Top => self.set_cursor(0),
+            Action::Bottom => self.set_cursor(self.row_count().saturating_sub(1)),
+            Action::HalfPageDown => self.move_cursor(self.page_step()),
+            Action::HalfPageUp => self.move_cursor(-self.page_step()),
+            Action::SwitchPane => {
                 self.focus = self.focus.toggled();
                 true
             }
-            _ => false,
+            Action::Cancel => self.pop(),
+            Action::CommandMode => self.push(View::Command(CommandLine::new())),
+            Action::Help => self.toggle_help(),
+            Action::Rescan => {
+                self.rescan();
+                true
+            }
+            Action::Quit | Action::ForceQuit => self.quit_action(action),
+
+            // -- the views that are not built yet ---------------------------
+            Action::Left
+            | Action::Right
+            | Action::Open
+            | Action::Parent
+            | Action::ToggleMark
+            | Action::VisualSelect
+            | Action::MarkAll
+            | Action::UnmarkAll
+            | Action::StageMove
+            | Action::Rename
+            | Action::StageDelete => self.not_yet(action.help(), Some("22-browser-view.md")),
+            Action::EditTags => self.not_yet(action.help(), Some("23-tagedit-view.md")),
+            Action::ShowPending
+            | Action::Unstage
+            | Action::Commit
+            | Action::DiscardPending
+            | Action::Undo => self.not_yet(action.help(), Some("24-pending-view.md")),
+            Action::Search | Action::SearchNext | Action::SearchPrev | Action::Filter => {
+                self.not_yet(action.help(), Some("25-search-and-filter.md"))
+            }
+            Action::Organize => self.not_yet(action.help(), Some("28-organize-command.md")),
+
+            // -- only meaningful where there is a line of text --------------
+            Action::Submit | Action::DeleteChar | Action::ClearLine => false,
         }
+    }
+
+    /// The command line's share of the actions, or `None` if it wants none of them.
+    fn command_action(&mut self, action: Action) -> Option<bool> {
+        if !matches!(self.views.last(), Some(View::Command(_))) {
+            return None;
+        }
+        // These two change the stack, so they are handled before anything borrows
+        // the line out of it.
+        match action {
+            Action::Cancel => {
+                self.pop();
+                return Some(true);
+            }
+            Action::Submit => return Some(self.submit_command()),
+            _ => {}
+        }
+
+        let Some(View::Command(line)) = self.views.last_mut() else {
+            return None;
+        };
+        Some(match action {
+            Action::Left => line.left(),
+            Action::Right => line.right(),
+            Action::DeleteChar => line.backspace(),
+            Action::ClearLine => line.clear(),
+            _ => return None,
+        })
+    }
+
+    /// Run what was typed at `:`, or say why it cannot be run.
+    fn submit_command(&mut self) -> bool {
+        let Some(View::Command(line)) = self.views.last() else {
+            return false;
+        };
+        match line.parse() {
+            Ok(command) => {
+                self.log.line(format!("command: :{}", line.text()));
+                self.views.pop();
+                self.keys.clear();
+                self.run_command(command)
+            }
+            // `:` and then `enter` is a change of mind, not a mistake.
+            Err(command::CommandError::Empty) => self.pop(),
+            Err(err) => {
+                // The line stays open with the reason under it, so the user edits
+                // what they typed instead of typing it again.
+                if let Some(View::Command(line)) = self.views.last_mut() {
+                    line.fail(err);
+                }
+                true
+            }
+        }
+    }
+
+    /// Carry out a parsed command.
+    ///
+    /// Only the two that this task owns do anything; see
+    /// [`super::command`] for why the rest parse now and act later.
+    pub fn run_command(&mut self, command: Command) -> bool {
+        match command {
+            Command::Quit { force } => self.quit_action(if force {
+                Action::ForceQuit
+            } else {
+                Action::Quit
+            }),
+            Command::Move { dst } => {
+                self.not_yet(format!("move to {dst}"), Some("22-browser-view.md"))
+            }
+            Command::Organize { template } => self.not_yet(
+                format!("organize by {template}"),
+                Some("28-organize-command.md"),
+            ),
+            Command::Undo { txid } => {
+                let what = txid.map_or_else(
+                    || "undo the last transaction".to_owned(),
+                    |txid| format!("undo {txid}"),
+                );
+                self.not_yet(what, Some("24-pending-view.md"))
+            }
+            Command::Doctor => self.not_yet("doctor", Some("29-doctor.md")),
+            // No task owns live settings, and inventing one here would be a
+            // promise this plan has not made. What `:set` has is a settled grammar
+            // and a test; what it does not have is anywhere to put the value.
+            Command::Set { key, value } => self.not_yet(
+                format!("set {key}={value}: nothing applies a setting"),
+                None,
+            ),
+        }
+    }
+
+    /// Leave, asking first when there is something staged to lose.
+    fn quit_action(&mut self, action: Action) -> bool {
+        if action == Action::Quit && !self.plan.is_empty() {
+            let count = self.plan.len();
+            let plural = if count == 1 { "" } else { "s" };
+            self.log.line("quit: asking about the pending plan");
+            return self.push(View::Confirm(Confirm {
+                question: format!(
+                    "{count} staged operation{plural} would be lost.\nQuit without committing?"
+                ),
+                on_yes: Action::ForceQuit,
+            }));
+        }
+        self.quit = true;
+        false
+    }
+
+    /// Open the help on the mode that is in force, or close it if it is open.
+    fn toggle_help(&mut self) -> bool {
+        if matches!(self.views.last(), Some(View::Help { .. })) {
+            return self.pop();
+        }
+        let mode = self.mode();
+        self.push(View::Help { mode, scroll: 0 })
+    }
+
+    /// Say that something is understood but not built yet, and which task builds it.
+    ///
+    /// A warning rather than information: the key worked, and nothing happened, and
+    /// the user should know which of those two is the surprise.
+    fn not_yet(&mut self, what: impl std::fmt::Display, task: Option<&str>) -> bool {
+        let text = match task {
+            Some(task) => format!("{what} — not yet; docs/tasks/{task} owns it"),
+            None => format!("{what} — not yet"),
+        };
+        self.notify(Level::Warn, text);
+        true
+    }
+
+    /// How far a half-page jump goes: half the rows the listing has.
+    fn page_step(&self) -> isize {
+        // The chrome is four rows (header, status, message) plus the listing's own
+        // border, and a half page of nothing is still one row.
+        let rows = self.size.1.saturating_sub(5).max(2);
+        isize::try_from(rows / 2).unwrap_or(1)
     }
 
     /// The slow tick: retire the message that has had its turn, and ask MPD what
@@ -389,13 +723,17 @@ impl App {
     /// arrives later as [`Msg::MpdStatus`] and redraws then if it differs.
     fn on_tick(&mut self) -> bool {
         let retired = self.retire_toast();
+        // A `g` nobody finished stops being pending, and stops saying so on the
+        // bottom line. `Keys::press` enforces the same deadline, and has to: the
+        // next keypress may well arrive before the next tick.
+        let expired = self.keys.expire(Instant::now());
 
         if !self.mpd_in_flight {
             self.mpd_in_flight = true;
             work::poll_mpd(self.tx.clone(), self.config.clone(), Arc::clone(&self.log));
         }
 
-        retired
+        retired || expired
     }
 
     /// A scan came back.
@@ -687,11 +1025,21 @@ impl App {
             return;
         }
 
+        // A command that would not parse gets a second row, so the reason and the
+        // text it is about are both readable. Nothing else ever needs one.
+        let message_rows = if self
+            .command_line()
+            .is_some_and(|line| line.error().is_some())
+        {
+            2
+        } else {
+            1
+        };
         let [header, body, status, message] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(message_rows),
         ])
         .areas(area);
 
@@ -701,11 +1049,19 @@ impl App {
         // true.
         self.render_browser(body, frame);
         frame.render_widget(self.status_bar(), status);
-        frame.render_widget(self.message_line(), message);
+        self.render_message(message, frame);
 
         for view in self.views.iter().filter(|view| view.is_overlay()) {
             self.render_overlay(view, body, frame);
         }
+    }
+
+    /// The command line on the stack, if there is one.
+    fn command_line(&self) -> Option<&CommandLine> {
+        self.views.iter().rev().find_map(|view| match view {
+            View::Command(line) => Some(line),
+            _ => None,
+        })
     }
 
     /// The top line: what MPDFM is pointed at.
@@ -751,39 +1107,130 @@ impl App {
         frame.render_stateful_widget(list, area, &mut state);
     }
 
-    /// An overlay, centred over the body.
+    /// An overlay over the body.
     fn render_overlay(&self, view: &View, body: Rect, frame: &mut ratatui::Frame) {
-        let (title, text, color) = match view {
-            View::Browser => return,
-            View::Help => (" help ", HELP.to_owned(), Color::Cyan),
-            View::Error(message) => (
-                " error ",
-                format!("{message}\n\nesc to dismiss"),
-                Color::Red,
+        match view {
+            // Drawn on the bottom line, by `render_message`: a command line that
+            // covered the listing would hide what the command is about.
+            View::Browser | View::Command(_) => {}
+            View::Help { mode, scroll } => self.render_help(*mode, *scroll, body, frame),
+            View::Confirm(confirm) => panel(
+                " confirm ",
+                &format!("{}\n\ny to quit · n or esc to stay", confirm.question),
+                Color::Yellow,
+                body,
+                frame,
             ),
+            View::Notice { title, body: text } => panel(
+                title,
+                &format!("{text}\n\nesc to dismiss"),
+                Color::Yellow,
+                body,
+                frame,
+            ),
+            View::Error(message) => panel(
+                " error ",
+                &format!("{message}\n\nesc to dismiss"),
+                Color::Red,
+                body,
+                frame,
+            ),
+        }
+    }
+
+    /// The help overlay, generated from the live keymap.
+    ///
+    /// Generated and never written down, which is the acceptance criterion: a
+    /// binding the user has remapped away cannot be documented here, because this
+    /// reads the same table the keypress did.
+    ///
+    /// It takes the whole body rather than a centred box, because there is more to
+    /// say than a box holds — and it scrolls, because there is more to say than the
+    /// body holds too. Task 26 owns the grouping and the sections for the modes
+    /// other than the one in force.
+    fn render_help(&self, mode: Mode, scroll: u16, body: Rect, frame: &mut ratatui::Frame) {
+        let rows = self.help_rows(mode);
+        let shown = usize::from(body.height.saturating_sub(2));
+        let hidden = rows.len().saturating_sub(shown + usize::from(scroll));
+        let footer = if hidden > 0 {
+            format!(" {hidden} more — j / k to scroll · esc to close ")
+        } else {
+            " esc to close ".to_owned()
         };
 
-        // Three quarters of the body, centred: wide enough for a path, and it
-        // leaves the browser visible around the edges so that it is obvious the
-        // overlay is on top of something rather than instead of it.
-        let [area] = Layout::horizontal([Constraint::Percentage(75)])
-            .flex(Flex::Center)
-            .areas(body);
-        let [area] = Layout::vertical([Constraint::Percentage(75)])
-            .flex(Flex::Center)
-            .areas(area);
-
-        // Without this the browser's rows show through the gaps in the text.
-        frame.render_widget(Clear, area);
+        frame.render_widget(Clear, body);
         frame.render_widget(
-            Paragraph::new(text).wrap(Wrap { trim: false }).block(
+            Paragraph::new(rows.join("\n")).scroll((scroll, 0)).block(
                 Block::new()
                     .borders(Borders::ALL)
-                    .border_style(Style::new().fg(color))
-                    .title(title),
+                    .border_style(Style::new().fg(Color::Cyan))
+                    .title(format!(" help · {mode} "))
+                    .title_bottom(footer),
             ),
-            area,
+            body,
         );
+    }
+
+    /// One line per binding, then the commands `:` takes.
+    fn help_rows(&self, mode: Mode) -> Vec<String> {
+        let mut rows: Vec<String> = self
+            .keys
+            .map()
+            .help()
+            .into_iter()
+            .filter(|section| section.mode == mode)
+            .flat_map(|section| section.rows)
+            .map(|row| format!("{:<13} {}", row.keys, row.action.help()))
+            .collect();
+
+        rows.push(String::new());
+        rows.push("commands".to_owned());
+        rows.extend(
+            command::USAGE
+                .iter()
+                .map(|(usage, help)| format!("{:<13} {help}", format!(":{usage}"))),
+        );
+        // Not generated, because it is not in the table: see `App::on_key`.
+        rows.push(String::new());
+        rows.push(format!(
+            "{:<13} {}",
+            "ctrl-c", "quit (asks once, then leaves)"
+        ));
+        rows
+    }
+
+    /// Scrolling, while the help overlay has the keyboard.
+    ///
+    /// Returns `None` for an action the help does not use, so that `q` and `esc`
+    /// still mean what they mean.
+    fn help_action(&mut self, action: Action) -> Option<bool> {
+        let &View::Help { mode, scroll } = self.views.last()? else {
+            return None;
+        };
+        let step = self.page_step();
+        let delta = match action {
+            Action::Down => 1,
+            Action::Up => -1,
+            Action::HalfPageDown => step,
+            Action::HalfPageUp => -step,
+            Action::Top => -isize::MAX,
+            Action::Bottom => isize::MAX,
+            _ => return None,
+        };
+
+        // Not past the end: scrolling into blank space looks like a broken overlay.
+        // The body is the terminal less the chrome and the overlay's own border.
+        let shown = usize::from(self.size.1.saturating_sub(5));
+        let last = self.help_rows(mode).len().saturating_sub(shown);
+        let target = u16::try_from(usize::from(scroll).saturating_add_signed(delta).min(last))
+            .unwrap_or(u16::MAX);
+
+        if let Some(View::Help { scroll, .. }) = self.views.last_mut() {
+            let moved = *scroll != target;
+            *scroll = target;
+            return Some(moved);
+        }
+        None
     }
 
     /// The status bar. Task 26 owns what goes on it and in which order it elides;
@@ -802,8 +1249,33 @@ impl App {
         Paragraph::new(Line::from(parts.join(" · ")).style(Style::new().fg(Color::DarkGray)))
     }
 
-    /// The bottom line: the toast, or the scan's progress, or nothing.
-    fn message_line(&self) -> Paragraph<'_> {
+    /// The bottom line, which is also where the command line lives.
+    fn render_message(&self, area: Rect, frame: &mut ratatui::Frame) {
+        if let Some(line) = self.command_line() {
+            self.render_command_line(line, area, frame);
+            return;
+        }
+
+        // The half-finished sequence goes in the corner, the way vim shows a
+        // pending `g`. Without it a prefix key looks like a key that did nothing.
+        let partial = self.keys.partial().unwrap_or_default();
+        let [text_area, partial_area] = Layout::horizontal([
+            Constraint::Min(1),
+            Constraint::Length(u16::try_from(partial.chars().count()).unwrap_or(0)),
+        ])
+        .areas(area);
+
+        frame.render_widget(self.message_text(), text_area);
+        if !partial.is_empty() {
+            frame.render_widget(
+                Paragraph::new(partial).style(Style::new().add_modifier(Modifier::BOLD)),
+                partial_area,
+            );
+        }
+    }
+
+    /// The toast, or the scan's progress, or what the keys are.
+    fn message_text(&self) -> Paragraph<'_> {
         if let Some(toast) = self.toasts.front() {
             let color = match toast.level {
                 Level::Info => Color::Green,
@@ -818,23 +1290,106 @@ impl App {
                 "scanning… {} files, {} dirs — {}",
                 progress.files, progress.dirs, progress.dir
             ),
-            ScanState::Idle | ScanState::Done { .. } => "? help · q quit · R rescan".to_owned(),
+            ScanState::Idle | ScanState::Done { .. } => self.hints(),
         };
         Paragraph::new(Line::from(text).style(Style::new().fg(Color::DarkGray)))
     }
+
+    /// The idle hint, read off the keymap rather than written down.
+    ///
+    /// A user who has remapped `?` is told the key they chose; a user who has
+    /// unbound it is not told about a key that does nothing.
+    fn hints(&self) -> String {
+        [
+            (Action::Help, "help"),
+            (Action::CommandMode, "command"),
+            (Action::Rescan, "rescan"),
+            (Action::Quit, "quit"),
+        ]
+        .into_iter()
+        .filter_map(|(action, label)| {
+            let key = self.keys.map().key_for(Mode::Browser, action)?;
+            Some(format!("{key} {label}"))
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+    }
+
+    /// `:` and what has been typed after it, with the reason above when there is
+    /// one, and the terminal's own cursor where the next character goes.
+    fn render_command_line(&self, line: &CommandLine, area: Rect, frame: &mut ratatui::Frame) {
+        let input = match line.error() {
+            Some(error) => {
+                let [above, input] =
+                    Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+                frame.render_widget(
+                    Paragraph::new(error.to_owned()).style(Style::new().fg(Color::Red)),
+                    above,
+                );
+                input
+            }
+            None => area,
+        };
+
+        frame.render_widget(Paragraph::new(format!(":{}", line.text())), input);
+        // Where the next character goes, measured in display columns rather than
+        // bytes so that a path with an `ï` in it does not put the cursor adrift.
+        let before = Line::raw(&line.text()[..line.cursor()]).width();
+        let column = u16::try_from(before + 1).unwrap_or(u16::MAX);
+        frame.set_cursor_position((input.x.saturating_add(column), input.y));
+    }
+
+    /// Put what was wrong with `keys.toml` in front of the user.
+    ///
+    /// A panel and not a toast, and the one place this task departs from task 20's
+    /// "warnings are transient": the warning for an unknown action lists every
+    /// action there is, which is the only thing a user wants at that moment, and a
+    /// one-line queue that moves on after four seconds cannot carry it.
+    pub fn report_key_warnings(&mut self, warnings: &[KeyWarning]) {
+        if warnings.is_empty() {
+            return;
+        }
+        for warning in warnings {
+            self.log.line(format!("keys: {warning}"));
+        }
+        self.views.push(View::Notice {
+            title: " keys.toml ".to_owned(),
+            body: warnings
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        });
+    }
 }
 
-/// The help text. Task 26 generates this from task 21's keymap, at which point it
-/// cannot document a binding that does not exist; until then it documents exactly
-/// the keys `on_key` handles.
-const HELP: &str = "\
-j / k / ↓ / ↑   move
-g / G          top / bottom
-tab            switch pane
-R              rescan the library
-?              this help
-esc            close an overlay
-q / ctrl-c     quit";
+/// A bordered box in the middle of the body, with `text` wrapped inside it.
+///
+/// Three quarters of the body, centred: wide enough for a path, and it leaves the
+/// browser visible around the edges so that it is obvious the overlay is on top of
+/// something rather than instead of it.
+fn panel(title: &str, text: &str, color: Color, body: Rect, frame: &mut ratatui::Frame) {
+    let [area] = Layout::horizontal([Constraint::Percentage(75)])
+        .flex(Flex::Center)
+        .areas(body);
+    let [area] = Layout::vertical([Constraint::Percentage(75)])
+        .flex(Flex::Center)
+        .areas(area);
+
+    // Without this the browser's rows show through the gaps in the text.
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(text.to_owned())
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::new()
+                    .borders(Borders::ALL)
+                    .border_style(Style::new().fg(color))
+                    .title(title.to_owned()),
+            ),
+        area,
+    );
+}
 
 /// The screen that replaces the layout when the terminal is too small.
 ///
@@ -929,7 +1484,10 @@ mod tests {
     /// instead of waiting on a real scan.
     fn app(fx: &Fixture) -> (App, mpsc::Receiver<Msg>) {
         let (tx, rx) = mpsc::channel();
-        (App::new(fx.config(), tx, Arc::new(Log::off())), rx)
+        (
+            App::new(fx.config(), KeyMap::defaults(), tx, Arc::new(Log::off())),
+            rx,
+        )
     }
 
     /// A key press, as the input thread would deliver it.
@@ -940,6 +1498,50 @@ mod tests {
     /// A char key press.
     fn press(c: char) -> Msg {
         key(KeyCode::Char(c))
+    }
+
+    /// Draw a frame, telling the app how big the terminal is first.
+    ///
+    /// Which is what `App::run` does once and a `Resize` does afterwards — the
+    /// half-page jump and the help overlay's scroll limit both need it.
+    fn draw(app: &mut App, terminal: &mut Terminal<TestBackend>) {
+        let area = *terminal.backend().buffer().area();
+        app.size = (area.width, area.height);
+        terminal
+            .draw(|frame| app.render(frame.area(), frame))
+            .expect("drawing should work");
+    }
+
+    /// Type a whole string, one keypress at a time, as command mode receives it.
+    fn type_in(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.update(press(c));
+        }
+    }
+
+    /// An app whose keymap is the defaults with `keys_toml` merged over them.
+    fn app_with_keys(fx: &Fixture, keys_toml: &str) -> (App, mpsc::Receiver<Msg>) {
+        let mut map = KeyMap::defaults();
+        let mut warnings = Vec::new();
+        crate::tui::keys::merge(
+            &mut map,
+            camino::Utf8Path::new("keys.toml"),
+            keys_toml,
+            &mut warnings,
+        );
+        assert!(
+            warnings.is_empty(),
+            "the test's own keys.toml: {warnings:?}"
+        );
+        let (tx, rx) = mpsc::channel();
+        (App::new(fx.config(), map, tx, Arc::new(Log::off())), rx)
+    }
+
+    /// One staged operation, so that `q` has something to warn about.
+    fn staged() -> mpdfm_core::ops::Operation {
+        mpdfm_core::ops::Operation::Delete {
+            target: mpdfm_core::paths::RelPath::parse("rock/a.mp3").expect("a relative path"),
+        }
     }
 
     /// A scan that succeeded, as the worker would report it.
@@ -1088,12 +1690,22 @@ mod tests {
         let before = app.views.clone();
 
         assert!(app.update(press('?')), "help should open");
-        assert_eq!(app.views.last(), Some(&View::Help));
+        assert_eq!(
+            app.views.last(),
+            Some(&View::Help {
+                mode: Mode::Browser,
+                scroll: 0
+            })
+        );
         terminal
             .draw(|frame| app.render(frame.area(), frame))
             .expect("drawing should work");
         let with_help = text(&terminal);
-        assert!(with_help.contains("rescan the library"), "{with_help}");
+        assert!(with_help.contains("help · browser"), "{with_help}");
+        // Derived from the keymap, which is task 21's criterion; `move down` is
+        // `Action::Down`'s own help line next to the keys bound to it.
+        assert!(with_help.contains("j / down"), "{with_help}");
+        assert!(with_help.contains("move down"), "{with_help}");
         // The overlay is over the browser, not instead of it: the header and the
         // status bar are still on screen.
         assert!(with_help.contains("MPDFM"), "{with_help}");
@@ -1107,7 +1719,7 @@ mod tests {
             .draw(|frame| app.render(frame.area(), frame))
             .expect("drawing should work");
         let after = text(&terminal);
-        assert!(!after.contains("rescan the library"), "{after}");
+        assert!(!after.contains("move down"), "{after}");
     }
 
     #[test]
@@ -1291,7 +1903,7 @@ mod tests {
         let fx = builder.build();
 
         let (tx, rx) = mpsc::channel();
-        let mut app = App::new(fx.config(), tx, Arc::new(Log::off()));
+        let mut app = App::new(fx.config(), KeyMap::defaults(), tx, Arc::new(Log::off()));
         let mut terminal = screen(80, 24);
 
         app.rescan();
@@ -1578,6 +2190,9 @@ mod tests {
         app.update(press('j'));
         assert_eq!(app.cursor, last, "down from the bottom stays at the bottom");
 
+        // `gg`, which takes two presses: one `g` is a prefix and nothing else.
+        app.update(press('g'));
+        assert_eq!(app.cursor, last, "a lone `g` moves nothing");
         app.update(press('g'));
         assert_eq!(app.cursor, 0);
     }
@@ -1627,6 +2242,431 @@ mod tests {
         assert_eq!(app.cursor, 0, "a release must not move anything");
     }
 
+    // -- the keymap --------------------------------------------------------
+
+    #[test]
+    fn every_action_in_the_vocabulary_is_answered_by_something() {
+        // `dispatch`'s `match` is exhaustive, so this cannot find an action with no
+        // arm. What it does find is one that panics, and one that claims nothing
+        // changed when it opened a view.
+        let fx = Fixture::realistic();
+        for &action in Action::ALL {
+            let (mut app, _rx) = app(&fx);
+            app.update(scanned(&fx));
+            let dirty = app.dispatch(action);
+            if action == Action::ForceQuit {
+                assert!(app.quit, "force_quit should leave");
+                continue;
+            }
+            assert!(
+                dirty
+                    || matches!(
+                        action,
+                        Action::Quit
+                            | Action::Submit
+                            | Action::DeleteChar
+                            | Action::ClearLine
+                            | Action::Top
+                            | Action::Up
+                            | Action::HalfPageUp
+                    ),
+                "{action} did nothing and did not say why"
+            );
+        }
+    }
+
+    #[test]
+    fn an_action_this_task_does_not_implement_names_the_task_that_does() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        app.toasts.clear();
+
+        assert!(app.update(press('e')), "`e` is bound to edit_tags");
+        let toast = app.toasts.front().expect("it should say something");
+        assert!(toast.text.contains("edit tags"), "{}", toast.text);
+        assert!(toast.text.contains("23-tagedit-view.md"), "{}", toast.text);
+        assert_eq!(
+            toast.level,
+            Level::Warn,
+            "a key that did nothing is a surprise, not news"
+        );
+    }
+
+    #[test]
+    fn a_remapped_key_works_and_the_key_it_replaced_does_not() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app_with_keys(
+            &fx,
+            "[browser]\n\"J\" = \"half_page_down\"\n\"j\" = \"none\"\n",
+        );
+        app.update(scanned(&fx));
+        app.size = (80, 24);
+
+        assert!(!app.update(press('j')), "`j` was unbound");
+        assert_eq!(app.cursor, 0);
+        assert!(app.update(press('J')), "`J` is a half page now");
+        assert_eq!(app.cursor, app.row_count() - 1, "the fixture is short");
+    }
+
+    #[test]
+    fn a_half_page_is_half_the_listing_and_stops_at_the_end() {
+        // A library with enough rows that a half page is not the whole of it.
+        let mut builder = Fixture::builder();
+        for n in 0..40 {
+            builder = builder.album(&format!("album-{n:02}"), &["01 a.mp3"]);
+        }
+        let fx = builder.build();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        app.size = (80, 24);
+        assert_eq!(app.row_count(), 40);
+
+        let step = usize::try_from(app.page_step()).expect("a positive step");
+        assert!((2..20).contains(&step), "{step} is not half a screen");
+        app.update(Msg::Input(Event::Key(KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+        ))));
+        assert_eq!(app.cursor, step);
+        app.update(Msg::Input(Event::Key(KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+        ))));
+        assert_eq!(app.cursor, 0, "and back, stopping at the top");
+    }
+
+    #[test]
+    fn the_bottom_line_names_the_keys_that_are_actually_bound() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app_with_keys(&fx, "[browser]\n\"?\" = \"none\"\n\"f1\" = \"help\"\n");
+        let mut terminal = screen(80, 24);
+        app.update(scanned(&fx));
+        app.toasts.clear();
+
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+        assert!(drawn.contains("f1 help"), "{drawn}");
+        assert!(!drawn.contains("? help"), "{drawn}");
+        assert!(drawn.contains("q quit"), "{drawn}");
+    }
+
+    #[test]
+    fn a_pending_sequence_shows_in_the_corner_until_it_times_out() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(80, 24);
+        app.update(scanned(&fx));
+        app.toasts.clear();
+
+        assert!(app.update(press('g')), "a prefix is worth a frame");
+        draw(&mut app, &mut terminal);
+        let bottom = lines(&terminal).pop().expect("there is a bottom line");
+        assert!(bottom.ends_with('g'), "{bottom:?}");
+    }
+
+    #[test]
+    fn startup_warnings_about_keys_toml_open_a_panel_rather_than_scrolling_past() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(80, 24);
+
+        let mut map = KeyMap::defaults();
+        let mut warnings = Vec::new();
+        crate::tui::keys::merge(
+            &mut map,
+            camino::Utf8Path::new("/tmp/keys.toml"),
+            "[browser]\n\"ctrl-r\" = \"rescann\"\n",
+            &mut warnings,
+        );
+        app.report_key_warnings(&warnings);
+
+        assert!(app.toasts.is_empty(), "a list of actions is not a toast");
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+        assert!(drawn.contains("keys.toml"), "{drawn}");
+        assert!(drawn.contains("rescann"), "{drawn}");
+        // The valid names, which is the whole reason this is a panel.
+        assert!(drawn.contains("rescan"), "{drawn}");
+        assert!(drawn.contains("esc to dismiss"), "{drawn}");
+
+        assert!(app.update(key(KeyCode::Esc)));
+        assert_eq!(app.views, vec![View::Browser]);
+    }
+
+    #[test]
+    fn nothing_at_all_is_wrong_with_the_default_keys() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        app.report_key_warnings(&[]);
+        assert_eq!(app.views, vec![View::Browser], "no panel for no warnings");
+    }
+
+    // -- the help overlay --------------------------------------------------
+
+    #[test]
+    fn the_rendered_help_follows_a_remap() {
+        let fx = Fixture::realistic();
+        let mut terminal = screen(80, 24);
+
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        app.update(press('?'));
+        draw(&mut app, &mut terminal);
+        let before = text(&terminal);
+        assert!(before.contains("j / down"), "{before}");
+
+        // The same help, over a keymap where `j` is somewhere else. Nothing about
+        // the overlay is written down, so this is the whole of what changed.
+        let (mut app, _rx) =
+            app_with_keys(&fx, "[browser]\n\"j\" = \"none\"\n\"ctrl-j\" = \"down\"\n");
+        app.update(scanned(&fx));
+        app.update(press('?'));
+        draw(&mut app, &mut terminal);
+        let after = text(&terminal);
+        assert!(after.contains("ctrl-j"), "{after}");
+        assert!(
+            !after.contains("j / down"),
+            "the help must not document a binding that was remapped away:\n{after}"
+        );
+    }
+
+    #[test]
+    fn the_help_lists_the_commands_and_scrolls_to_reach_them() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(80, 24);
+        app.update(scanned(&fx));
+        app.update(press('?'));
+
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+        assert!(drawn.contains("more — j / k to scroll"), "{drawn}");
+        assert!(
+            !drawn.contains(":organize"),
+            "it is below the fold:\n{drawn}"
+        );
+
+        // Down to the bottom, where the commands are.
+        assert!(app.update(press('G')));
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+        assert!(drawn.contains(":organize <template>"), "{drawn}");
+        assert!(drawn.contains(":q!"), "{drawn}");
+        // `ctrl-c` is not in the keymap, and the help says so anyway.
+        assert!(drawn.contains("ctrl-c"), "{drawn}");
+
+        assert!(app.update(press('g')) && app.update(press('g')), "back up");
+        assert!(matches!(
+            app.views.last(),
+            Some(View::Help { scroll: 0, .. })
+        ));
+        // And the cursor underneath never moved, because the overlay had the keys.
+        assert_eq!(app.cursor, 0);
+
+        assert!(app.update(press('?')), "`?` closes it again");
+        assert_eq!(app.views, vec![View::Browser]);
+    }
+
+    // -- command mode ------------------------------------------------------
+
+    #[test]
+    fn command_mode_types_a_command_and_runs_it() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(80, 24);
+        app.update(scanned(&fx));
+        app.toasts.clear();
+
+        assert!(app.update(press(':')), "`:` opens the line");
+        assert_eq!(app.mode(), Mode::Command);
+        type_in(&mut app, "move hiphop/MF DOOM");
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+        assert!(drawn.contains(":move hiphop/MF DOOM"), "{drawn}");
+        // The letters went into the line and not into the browser: `m` is
+        // `stage_move` out here, and the cursor has not moved either.
+        assert_eq!(app.cursor, 0);
+
+        assert!(app.update(key(KeyCode::Enter)), "enter runs it");
+        assert_eq!(app.views, vec![View::Browser], "and closes the line");
+        let toast = app.toasts.front().expect("it reported something");
+        assert!(
+            toast.text.contains("move to hiphop/MF DOOM"),
+            "{}",
+            toast.text
+        );
+    }
+
+    #[test]
+    fn a_command_that_does_not_parse_leaves_the_line_open_with_the_reason_under_it() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(80, 24);
+        app.update(scanned(&fx));
+        app.toasts.clear();
+
+        app.update(press(':'));
+        type_in(&mut app, "wibble");
+        assert!(app.update(key(KeyCode::Enter)));
+        assert_eq!(
+            app.mode(),
+            Mode::Command,
+            "the line stays open to be edited"
+        );
+
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+        assert!(drawn.contains("no command `wibble`"), "{drawn}");
+        assert!(
+            drawn.contains(":wibble"),
+            "what caused it is still there:\n{drawn}"
+        );
+
+        // Editing clears the complaint, and the line can be fixed rather than
+        // retyped.
+        for _ in 0..6 {
+            app.update(key(KeyCode::Backspace));
+        }
+        type_in(&mut app, "doctor");
+        assert!(app.update(key(KeyCode::Enter)));
+        assert_eq!(app.views, vec![View::Browser]);
+        let toast = app.toasts.front().expect("doctor said something");
+        assert!(toast.text.contains("29-doctor.md"), "{}", toast.text);
+    }
+
+    #[test]
+    fn the_command_line_edits_and_esc_abandons_it() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        app.toasts.clear();
+
+        app.update(press(':'));
+        type_in(&mut app, "doctor");
+        // ctrl-u is `clear_line` here and `half_page_up` in the browser, which is
+        // the whole argument for modes.
+        assert!(app.update(Msg::Input(Event::Key(KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL
+        )))));
+        assert_eq!(app.command_line().map(CommandLine::text), Some(""));
+
+        type_in(&mut app, "q");
+        assert!(app.update(key(KeyCode::Esc)), "esc closes it");
+        assert_eq!(app.views, vec![View::Browser]);
+        assert!(!app.quit, "the `q` it held was text, not a key");
+
+        // `:` then enter is a change of mind and not an error.
+        app.update(press(':'));
+        assert!(app.update(key(KeyCode::Enter)));
+        assert_eq!(app.views, vec![View::Browser]);
+        assert!(app.toasts.is_empty());
+    }
+
+    #[test]
+    fn colon_q_is_the_same_door_as_the_q_key() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        app.plan.push(staged());
+
+        app.update(press(':'));
+        type_in(&mut app, "q");
+        app.update(key(KeyCode::Enter));
+        assert!(!app.quit, "there is a plan, so it asks");
+        assert!(matches!(app.views.last(), Some(View::Confirm(_))));
+        app.update(press('n'));
+
+        // And `:q!` does not ask, which is the only difference between them.
+        app.update(press(':'));
+        type_in(&mut app, "q!");
+        app.update(key(KeyCode::Enter));
+        assert!(app.quit);
+    }
+
+    // -- quitting with a plan in hand --------------------------------------
+
+    #[test]
+    fn q_with_staged_operations_asks_before_discarding_them() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(80, 24);
+        app.update(scanned(&fx));
+        app.plan.push(staged());
+
+        assert!(app.update(press('q')));
+        assert!(!app.quit, "it must ask, not leave");
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+        assert!(drawn.contains("1 staged operation"), "{drawn}");
+        assert!(drawn.contains("y to quit"), "{drawn}");
+
+        // Anything that is not an answer leaves the question up.
+        assert!(!app.update(press('j')));
+        assert!(matches!(app.views.last(), Some(View::Confirm(_))));
+
+        // `n` stays, and the plan is still there.
+        assert!(app.update(press('n')));
+        assert!(!app.quit);
+        assert_eq!(app.plan.len(), 1);
+        assert_eq!(app.views, vec![View::Browser]);
+
+        // `y` leaves.
+        app.update(press('q'));
+        assert!(app.update(press('y')));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn q_with_nothing_staged_does_not_ask() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        assert!(app.plan.is_empty());
+        app.update(press('q'));
+        assert!(app.quit, "there was nothing to lose");
+    }
+
+    #[test]
+    fn ctrl_c_asks_once_and_then_leaves_whatever_the_answer_would_have_been() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        app.plan.push(staged());
+
+        let ctrl_c = || {
+            Msg::Input(Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            )))
+        };
+
+        app.update(ctrl_c());
+        assert!(!app.quit, "the first one asks, like `q`");
+        assert!(matches!(app.views.last(), Some(View::Confirm(_))));
+        app.update(ctrl_c());
+        assert!(
+            app.quit,
+            "and the second leaves: two presses always get out"
+        );
+    }
+
+    #[test]
+    fn a_confirmation_cannot_be_rebound_out_of_existence() {
+        // `y` / `n` are not in the keymap, so a keys.toml that binds them to
+        // something else cannot leave a user stuck in a prompt.
+        let fx = Fixture::realistic();
+        let (mut app, _rx) =
+            app_with_keys(&fx, "[browser]\n\"y\" = \"rescan\"\n\"n\" = \"rescan\"\n");
+        app.update(scanned(&fx));
+        app.plan.push(staged());
+
+        app.update(press('q'));
+        assert!(app.update(press('y')));
+        assert!(app.quit);
+    }
+
     // -- the log -----------------------------------------------------------
 
     #[test]
@@ -1638,7 +2678,7 @@ mod tests {
         let fx = Fixture::realistic();
         let (tx, _rx) = mpsc::channel();
         let log = Arc::new(Log::to_file(&path).expect("a log in a temp dir opens"));
-        let mut app = App::new(fx.config(), tx, log);
+        let mut app = App::new(fx.config(), KeyMap::defaults(), tx, log);
         let mut terminal = screen(80, 24);
 
         let events = Events::scripted(vec![scanned(&fx), press('?'), press('q')]);

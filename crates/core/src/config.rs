@@ -828,6 +828,18 @@ pub fn config_file_path(env: &Env) -> Option<Utf8PathBuf> {
     Some(env.config_home()?.join("mpdfm/config.toml"))
 }
 
+/// Where the TUI's keymap lives (task 21).
+///
+/// Next to `config.toml` and discovered the same way, so that `$XDG_CONFIG_HOME`
+/// moves both. The file is read by the front-end rather than by resolution: a
+/// keymap is not a setting, nothing outside the TUI has an opinion about it, and
+/// `Config` carrying a `HashMap` of key bindings would put `crossterm`'s vocabulary
+/// in core.
+#[must_use]
+pub fn keys_file_path(env: &Env) -> Option<Utf8PathBuf> {
+    Some(env.config_home()?.join("mpdfm/keys.toml"))
+}
+
 // ---------------------------------------------------------------------------
 // Resolution
 // ---------------------------------------------------------------------------
