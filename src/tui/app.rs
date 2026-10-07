@@ -26,13 +26,18 @@
 //! the whole trick, and the reason the task asks for a stack rather than a
 //! `current_view` field.
 //!
-//! # What is deliberately thin here
+//! # What is here and what is in a view
 //!
-//! The browser is a list with a cursor, and the status bar is one line of text.
-//! Tasks 22–26 own what they become; this task owns the shell they live in, so
-//! each of them is built just far enough to prove the shell works — a cursor to
-//! show that an overlay does not lose it, a status bar to show that the tick
-//! reaches it.
+//! This file owns the shell: the loop, the stack, the chrome, and the dispatch
+//! that turns an [`Action`] into a call on whatever has the keyboard. It owns no
+//! cursor and no listing — [`Browser`] does (task 22), and tasks 23–25 add the
+//! views beside it. The rule that keeps the two apart is that nothing here
+//! reaches into a view's state to answer a question a method could answer, and
+//! nothing in a view knows what a frame is.
+//!
+//! The status bar is the one deliberate exception: it reads a little from
+//! everything, because that is what a status bar is. Task 26 owns what goes on
+//! it and in which order it elides.
 //!
 //! # Keys, and what answers them
 //!
@@ -65,7 +70,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use mpdfm_core::config::Config;
-use mpdfm_core::library::{DirPath, Library, ScanProgress};
+use mpdfm_core::library::{Library, ScanProgress};
 use mpdfm_core::ops::Plan;
 use mpdfm_core::playlist::PlaylistIndex;
 use ratatui::Terminal;
@@ -73,7 +78,7 @@ use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget as _, Wrap};
 
 use super::action::Action;
 use super::command::{self, Command, CommandLine};
@@ -82,10 +87,31 @@ use super::keys::{KeyChord, KeyMap, KeyWarning, Keys, Mode, Resolution};
 use super::log::Log;
 use super::msg::{MpdSnapshot, Msg, ScanOutcome, TaskOutcome};
 use super::terminal::{MIN_SIZE, fits};
+use super::views::browser::{Browser, Enter, Pane, Sort, TreeRow};
+use super::widgets::details::DetailsPane;
+use super::widgets::filelist::FileList;
+use super::widgets::{fit, pad};
 use super::{PANIC_AT, work};
 
 /// How long an informational toast stays up once it is the one on screen.
 const TOAST_LIFETIME: Duration = Duration::from_secs(4);
+
+/// Rows of chrome around the body: the header, the status bar, the message line.
+///
+/// Named because three places need the same number — the layout, the half-page
+/// step, and the estimate of how many rows of tags to read ahead — and a layout
+/// that disagreed with the read-ahead by a constant would be a bug nobody saw.
+const CHROME_ROWS: u16 = 3;
+
+/// How wide the terminal has to be before the details pane is worth its space.
+///
+/// Below this the two panes that can be navigated get the whole width, which is
+/// the right trade: a 14-cell details pane is unreadable and the listing is what
+/// the keys act on. The task calls it "a third, narrow column on wide terminals".
+const DETAILS_FROM: u16 = 90;
+
+/// Cells given to the details pane when it is shown.
+const DETAILS_W: u16 = 26;
 
 /// How many messages may be waiting for the bottom line.
 ///
@@ -122,6 +148,17 @@ impl Focus {
         match self {
             Self::Tree => "tree",
             Self::Files => "files",
+        }
+    }
+
+    /// The browser's name for the same pane.
+    ///
+    /// Two enums rather than one so the view does not depend on the shell; see
+    /// [`Pane`]. The mapping is total and this is the only place it is written.
+    fn pane(self) -> Pane {
+        match self {
+            Self::Tree => Pane::Tree,
+            Self::Files => Pane::Files,
         }
     }
 }
@@ -261,6 +298,18 @@ pub struct App {
     plan: Plan,
     /// Which pane the keyboard is in.
     focus: Focus,
+    /// The browser: where it is in the tree, what is marked, what is cached.
+    browser: Browser,
+    /// Whether a tag read is already out, so a held `j` does not start a thread
+    /// per row. Cleared when the answer lands, which is also when the next
+    /// window is asked for.
+    tags_in_flight: bool,
+    /// How many things the last scan could not model — non-UTF-8 names, an
+    /// unreadable directory, a playlist that would not parse.
+    ///
+    /// A badge on the status bar and not a silent omission: a library browser
+    /// that quietly shows 2 799 of 2 800 files is lying about the library.
+    warnings: usize,
     /// The bindings, and the half-finished sequence waiting for its second key.
     keys: Keys,
     /// The view stack. Never empty; `views[0]` is the base.
@@ -274,8 +323,6 @@ pub struct App {
     toasts: VecDeque<Toast>,
     /// What the status line says about scanning.
     scan: ScanState,
-    /// The browser's cursor, as an index into the current directory's rows.
-    cursor: usize,
     /// What MPD last said. `None` until the first poll answers.
     mpd: Option<MpdSnapshot>,
     /// Whether an MPD poll is already out, so the tick does not stack them up.
@@ -300,11 +347,13 @@ impl App {
             index: None,
             plan: Plan::new(),
             focus: Focus::Tree,
+            browser: Browser::new(),
+            tags_in_flight: false,
+            warnings: 0,
             keys: Keys::new(keys),
             views: vec![View::Browser],
             toasts: VecDeque::new(),
             scan: ScanState::Idle,
-            cursor: 0,
             mpd: None,
             mpd_in_flight: false,
             tx,
@@ -342,6 +391,7 @@ impl App {
         while !self.quit {
             if dirty {
                 terminal.draw(|frame| self.render(frame.area(), frame))?;
+                self.remember_scroll();
                 dirty = false;
             }
 
@@ -376,7 +426,7 @@ impl App {
                 msg.name()
             );
         }
-        match msg {
+        let dirty = match msg {
             Msg::Input(event) => self.on_event(event),
             Msg::Tick => self.on_tick(),
             Msg::Progress(progress) => {
@@ -391,7 +441,13 @@ impl App {
                 self.quit = true;
                 false
             }
-        }
+        };
+
+        // Whatever just happened may have brought a row into view, so this is
+        // the one place that asks — after the state has settled and before the
+        // frame is drawn. It never reads a file itself; see `request_tags`.
+        self.request_tags();
+        dirty
     }
 
     // -- messages ----------------------------------------------------------
@@ -531,18 +587,47 @@ impl App {
         }
 
         match action {
-            // -- the shell answers these ------------------------------------
-            Action::Down => self.move_cursor(1),
-            Action::Up => self.move_cursor(-1),
-            Action::Top => self.set_cursor(0),
-            Action::Bottom => self.set_cursor(self.row_count().saturating_sub(1)),
-            Action::HalfPageDown => self.move_cursor(self.page_step()),
-            Action::HalfPageUp => self.move_cursor(-self.page_step()),
+            // -- moving around, which is the browser's -----------------------
+            Action::Down => {
+                self.browse(|browser, pane, library| browser.move_cursor(pane, 1, library))
+            }
+            Action::Up => {
+                self.browse(|browser, pane, library| browser.move_cursor(pane, -1, library))
+            }
+            Action::Top => {
+                self.browse(|browser, pane, library| browser.set_cursor(pane, 0, library))
+            }
+            Action::Bottom => self.browse(|browser, pane, library| browser.go_last(pane, library)),
+            Action::HalfPageDown => {
+                let step = self.page_step();
+                self.browse(|browser, pane, library| browser.move_cursor(pane, step, library))
+            }
+            Action::HalfPageUp => {
+                let step = -self.page_step();
+                self.browse(|browser, pane, library| browser.move_cursor(pane, step, library))
+            }
             Action::SwitchPane => {
                 self.focus = self.focus.toggled();
                 true
             }
-            Action::Cancel => self.pop(),
+            Action::Left => {
+                let pane = self.focus.pane();
+                self.browse(move |browser, _, library| browser.leave(pane, library))
+            }
+            Action::Parent => self.browse(|browser, _, library| browser.go_up(library)),
+            Action::Right | Action::Open => self.open_action(),
+
+            // -- marking ------------------------------------------------------
+            Action::ToggleMark => self.browse(|browser, _, library| browser.toggle_mark(library)),
+            Action::VisualSelect => self.browse(|browser, _, library| browser.visual(library)),
+            Action::MarkAll => self.browse(|browser, _, library| browser.mark_all(library)),
+            Action::UnmarkAll => self.browse(|browser, _, _| browser.unmark_all()),
+
+            // -- chrome -------------------------------------------------------
+            // `esc` closes an open visual range before it dismisses a message:
+            // an abandoned selection is the more recent of the two, and the one
+            // the user is looking at.
+            Action::Cancel => self.browser.cancel_visual() || self.pop(),
             Action::CommandMode => self.push(View::Command(CommandLine::new())),
             Action::Help => self.toggle_help(),
             Action::Rescan => {
@@ -552,19 +637,14 @@ impl App {
             Action::Quit | Action::ForceQuit => self.quit_action(action),
 
             // -- the views that are not built yet ---------------------------
-            Action::Left
-            | Action::Right
-            | Action::Open
-            | Action::Parent
-            | Action::ToggleMark
-            | Action::VisualSelect
-            | Action::MarkAll
-            | Action::UnmarkAll
-            | Action::StageMove
-            | Action::Rename
-            | Action::StageDelete => self.not_yet(action.help(), Some("22-browser-view.md")),
             Action::EditTags => self.not_yet(action.help(), Some("23-tagedit-view.md")),
-            Action::ShowPending
+            // Staging needs somewhere to show what was staged, and that is task
+            // 24: this task hands it the marks, and that is the whole of the
+            // seam between them.
+            Action::StageMove
+            | Action::Rename
+            | Action::StageDelete
+            | Action::ShowPending
             | Action::Unstage
             | Action::Commit
             | Action::DiscardPending
@@ -576,6 +656,50 @@ impl App {
 
             // -- only meaningful where there is a line of text --------------
             Action::Submit | Action::DeleteChar | Action::ClearLine => false,
+        }
+    }
+
+    /// Do something to the browser, if there is a library for it to be about.
+    ///
+    /// The one place the two fields are borrowed together, and the reason every
+    /// browser verb above is one line: a library that has not landed yet means
+    /// the keys move nothing, which is right — there is nothing on screen to
+    /// move through.
+    fn browse<F>(&mut self, act: F) -> bool
+    where
+        F: FnOnce(&mut Browser, Pane, &Library) -> bool,
+    {
+        let Some(library) = &self.library else {
+            return false;
+        };
+        let was = self.browser.dir().clone();
+        let dirty = act(&mut self.browser, self.focus.pane(), library);
+        if self.browser.dir() != &was {
+            self.log
+                .line(format!("browser: {}", self.browser.dir_label()));
+        }
+        dirty
+    }
+
+    /// `l` / `enter`: into a directory, across to the listing, or into a file —
+    /// which is the tag editor's job and so is answered by naming it.
+    fn open_action(&mut self) -> bool {
+        let Some(library) = &self.library else {
+            return false;
+        };
+        match self.browser.enter(self.focus.pane(), library) {
+            Enter::Opened => {
+                self.log
+                    .line(format!("browser: {}", self.browser.dir_label()));
+                true
+            }
+            Enter::ToFiles => {
+                let moved = self.focus != Focus::Files;
+                self.focus = Focus::Files;
+                moved
+            }
+            Enter::File(_) => self.dispatch(Action::EditTags),
+            Enter::Nothing => false,
         }
     }
 
@@ -644,7 +768,7 @@ impl App {
                 Action::Quit
             }),
             Command::Move { dst } => {
-                self.not_yet(format!("move to {dst}"), Some("22-browser-view.md"))
+                self.not_yet(format!("move to {dst}"), Some("24-pending-view.md"))
             }
             Command::Organize { template } => self.not_yet(
                 format!("organize by {template}"),
@@ -658,14 +782,34 @@ impl App {
                 self.not_yet(what, Some("24-pending-view.md"))
             }
             Command::Doctor => self.not_yet("doctor", Some("29-doctor.md")),
-            // No task owns live settings, and inventing one here would be a
-            // promise this plan has not made. What `:set` has is a settled grammar
-            // and a test; what it does not have is anywhere to put the value.
-            Command::Set { key, value } => self.not_yet(
-                format!("set {key}={value}: nothing applies a setting"),
-                None,
-            ),
+            Command::Set { key, value } => self.set_setting(&key, &value),
         }
+    }
+
+    /// Apply `:set <key>=<value>`, or say why it could not be.
+    ///
+    /// One key so far. `sort` is here and not in `config.toml` on purpose: it is
+    /// a property of this session's browsing, the task asks for it to be
+    /// remembered *per session*, and a setting written to a file would outlive
+    /// the reason somebody chose it. Everything else `:set` takes still parses
+    /// and still has nowhere to go, which is what it says.
+    fn set_setting(&mut self, key: &str, value: &str) -> bool {
+        if key != "sort" {
+            return self.not_yet(
+                format!("set {key}={value}: nothing applies that setting"),
+                None,
+            );
+        }
+        let Some(sort) = Sort::parse(value) else {
+            self.notify(
+                Level::Warn,
+                format!("no sort called `{value}`; try {}", Sort::names()),
+            );
+            return true;
+        };
+        self.browser.set_sort(sort, self.library.as_ref());
+        self.notify(Level::Info, format!("sorting by {sort}"));
+        true
     }
 
     /// Leave, asking first when there is something staged to lose.
@@ -748,6 +892,7 @@ impl App {
         match library {
             Ok(library) => {
                 let warnings = library.warnings().len() + playlist_warnings.len();
+                self.warnings = warnings;
                 self.scan = ScanState::Done {
                     files: library.len(),
                     dirs: library.dir_count(),
@@ -760,8 +905,12 @@ impl App {
                 );
                 self.library = Some(library);
                 self.index = index;
-                // The cursor may have been past the end of a smaller library.
-                self.clamp_cursor();
+                // Where the browser was may not exist any more, and whatever it
+                // had cached is about a library that has just been replaced.
+                if let Some(library) = &self.library {
+                    self.browser.library_changed(library, self.index.as_ref());
+                }
+                self.tags_in_flight = false;
 
                 if warnings == 0 {
                     self.notify(Level::Info, summary);
@@ -809,11 +958,60 @@ impl App {
     /// A worker that was not a scan came back.
     fn on_task_done(&mut self, outcome: TaskOutcome) -> bool {
         match outcome {
+            TaskOutcome::Tags(reads) => {
+                self.tags_in_flight = false;
+                // A failure here is per-file and already in the row's own slot:
+                // it shows as `?` in the listing and as the reason in the
+                // details pane. A panel for one unreadable track in a directory
+                // of fourteen would be a modal dialogue nobody asked for.
+                self.browser.tags_arrived(reads)
+            }
             TaskOutcome::Failed { what, message } => {
+                self.tags_in_flight = false;
                 self.fail(format!("{what}: {message}"));
                 true
             }
         }
+    }
+
+    /// Start reading the tags of any visible row that has none yet.
+    ///
+    /// Nothing here opens a file: [`Browser::wanted`] names the paths and
+    /// `work::read_tags` is the thread that reads them, which is the same
+    /// division the scan uses. One batch at a time — a held-down `j` would
+    /// otherwise start a thread per row — and the answer is what asks for the
+    /// next one, so scrolling fast coalesces into a few large reads instead of
+    /// many small ones.
+    fn request_tags(&mut self) {
+        if self.tags_in_flight {
+            return;
+        }
+        let Some(library) = &self.library else {
+            return;
+        };
+        let rows = self.list_rows();
+        let wanted = self.browser.wanted(library, rows);
+        if wanted.is_empty() {
+            return;
+        }
+        self.tags_in_flight = true;
+        work::read_tags(
+            self.tx.clone(),
+            wanted,
+            library.root().to_path_buf(),
+            Arc::clone(&self.log),
+        );
+    }
+
+    /// How many rows the listing has room for, from the last size the terminal
+    /// reported.
+    ///
+    /// An estimate, and allowed to be: it decides how many tags are read ahead,
+    /// and the frame itself measures the real area. The two differ by one row
+    /// when a command error is on screen, which costs one extra file read and
+    /// nothing else.
+    fn list_rows(&self) -> usize {
+        usize::from(self.size.1.saturating_sub(CHROME_ROWS + 2))
     }
 
     // -- state -------------------------------------------------------------
@@ -928,83 +1126,6 @@ impl App {
         self.views.push(View::Error(message));
     }
 
-    /// The directory the browser is showing. The root until task 22 can navigate.
-    fn current_dir(&self) -> DirPath {
-        DirPath::root()
-    }
-
-    /// The current directory as something to put on screen.
-    ///
-    /// [`DirPath::root`] displays as the empty string, which is right for joining
-    /// a path and wrong for a title or a status bar: it leaves a pane called `  `
-    /// and a bar that starts with a stray separator.
-    fn dir_label(&self) -> String {
-        let dir = self.current_dir();
-        if dir.is_root() {
-            "/".to_owned()
-        } else {
-            dir.to_string()
-        }
-    }
-
-    /// How many rows the browser has — subdirectories, then files.
-    fn row_count(&self) -> usize {
-        self.rows().len()
-    }
-
-    /// The rows of the current directory: subdirectories first, then files.
-    ///
-    /// Built per draw from the model's own index, which is what the task's second
-    /// pitfall asks for: the widget gets a small owned `Vec<String>` and the
-    /// library is not borrowed across the draw by anything that could be mutated.
-    fn rows(&self) -> Vec<String> {
-        let Some(library) = &self.library else {
-            return Vec::new();
-        };
-        let dir = self.current_dir();
-        let Some(entry) = library.dir(&dir) else {
-            return Vec::new();
-        };
-
-        let mut rows: Vec<String> = entry
-            .subdirs()
-            .iter()
-            .filter_map(|sub| sub.file_name().map(|name| format!("{name}/")))
-            .collect();
-        rows.extend(
-            entry
-                .files()
-                .iter()
-                .filter_map(|index| library.entry(*index))
-                .map(|entry| entry.file_name().to_owned()),
-        );
-        rows
-    }
-
-    /// Move the cursor by `delta`, stopping at either end rather than wrapping.
-    fn move_cursor(&mut self, delta: isize) -> bool {
-        let count = self.row_count();
-        if count == 0 {
-            return false;
-        }
-        let last = count - 1;
-        let target = self.cursor.saturating_add_signed(delta).min(last);
-        self.set_cursor(target)
-    }
-
-    /// Put the cursor on `row`. Returns whether it moved.
-    fn set_cursor(&mut self, row: usize) -> bool {
-        let moved = self.cursor != row;
-        self.cursor = row;
-        moved
-    }
-
-    /// Bring the cursor back inside the library after a rescan shrank it.
-    fn clamp_cursor(&mut self) {
-        let count = self.row_count();
-        self.cursor = self.cursor.min(count.saturating_sub(1));
-    }
-
     // -- drawing -----------------------------------------------------------
 
     /// Draw the whole frame into `area`.
@@ -1079,32 +1200,163 @@ impl App {
         ]))
     }
 
-    /// The browser: the current directory's rows, with the cursor on one.
+    /// The browser: the tree, the listing, and — when there is room — the
+    /// details of whatever the listing's cursor is on.
+    ///
+    /// Everything a widget needs is derived here, into owned values, from a
+    /// library that is borrowed for the length of this call and no longer.
+    /// Nothing is mutated: the scroll offsets the next frame starts from are
+    /// recorded by [`App::remember_scroll`], which the loop calls after the draw.
     fn render_browser(&self, area: Rect, frame: &mut ratatui::Frame) {
-        let rows = self.rows();
-        let title = format!(" {} ", self.dir_label());
-
-        if rows.is_empty() {
+        let Some(library) = &self.library else {
             let text = match &self.scan {
                 ScanState::Running(_) => "scanning…",
-                _ => "nothing here",
+                _ => "no library yet",
             };
             frame.render_widget(
-                Paragraph::new(text).block(Block::new().borders(Borders::ALL).title(title)),
+                Paragraph::new(text).block(Block::new().borders(Borders::ALL).title(" / ")),
                 area,
             );
             return;
+        };
+
+        let [tree_area, files_area, details_area] = panes(area);
+        // The listing is the only pane whose height decides how much work is
+        // done, which is what makes the whole view virtualized: `rows` returns
+        // this many rows and the widget cannot look past them.
+        let height = usize::from(files_area.height.saturating_sub(2));
+
+        self.render_tree(tree_area, library, frame);
+        self.render_files(files_area, library, height, frame);
+        if details_area.width > 0 {
+            frame.render_widget(
+                DetailsPane::new(&self.browser.details(library, self.index.as_ref()))
+                    .block(Block::new().borders(Borders::ALL).title(" details ")),
+                details_area,
+            );
+        }
+    }
+
+    /// The directory tree, indented, with the current directory on the cursor.
+    fn render_tree(&self, area: Rect, library: &Library, frame: &mut ratatui::Frame) {
+        let height = usize::from(area.height.saturating_sub(2));
+        let shown = self.browser.tree(library, height);
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .title(format!(" {} ", fit(root_name(library), inner_width(area))));
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width == 0 {
+            return;
         }
 
-        let items: Vec<ListItem> = rows.into_iter().map(ListItem::new).collect();
-        let list = List::new(items)
-            .block(Block::new().borders(Borders::ALL).title(title))
-            .highlight_symbol("> ")
-            .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+        let cells = usize::from(inner.width);
+        let lines: Vec<Line<'static>> = shown
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let mut line = Line::from(vec![
+                    Span::styled(
+                        pad(if row.referenced { "⚠" } else { "" }, 2),
+                        Style::new().fg(Color::Magenta),
+                    ),
+                    Span::raw(pad(&tree_label(row), cells.saturating_sub(2))),
+                ]);
+                if shown.cursor == Some(index) {
+                    line = line.style(if self.focus == Focus::Tree {
+                        Style::new().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::new().add_modifier(Modifier::BOLD)
+                    });
+                }
+                line
+            })
+            .collect();
+        Paragraph::new(lines).render(inner, frame.buffer_mut());
+    }
 
-        let mut state = ListState::default();
-        state.select(Some(self.cursor));
-        frame.render_stateful_widget(list, area, &mut state);
+    /// The listing, or the reason there is nothing in it.
+    fn render_files(
+        &self,
+        area: Rect,
+        library: &Library,
+        height: usize,
+        frame: &mut ratatui::Frame,
+    ) {
+        let shown = self.browser.rows(library, height);
+        let title = format!(" {} ", fit(&self.browser.dir_label(), inner_width(area)));
+        let footer = if shown.total == 0 {
+            String::new()
+        } else {
+            format!(" {}/{} ", self.browser.cursor() + 1, shown.total)
+        };
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .title(title)
+            .title_bottom(footer);
+
+        if shown.total == 0 {
+            // Not "nothing here": an empty directory and one the scan could not
+            // read look identical in the model, and which of the two it is, is
+            // the thing a user needs to know.
+            let text = match &self.scan {
+                ScanState::Running(_) => "scanning…".to_owned(),
+                _ => self.browser.empty_reason(library),
+            };
+            frame.render_widget(Paragraph::new(text).block(block), area);
+            return;
+        }
+
+        // The visual range is in listing coordinates; the widget's are window
+        // coordinates, so it is shifted and clipped to what is on screen.
+        let range = self.browser.visual_range().and_then(|(from, to)| {
+            let start = shown.range.start;
+            (to >= start).then(|| {
+                (
+                    from.saturating_sub(start),
+                    (to - start).min(shown.rows.len().saturating_sub(1)),
+                )
+            })
+        });
+
+        frame.render_widget(
+            FileList::new(&shown.rows)
+                .cursor(shown.cursor)
+                .range(range)
+                .focused(self.focus == Focus::Files)
+                .block(block),
+            area,
+        );
+    }
+
+    /// Record where each pane ended up scrolled to, after a frame.
+    ///
+    /// Separate from the draw because the draw takes `&self`: a render that
+    /// mutated the state it renders from is a render whose output depends on how
+    /// many times it has been called.
+    fn remember_scroll(&mut self) {
+        let Some(library) = &self.library else {
+            return;
+        };
+        let [tree_area, files_area, _] = panes(self.body());
+        let tree = self
+            .browser
+            .tree(library, usize::from(tree_area.height.saturating_sub(2)))
+            .range
+            .start;
+        let files = self
+            .browser
+            .rows(library, usize::from(files_area.height.saturating_sub(2)))
+            .range
+            .start;
+        self.browser.scrolled(tree, files);
+    }
+
+    /// The area the body occupies, from the last size the terminal reported.
+    fn body(&self) -> Rect {
+        Rect::new(0, 1, self.size.0, self.size.1.saturating_sub(CHROME_ROWS))
     }
 
     /// An overlay over the body.
@@ -1234,18 +1486,33 @@ impl App {
     }
 
     /// The status bar. Task 26 owns what goes on it and in which order it elides;
-    /// this is the subset the shell can answer for.
+    /// this is the subset the shell and the browser can answer for.
     fn status_bar(&self) -> Paragraph<'_> {
-        let marks = 0; // Task 22 marks files.
-        let parts = [
-            self.dir_label(),
-            format!("{} marked", marks),
+        // No path here: the listing's own title carries it, and a 46-character
+        // scene-release directory would push everything that changes off the
+        // right-hand end of an 80-column bar. Task 26 owns the elision order;
+        // not repeating a thing that is already on screen is free.
+        let mut parts = vec![
+            format!("{} marked", self.browser.marked()),
             format!("{} pending", self.plan.len()),
+            format!("sort {}", self.browser.sort()),
             format!("focus {}", self.focus.label()),
+        ];
+        if self.browser.in_visual() {
+            parts.push("VISUAL".to_owned());
+        }
+        if self.warnings > 0 {
+            // A badge, because a scan that skipped a file and said nothing is a
+            // browser that is lying about the library. The count is the whole
+            // message; `:messages` (task 26) is where the list will live.
+            let plural = if self.warnings == 1 { "" } else { "s" };
+            parts.push(format!("⚠ {} warning{plural}", self.warnings));
+        }
+        parts.push(
             self.mpd
                 .as_ref()
                 .map_or_else(|| "○ mpd ?".to_owned(), mpd_summary),
-        ];
+        );
         Paragraph::new(Line::from(parts.join(" · ")).style(Style::new().fg(Color::DarkGray)))
     }
 
@@ -1363,6 +1630,53 @@ impl App {
     }
 }
 
+/// The three panes of the browser: tree, listing, details.
+///
+/// The details pane is zero-wide below [`DETAILS_FROM`], which is how
+/// `render_browser` decides not to draw it — a width and not a flag, so there is
+/// one source of truth for the layout instead of a `bool` that could disagree
+/// with it.
+fn panes(body: Rect) -> [Rect; 3] {
+    let details = if body.width >= DETAILS_FROM {
+        DETAILS_W
+    } else {
+        0
+    };
+    // A quarter of the width for the tree, between the narrowest path worth
+    // reading and the point where it starts stealing from the listing.
+    let tree = (body.width / 4).clamp(14, 30).min(body.width / 2);
+    Layout::horizontal([
+        Constraint::Length(tree),
+        Constraint::Min(10),
+        Constraint::Length(details),
+    ])
+    .areas(body)
+}
+
+/// How many cells a bordered pane has inside it.
+fn inner_width(area: Rect) -> usize {
+    usize::from(area.width.saturating_sub(2))
+}
+
+/// The tree pane's title: the library's own directory name.
+fn root_name(library: &Library) -> &str {
+    library
+        .root()
+        .file_name()
+        .unwrap_or_else(|| library.root().as_str())
+}
+
+/// One tree row, indented and with the open/closed marker a tree needs.
+fn tree_label(row: &TreeRow) -> String {
+    let marker = match (row.has_children, row.expanded) {
+        (false, _) => " ",
+        (true, true) => "▾",
+        (true, false) => "▸",
+    };
+    let name = row.dir.file_name().unwrap_or("/");
+    format!("{}{marker} {name}", "  ".repeat(row.depth))
+}
+
 /// A bordered box in the middle of the body, with `text` wrapped inside it.
 ///
 /// Three quarters of the body, centred: wide enough for a path, and it leaves the
@@ -1443,6 +1757,7 @@ fn mpd_summary(snapshot: &MpdSnapshot) -> String {
 mod tests {
     use std::sync::mpsc;
 
+    use mpdfm_core::library::DirPath;
     use mpdfm_core::testing::Fixture;
     use ratatui::backend::TestBackend;
 
@@ -1458,16 +1773,28 @@ mod tests {
     ///
     /// Styles are dropped: what is asserted on is what a user reads, and a test
     /// that also pinned the colours would fail every time task 26 adjusted one.
+    ///
+    /// The cells a wide character covers are **skipped**. A two-cell `ノ` lives
+    /// in one `Cell` and the next one is never written, so it still holds
+    /// whatever the previous frame put there — invisible on a real terminal,
+    /// because the glyph is drawn over it, and so it must be invisible here too.
+    /// Reading it would make an assertion fail on a name the user can see
+    /// perfectly well.
     fn lines(terminal: &Terminal<TestBackend>) -> Vec<String> {
         let buffer = terminal.backend().buffer();
         let area = *buffer.area();
         (0..area.height)
             .map(|y| {
-                (0..area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-                    .trim_end()
-                    .to_owned()
+                let mut row = String::new();
+                let mut x = 0;
+                while x < area.width {
+                    let symbol = buffer[(x, y)].symbol();
+                    row.push_str(symbol);
+                    x += u16::try_from(super::super::widgets::width(symbol))
+                        .unwrap_or(1)
+                        .max(1);
+                }
+                row.trim_end().to_owned()
             })
             .collect()
     }
@@ -1488,6 +1815,19 @@ mod tests {
             App::new(fx.config(), KeyMap::defaults(), tx, Arc::new(Log::off())),
             rx,
         )
+    }
+
+    /// Where the focused pane's cursor is. The browser owns it now, and these
+    /// two helpers are what keep the shell's own tests about the shell.
+    fn cursor(app: &App) -> usize {
+        let library = app.library.as_ref().expect("a library has landed");
+        app.browser.pane_cursor(app.focus.pane(), library)
+    }
+
+    /// How many rows the focused pane has.
+    fn row_count(app: &App) -> usize {
+        let library = app.library.as_ref().expect("a library has landed");
+        app.browser.row_count(app.focus.pane(), library)
     }
 
     /// A key press, as the input thread would deliver it.
@@ -1686,7 +2026,7 @@ mod tests {
         // browser was showing there.
         app.update(press('j'));
         app.update(press('j'));
-        assert_eq!(app.cursor, 2);
+        assert_eq!(cursor(&app), 2);
         let before = app.views.clone();
 
         assert!(app.update(press('?')), "help should open");
@@ -1713,7 +2053,7 @@ mod tests {
 
         assert!(app.update(key(KeyCode::Esc)), "esc should close it");
         assert_eq!(app.views, before, "the stack should be back as it was");
-        assert_eq!(app.cursor, 2, "the cursor must survive the overlay");
+        assert_eq!(cursor(&app), 2, "the cursor must survive the overlay");
 
         terminal
             .draw(|frame| app.render(frame.area(), frame))
@@ -1854,7 +2194,7 @@ mod tests {
         let (mut app, _rx) = app(&fx);
         app.update(scanned(&fx));
         app.update(press('G'));
-        let bottom = app.cursor;
+        let bottom = cursor(&app);
         assert!(bottom > 0, "the fixture should have more than one row");
 
         // A library with one directory in it, as a rescan after a big move might
@@ -1862,10 +2202,13 @@ mod tests {
         let smaller = Fixture::builder().album("only", &["01 a.mp3"]).build();
         app.update(scanned(&smaller));
         assert!(
-            app.cursor < bottom,
+            cursor(&app) < bottom,
             "the cursor should have been clamped, not left past the end"
         );
-        assert_eq!(app.cursor, app.row_count() - 1);
+        assert!(
+            cursor(&app) < row_count(&app),
+            "and it should be on a row that exists"
+        );
     }
 
     /// The task's worker criterion, end to end: a real scan of a library the size
@@ -1985,7 +2328,7 @@ mod tests {
         assert!(!app.update(press('Z')));
 
         // The cursor already at the top, asked to go up.
-        app.cursor = 0;
+        assert_eq!(cursor(&app), 0);
         assert!(!app.update(press('k')));
 
         // Events the app has no use for.
@@ -2180,21 +2523,25 @@ mod tests {
         let fx = Fixture::realistic();
         let (mut app, _rx) = app(&fx);
         app.update(scanned(&fx));
-        let last = app.row_count() - 1;
+        let last = row_count(&app) - 1;
 
         app.update(press('k'));
-        assert_eq!(app.cursor, 0, "up from the top stays at the top");
+        assert_eq!(cursor(&app), 0, "up from the top stays at the top");
 
         app.update(press('G'));
-        assert_eq!(app.cursor, last);
+        assert_eq!(cursor(&app), last);
         app.update(press('j'));
-        assert_eq!(app.cursor, last, "down from the bottom stays at the bottom");
+        assert_eq!(
+            cursor(&app),
+            last,
+            "down from the bottom stays at the bottom"
+        );
 
         // `gg`, which takes two presses: one `g` is a prefix and nothing else.
         app.update(press('g'));
-        assert_eq!(app.cursor, last, "a lone `g` moves nothing");
+        assert_eq!(cursor(&app), last, "a lone `g` moves nothing");
         app.update(press('g'));
-        assert_eq!(app.cursor, 0);
+        assert_eq!(cursor(&app), 0);
     }
 
     #[test]
@@ -2202,9 +2549,18 @@ mod tests {
         let fx = Fixture::builder().build();
         let (mut app, _rx) = app(&fx);
         app.update(scanned(&fx));
-        assert_eq!(app.row_count(), 0);
+
+        // The tree always has one row — the library root itself, which is where
+        // a browser stands even when there is nothing under it.
+        assert_eq!(row_count(&app), 1);
         assert!(!app.update(press('j')));
-        assert_eq!(app.cursor, 0);
+        assert_eq!(cursor(&app), 0);
+
+        // The listing really has none.
+        app.focus = Focus::Files;
+        assert_eq!(row_count(&app), 0);
+        assert!(!app.update(press('j')));
+        assert_eq!(cursor(&app), 0);
     }
 
     #[test]
@@ -2239,7 +2595,7 @@ mod tests {
         let mut release = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
         release.kind = KeyEventKind::Release;
         assert!(!app.update(Msg::Input(Event::Key(release))));
-        assert_eq!(app.cursor, 0, "a release must not move anything");
+        assert_eq!(cursor(&app), 0, "a release must not move anything");
     }
 
     // -- the keymap --------------------------------------------------------
@@ -2262,13 +2618,22 @@ mod tests {
                 dirty
                     || matches!(
                         action,
+                        // Nothing to accept, nothing to delete, nothing to clear.
                         Action::Quit
                             | Action::Submit
                             | Action::DeleteChar
                             | Action::ClearLine
+                            // Already at the top of the tree.
                             | Action::Top
                             | Action::Up
                             | Action::HalfPageUp
+                            // Already at the library root: there is nothing
+                            // above `music_directory` and saying so would be
+                            // noise on a key that is pressed constantly.
+                            | Action::Left
+                            | Action::Parent
+                            // Nothing is marked, so unmarking changes nothing.
+                            | Action::UnmarkAll
                     ),
                 "{action} did nothing and did not say why"
             );
@@ -2304,9 +2669,9 @@ mod tests {
         app.size = (80, 24);
 
         assert!(!app.update(press('j')), "`j` was unbound");
-        assert_eq!(app.cursor, 0);
+        assert_eq!(cursor(&app), 0);
         assert!(app.update(press('J')), "`J` is a half page now");
-        assert_eq!(app.cursor, app.row_count() - 1, "the fixture is short");
+        assert_eq!(cursor(&app), row_count(&app) - 1, "the fixture is short");
     }
 
     #[test]
@@ -2320,7 +2685,8 @@ mod tests {
         let (mut app, _rx) = app(&fx);
         app.update(scanned(&fx));
         app.size = (80, 24);
-        assert_eq!(app.row_count(), 40);
+        // 40 albums plus the root row they hang off.
+        assert_eq!(row_count(&app), 41);
 
         let step = usize::try_from(app.page_step()).expect("a positive step");
         assert!((2..20).contains(&step), "{step} is not half a screen");
@@ -2328,12 +2694,12 @@ mod tests {
             KeyCode::Char('d'),
             KeyModifiers::CONTROL,
         ))));
-        assert_eq!(app.cursor, step);
+        assert_eq!(cursor(&app), step);
         app.update(Msg::Input(Event::Key(KeyEvent::new(
             KeyCode::Char('u'),
             KeyModifiers::CONTROL,
         ))));
-        assert_eq!(app.cursor, 0, "and back, stopping at the top");
+        assert_eq!(cursor(&app), 0, "and back, stopping at the top");
     }
 
     #[test]
@@ -2462,7 +2828,7 @@ mod tests {
             Some(View::Help { scroll: 0, .. })
         ));
         // And the cursor underneath never moved, because the overlay had the keys.
-        assert_eq!(app.cursor, 0);
+        assert_eq!(cursor(&app), 0);
 
         assert!(app.update(press('?')), "`?` closes it again");
         assert_eq!(app.views, vec![View::Browser]);
@@ -2486,7 +2852,7 @@ mod tests {
         assert!(drawn.contains(":move hiphop/MF DOOM"), "{drawn}");
         // The letters went into the line and not into the browser: `m` is
         // `stage_move` out here, and the cursor has not moved either.
-        assert_eq!(app.cursor, 0);
+        assert_eq!(cursor(&app), 0);
 
         assert!(app.update(key(KeyCode::Enter)), "enter runs it");
         assert_eq!(app.views, vec![View::Browser], "and closes the line");
@@ -2689,5 +3055,490 @@ mod tests {
         assert!(text.contains("msg: scan-done"), "{text}");
         assert!(text.contains("view: push help"), "{text}");
         assert!(text.contains("loop: leaving"), "{text}");
+    }
+
+    // -- the browser (task 22) ---------------------------------------------
+
+    /// A fixture with one directory holding `count` tracks, for the tests about
+    /// scrolling and about how much is read.
+    fn big_album(count: usize) -> Fixture {
+        let tracks: Vec<String> = (0..count).map(|n| format!("{n:03} track.mp3")).collect();
+        let refs: Vec<&str> = tracks.iter().map(String::as_str).collect();
+        Fixture::builder().album("big", &refs).build()
+    }
+
+    /// Drive the app to `dir`, as the keys would, and draw a frame.
+    fn go_to(app: &mut App, terminal: &mut Terminal<TestBackend>, dir: &str) {
+        // A frame first, so the app knows how tall the listing is — which is
+        // what decides how many rows of tags it asks for.
+        draw(app, terminal);
+        let library = app.library.as_ref().expect("a library has landed");
+        app.browser
+            .open(DirPath::parse(dir).expect("a fixture path"), library);
+        app.focus = Focus::Files;
+        app.request_tags();
+        draw(app, terminal);
+    }
+
+    /// Wait for the tag worker's answer and hand it to the app.
+    ///
+    /// Generous: this is a correctness test and not a timing one, and a machine
+    /// under load must not fail it.
+    fn take_tags(app: &mut App, rx: &mpsc::Receiver<Msg>) -> Vec<String> {
+        loop {
+            let msg = rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the tag worker should answer");
+            if let Msg::TaskDone(outcome) = &msg
+                && let TaskOutcome::Tags(reads) = outcome.as_ref()
+            {
+                let paths = reads
+                    .iter()
+                    .map(|(rel, _)| rel.to_string())
+                    .collect::<Vec<_>>();
+                app.update(msg);
+                return paths;
+            }
+            app.update(msg);
+        }
+    }
+
+    #[test]
+    fn l_and_h_and_enter_and_backspace_navigate_the_tree() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(100, 24);
+        app.update(scanned(&fx));
+        draw(&mut app, &mut terminal);
+
+        // `l` on the tree hands the keyboard to the listing — there is nothing
+        // to open that is not already open — and the second one goes in.
+        assert!(app.update(press('l')));
+        assert_eq!(app.focus, Focus::Files);
+        assert!(app.update(press('l')));
+        assert_eq!(app.browser.dir().as_str(), "coding-music");
+
+        // `enter` goes one deeper.
+        assert!(app.update(key(KeyCode::Enter)));
+        assert_eq!(app.browser.dir().as_str(), "coding-music/SwitchAngel");
+
+        // `backspace` and `h` come back out, one level each.
+        assert!(app.update(key(KeyCode::Backspace)));
+        assert_eq!(app.browser.dir().as_str(), "coding-music");
+        assert!(app.update(press('h')));
+        assert!(app.browser.dir().is_root());
+
+        // And out of the root there is nowhere to go.
+        assert!(!app.update(press('h')));
+        assert!(app.browser.dir().is_root());
+    }
+
+    #[test]
+    fn the_title_and_the_status_bar_follow_the_browser_into_a_directory() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(100, 24);
+        app.update(scanned(&fx));
+
+        go_to(
+            &mut app,
+            &mut terminal,
+            mpdfm_core::testing::names::MF_DOOM_ALBUM,
+        );
+        let drawn = text(&terminal);
+        assert!(
+            drawn.contains("Mm..Food"),
+            "the pane names where it is:\n{drawn}"
+        );
+        assert!(drawn.contains("01 Beef Rap.mp3"), "{drawn}");
+        // The tree shows the path it came down, not just the leaf.
+        assert!(drawn.contains("hiphop"), "{drawn}");
+    }
+
+    #[test]
+    fn marks_persist_across_directories_and_the_status_bar_counts_them() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(100, 24);
+        app.update(scanned(&fx));
+
+        go_to(
+            &mut app,
+            &mut terminal,
+            mpdfm_core::testing::names::MF_DOOM_ALBUM,
+        );
+        assert!(app.update(key(KeyCode::Char(' '))));
+        assert!(app.update(key(KeyCode::Char(' '))));
+        draw(&mut app, &mut terminal);
+        assert!(text(&terminal).contains("2 marked"), "{}", text(&terminal));
+
+        go_to(
+            &mut app,
+            &mut terminal,
+            mpdfm_core::testing::names::KIND_OF_BLUE_ALBUM,
+        );
+        assert!(app.update(key(KeyCode::Char(' '))));
+        draw(&mut app, &mut terminal);
+        assert!(
+            text(&terminal).contains("3 marked"),
+            "a mark in another directory must not have been lost:\n{}",
+            text(&terminal)
+        );
+    }
+
+    #[test]
+    fn v_range_marks_and_a_marks_the_view_and_capital_a_clears_it() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(100, 24);
+        app.update(scanned(&fx));
+        go_to(
+            &mut app,
+            &mut terminal,
+            mpdfm_core::testing::names::MF_DOOM_ALBUM,
+        );
+
+        assert!(app.update(press('v')), "`v` opens a range");
+        draw(&mut app, &mut terminal);
+        assert!(text(&terminal).contains("VISUAL"), "{}", text(&terminal));
+        app.update(press('j'));
+        app.update(press('j'));
+        assert!(app.update(press('v')), "`v` closes it");
+        assert_eq!(app.browser.marked(), 3);
+
+        // `a` takes the whole listing — three tracks and five aux files.
+        assert!(app.update(press('a')));
+        assert_eq!(app.browser.marked(), 8);
+
+        assert!(app.update(press('A')));
+        assert_eq!(app.browser.marked(), 0);
+        draw(&mut app, &mut terminal);
+        assert!(text(&terminal).contains("0 marked"), "{}", text(&terminal));
+    }
+
+    #[test]
+    fn esc_abandons_a_visual_range_before_it_dismisses_a_message() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(100, 24);
+        app.update(scanned(&fx));
+        go_to(
+            &mut app,
+            &mut terminal,
+            mpdfm_core::testing::names::MF_DOOM_ALBUM,
+        );
+
+        app.update(press('v'));
+        app.update(press('j'));
+        assert!(app.update(key(KeyCode::Esc)));
+        assert_eq!(app.browser.marked(), 0, "esc marks nothing");
+        assert!(!app.browser.in_visual());
+    }
+
+    #[test]
+    fn a_non_audio_file_is_on_screen_and_the_details_pane_names_the_playlists() {
+        let fx = Fixture::realistic();
+        let (mut app, rx) = app(&fx);
+        // Wide enough for the third column; the task calls it a wide terminal.
+        let mut terminal = screen(120, 24);
+        app.update(scanned(&fx));
+        go_to(
+            &mut app,
+            &mut terminal,
+            mpdfm_core::testing::names::MF_DOOM_ALBUM,
+        );
+
+        let drawn = text(&terminal);
+        assert!(
+            drawn.contains("folder.jpg"),
+            "the cover art travels too:\n{drawn}"
+        );
+        assert!(drawn.contains("info.nfo"), "{drawn}");
+
+        // The cursor is on `01 Beef Rap.mp3`, which two playlists point at.
+        take_tags(&mut app, &rx);
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+        assert!(drawn.contains("details"), "{drawn}");
+        assert!(drawn.contains("Hip hop"), "{drawn}");
+        assert!(drawn.contains("MF Doom"), "{drawn}");
+        assert!(drawn.contains("2 lines in 2 playlists"), "{drawn}");
+    }
+
+    #[test]
+    fn a_narrow_terminal_drops_the_details_pane_rather_than_the_listing() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(70, 24);
+        app.update(scanned(&fx));
+        go_to(
+            &mut app,
+            &mut terminal,
+            mpdfm_core::testing::names::MF_DOOM_ALBUM,
+        );
+
+        let drawn = text(&terminal);
+        assert!(!drawn.contains("details"), "{drawn}");
+        assert!(drawn.contains("01 Beef Rap.mp3"), "{drawn}");
+    }
+
+    #[test]
+    fn only_the_visible_rows_have_their_tags_read() {
+        let fx = big_album(60);
+        let (mut app, rx) = app(&fx);
+        let mut terminal = screen(100, 24);
+        app.update(scanned(&fx));
+        // Nothing is read before there is a screen to read for.
+        assert!(rx.try_recv().is_err(), "no screen, no reads");
+
+        let before = mpdfm_core::library::audio_reads();
+        go_to(&mut app, &mut terminal, "big");
+        let read = take_tags(&mut app, &rx);
+
+        let visible = app.list_rows();
+        assert!((10..30).contains(&visible), "{visible} is not a screenful");
+        assert_eq!(
+            read.len(),
+            visible,
+            "a 60-file directory on a {visible}-row pane read {} files",
+            read.len()
+        );
+        // And they are the rows at the top of the listing, in order.
+        assert_eq!(read[0], "big/000 track.mp3");
+        assert_eq!(
+            read[visible - 1],
+            format!("big/{:03} track.mp3", visible - 1)
+        );
+        // The counter core keeps is a lower bound here, because the test suite
+        // runs in parallel and it is process-wide.
+        assert!(
+            mpdfm_core::library::audio_reads() >= before + visible as u64,
+            "the files really were opened"
+        );
+
+        // Jumping to the end reads the other end of the listing, and nothing in
+        // the middle that was never on screen.
+        app.update(press('G'));
+        let read = take_tags(&mut app, &rx);
+        assert_eq!(read.len(), visible);
+        assert_eq!(read[visible - 1], "big/059 track.mp3");
+        assert_eq!(
+            app.browser.cached(),
+            visible * 2,
+            "only the two screenfuls that were looked at"
+        );
+
+        // And going back over rows that are already cached reads nothing.
+        app.update(press('g'));
+        app.update(press('g'));
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a cached row must not be read a second time"
+        );
+    }
+
+    #[test]
+    fn a_four_hundred_entry_directory_draws_a_frame_in_well_under_a_millisecond() {
+        // The task's criterion, measured rather than asserted by eye. The bound
+        // is deliberately loose — this runs alongside every other test — and the
+        // number that matters is the one printed, which is recorded in
+        // `docs/tasks/22-browser-view.md`.
+        let fx = big_album(400);
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(120, 40);
+        app.update(scanned(&fx));
+        go_to(&mut app, &mut terminal, "big");
+        assert_eq!(
+            app.browser
+                .row_count(Pane::Files, app.library.as_ref().unwrap()),
+            400
+        );
+
+        // Scroll a row per frame, so every frame lays out a different window and
+        // none of it can be cached between them.
+        let frames = 400;
+        let started = Instant::now();
+        for _ in 0..frames {
+            app.dispatch(Action::Down);
+            terminal
+                .draw(|frame| app.render(frame.area(), frame))
+                .expect("drawing should work");
+        }
+        let each = started.elapsed() / frames;
+        eprintln!(
+            "400-row browser: {} µs per frame ({} build)",
+            each.as_micros(),
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }
+        );
+        // 130 µs released and 1.4 ms unoptimized on the author's machine, both
+        // recorded in the task. The bound is what "smooth" means at 60 Hz with
+        // room to spare, and is loose enough to survive a loaded test runner.
+        assert!(
+            each < Duration::from_millis(5),
+            "{} µs per frame is not smooth scrolling",
+            each.as_micros()
+        );
+    }
+
+    #[test]
+    fn a_cjk_name_renders_without_breaking_the_columns() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(120, 24);
+        app.update(scanned(&fx));
+        go_to(
+            &mut app,
+            &mut terminal,
+            mpdfm_core::testing::names::KREAM_ALBUM,
+        );
+
+        let drawn = text(&terminal);
+        assert!(drawn.contains("01 So Hï.mp3"), "{drawn}");
+        assert!(drawn.contains("03 ノスタルジア.mp3"), "{drawn}");
+
+        // Every pane border is in the same column on every row of the body.
+        // That is what a width bug destroys: one cell too many on the CJK row
+        // and the listing's right-hand border is pushed into the details pane.
+        //
+        // At 120 cells the panes are 30 + 64 + 26, so the verticals are here:
+        let buffer = terminal.backend().buffer();
+        let [tree, files, details] = panes(app.body());
+        for y in 2..21 {
+            for x in [
+                tree.x,
+                tree.right() - 1,
+                files.x,
+                files.right() - 1,
+                details.x,
+                details.right() - 1,
+            ] {
+                assert_eq!(
+                    buffer[(x, y)].symbol(),
+                    "│",
+                    "row {y} has no pane border at column {x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_directory_and_an_unreadable_one_both_say_which_they_are() {
+        let fx = Fixture::builder().album("pop/fine", &["a.mp3"]).build();
+        std::fs::create_dir(fx.music_dir().join("pop/nothing")).expect("mkdir");
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(100, 24);
+        app.update(scanned(&fx));
+
+        go_to(&mut app, &mut terminal, "pop/nothing");
+        let drawn = text(&terminal);
+        assert!(drawn.contains("empty directory"), "{drawn}");
+        // The chrome is still there: an empty directory is not an error.
+        assert!(drawn.contains("MPDFM"), "{drawn}");
+        assert!(drawn.contains("0 marked"), "{drawn}");
+    }
+
+    #[test]
+    fn a_scan_warning_shows_as_a_badge_rather_than_being_swallowed() {
+        // A name that is not UTF-8: scanned, skipped, warned about.
+        let fx = Fixture::builder()
+            .album("pop/fine", &["a.mp3"])
+            .non_utf8_file("pop/fine", b"bad\xff.mp3")
+            .build();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(100, 24);
+        app.update(scanned(&fx));
+        draw(&mut app, &mut terminal);
+
+        assert!(app.warnings > 0, "the fixture should have produced one");
+        let drawn = text(&terminal);
+        assert!(drawn.contains("warning"), "{drawn}");
+    }
+
+    #[test]
+    fn set_sort_changes_the_order_and_is_remembered() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(100, 24);
+        app.update(scanned(&fx));
+        assert_eq!(app.browser.sort(), Sort::Name);
+
+        app.update(press(':'));
+        type_in(&mut app, "set sort=size");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.browser.sort(), Sort::Size);
+        draw(&mut app, &mut terminal);
+        assert!(text(&terminal).contains("sort size"), "{}", text(&terminal));
+
+        // It outlives a change of directory, which is what "per session" means.
+        go_to(
+            &mut app,
+            &mut terminal,
+            mpdfm_core::testing::names::MF_DOOM_ALBUM,
+        );
+        assert_eq!(app.browser.sort(), Sort::Size);
+    }
+
+    #[test]
+    fn a_sort_nobody_has_lists_the_ones_there_are() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        app.toasts.clear();
+
+        app.update(press(':'));
+        type_in(&mut app, "set sort=alphabetical");
+        app.update(key(KeyCode::Enter));
+
+        let toast = app.toasts.front().expect("it should say something");
+        assert!(toast.text.contains("alphabetical"), "{}", toast.text);
+        assert!(toast.text.contains("mtime"), "{}", toast.text);
+        assert_eq!(app.browser.sort(), Sort::Name, "and nothing changed");
+    }
+
+    #[test]
+    fn a_setting_nothing_applies_still_says_so() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        app.toasts.clear();
+
+        app.update(press(':'));
+        type_in(&mut app, "set backup_keep=20");
+        app.update(key(KeyCode::Enter));
+        let toast = app.toasts.front().expect("it should say something");
+        assert!(toast.text.contains("backup_keep"), "{}", toast.text);
+        assert_eq!(toast.level, Level::Warn);
+    }
+
+    #[test]
+    fn a_tag_read_that_fails_marks_the_row_and_does_not_open_a_panel() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(120, 24);
+        app.update(scanned(&fx));
+        go_to(
+            &mut app,
+            &mut terminal,
+            mpdfm_core::testing::names::MF_DOOM_ALBUM,
+        );
+
+        let rel = mpdfm_core::paths::RelPath::parse(mpdfm_core::testing::names::MF_DOOM_TRACK)
+            .expect("a fixture path");
+        app.update(Msg::TaskDone(Box::new(TaskOutcome::Tags(vec![(
+            rel,
+            Err("not a container MPDFM edits".to_owned()),
+        )]))));
+
+        assert_eq!(app.views, vec![View::Browser], "no panel for one bad file");
+        draw(&mut app, &mut terminal);
+        assert!(
+            text(&terminal).contains("not a container"),
+            "the details pane should say why:\n{}",
+            text(&terminal)
+        );
     }
 }
