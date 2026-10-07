@@ -58,7 +58,7 @@ losing one malformed frame `lofty` will not re-emit. Numbers in task 17.
 | 20 | [TUI shell and event loop](tasks/20-tui-shell.md) | 01, 04 | done |
 | 21 | [Configurable vim keymap](tasks/21-keymap.md) | 20 | done |
 | 22 | [Library browser view](tasks/22-browser-view.md) | 05, 16, 20, 21 | done |
-| 23 | [Tag editor view](tasks/23-tagedit-view.md) | 16–18, 21, 22 | not started |
+| 23 | [Tag editor view](tasks/23-tagedit-view.md) | 16–18, 21, 22 | done |
 | 24 | [Pending ops view](tasks/24-pending-view.md) | 10–12, 20, 21 | not started |
 | 25 | [Search and filter](tasks/25-search-and-filter.md) | 05, 16, 22 | not started |
 | 26 | [Status bar, help, errors](tasks/26-tui-chrome.md) | 13, 20, 21 | not started |
@@ -70,7 +70,10 @@ tested three ways: a guard, a panic hook, and `SIGTERM` turned into an ordinary
 message. Measured on the real library: a 3 132-file startup scan in 11 ms on a
 worker thread, and under 0.1% of one core when the session is idle. Task 22 adds
 the browser, which walks those 318 directories at 130 µs a frame and reads tags
-for the rows on screen and no others — 35 files for a 170-track directory.
+for the rows on screen and no others — 35 files for a 170-track directory. Task 23
+adds the tag editor, measured on a copy of a real 70-track album: the selection is
+read in 13 ms warm, and `W` stages and commits all 70 files in 210 ms, with `u`
+putting every byte back in 100 ms.
 
 ## M4 — Organize by template
 

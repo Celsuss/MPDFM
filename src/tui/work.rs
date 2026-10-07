@@ -17,7 +17,24 @@
 //!   failure should look like on screen;
 //! - **a failed send is the end of the job.** It means the loop has gone, and the
 //!   worker's answer is of no interest to anybody.
+//!
+//! # The two that write
+//!
+//! [`commit`] and [`undo`] are the only workers that change anything, and they
+//! are here for a stronger reason than responsiveness: a tag write copies the
+//! whole original file into the transaction's backup before touching it
+//! (`docs/tasks/17-tag-write.md`), so `W` on two hundred marked files is seconds
+//! of I/O. On the drawing thread that is a frozen screen in the middle of the one
+//! operation the user most wants to see finish.
+//!
+//! They take **clones** of the plan, the library and the effects the user agreed
+//! to rather than borrowing the app's model, which is what lets the UI keep
+//! drawing — and redrawing from a model nobody else is holding — while the files
+//! are rewritten. Commit re-validates what it is given and refuses on
+//! [`Drift`][mpdfm_core::ops::commit::Drift] if the answer has changed since, so
+//! the clone cannot become a stale write.
 
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::thread;
@@ -25,14 +42,18 @@ use std::time::{Duration, Instant};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use mpdfm_core::config::Config;
-use mpdfm_core::library::Library;
-use mpdfm_core::mpd::{self};
+use mpdfm_core::journal::store::Store;
+use mpdfm_core::journal::undo;
+use mpdfm_core::library::{DirPath, Library};
+use mpdfm_core::mpd::{self, Mpd};
+use mpdfm_core::ops::commit::{self, Previewed};
+use mpdfm_core::ops::{Effects, Plan};
 use mpdfm_core::paths::RelPath;
 use mpdfm_core::playlist::PlaylistIndex;
 use mpdfm_core::tags;
 
 use super::log::Log;
-use super::msg::{MpdSnapshot, MpdState, Msg, ScanOutcome, TaskOutcome, TrackInfo};
+use super::msg::{MpdSnapshot, MpdState, Msg, Reads, ScanOutcome, TaskOutcome, TrackInfo};
 
 /// How long MPD gets to answer the status poll.
 ///
@@ -130,26 +151,54 @@ pub fn scan(tx: Sender<Msg>, music_dir: Utf8PathBuf, playlist_dir: Utf8PathBuf, 
 /// will not read is an `Err` in its own slot and not an end of the batch: the
 /// other rows on screen still get their numbers.
 pub fn read_tags(tx: Sender<Msg>, paths: Vec<RelPath>, root: Utf8PathBuf, log: Arc<Log>) {
+    read(tx, paths, root, log, "tags", TaskOutcome::Tags);
+}
+
+/// Read every file the tag editor was opened on.
+///
+/// [`read_tags`] answers a different question: the bulk view has to see the
+/// whole selection before it can say `<multiple>` honestly, so this is the one
+/// read whose cost is the user's selection rather than the screen — a few
+/// hundred files at the outside (`docs/tasks/23-tagedit-view.md`), which is why
+/// it is a worker and not part of the keypress that opens the form.
+pub fn read_selection(tx: Sender<Msg>, paths: Vec<RelPath>, root: Utf8PathBuf, log: Arc<Log>) {
+    read(tx, paths, root, log, "selection", TaskOutcome::Selection);
+}
+
+/// The body both reads share: one thread, one message, whatever happened.
+///
+/// `wrap` is the only difference between them, and it is a function pointer
+/// rather than two copies of the thread because the part that must not drift is
+/// "exactly one answer comes back" — the app holds a flag or a half-open view
+/// that a missing answer would strand.
+fn read(
+    tx: Sender<Msg>,
+    paths: Vec<RelPath>,
+    root: Utf8PathBuf,
+    log: Arc<Log>,
+    what: &'static str,
+    wrap: fn(Reads) -> TaskOutcome,
+) {
     let fallback = tx.clone();
     let spawned = thread::Builder::new()
-        .name("mpdfm-tags".to_owned())
+        .name(format!("mpdfm-{what}"))
         .spawn(move || {
             let started = Instant::now();
             let reads = read_window(&paths, &root);
             if log.is_on() {
                 let failed = reads.iter().filter(|(_, read)| read.is_err()).count();
                 log.line(format!(
-                    "tags: read {} file(s) in {} µs, {failed} failed",
+                    "{what}: read {} file(s) in {} µs, {failed} failed",
                     reads.len(),
                     started.elapsed().as_micros()
                 ));
             }
-            let _ = tx.send(Msg::TaskDone(Box::new(TaskOutcome::Tags(reads))));
+            let _ = tx.send(Msg::TaskDone(Box::new(wrap(reads))));
         });
 
     if let Err(err) = spawned {
         let _ = fallback.send(Msg::TaskDone(Box::new(TaskOutcome::Failed {
-            what: "read tags".to_owned(),
+            what: format!("read {what}"),
             message: format!("cannot start the tag thread: {err}"),
         })));
     }
@@ -161,10 +210,7 @@ pub fn read_tags(tx: Sender<Msg>, paths: Vec<RelPath>, root: Utf8PathBuf, log: A
 /// [`library::audio_reads`][mpdfm_core::library::audio_reads] and in wall-clock —
 /// without a thread in the way.
 #[must_use]
-pub fn read_window(
-    paths: &[RelPath],
-    root: &Utf8Path,
-) -> Vec<(RelPath, Result<TrackInfo, String>)> {
+pub fn read_window(paths: &[RelPath], root: &Utf8Path) -> Reads {
     paths
         .iter()
         .map(|rel| {
@@ -249,4 +295,170 @@ fn read_state(mpd: &mut mpd::Mpd) -> Result<MpdState, mpd::MpdError> {
         song,
         updating: status.updating_db.is_some(),
     })
+}
+
+/// Commit a staged plan: write the files, rewrite the playlists, journal it all.
+///
+/// One [`TaskOutcome::Committed`] comes back whatever happened. Nothing is
+/// written when the plan is refused — commit's own step 0 checks the conflicts it
+/// was handed before it opens the journal — so a failure here is either "nothing
+/// happened and this is why" or a partial transaction the record can be recovered
+/// from, and the message says which.
+///
+/// Task 24 owns the progress indicator and the cancellation this grows into; what
+/// is here is the path `W` in the tag editor needs.
+pub fn commit(
+    tx: Sender<Msg>,
+    plan: Plan,
+    library: Library,
+    effects: Effects,
+    config: Config,
+    log: Arc<Log>,
+) {
+    let fallback = tx.clone();
+    let spawned = thread::Builder::new()
+        .name("mpdfm-commit".to_owned())
+        .spawn(move || {
+            let started = Instant::now();
+            log.line(format!(
+                "commit: {} operation(s), {} step(s)",
+                plan.len(),
+                effects.fs_steps.len()
+            ));
+
+            // MPD is told which directories changed: a tag write advances the
+            // mtime, and the daemon's index is otherwise a version behind until
+            // its next update of its own.
+            let mpd = MpdLink::open(&config, &log);
+            let update = |dirs: &[DirPath]| mpd.update(dirs);
+            let options = commit::Options {
+                update: mpd.connected().then_some(&update as commit::Updater<'_>),
+                ..commit::Options::default()
+            };
+            let previewed = Previewed {
+                plan: &plan,
+                library: &library,
+                effects: &effects,
+            };
+
+            let outcome = match commit::commit_with(&previewed, &config, &options) {
+                Ok(committed) => {
+                    log.line(format!(
+                        "commit: {} in {} ms",
+                        committed.txid,
+                        started.elapsed().as_millis()
+                    ));
+                    Ok(Box::new(committed))
+                }
+                Err(err) => {
+                    log.line(format!("commit: failed: {err}"));
+                    Err(err.to_string())
+                }
+            };
+            let _ = tx.send(Msg::TaskDone(Box::new(TaskOutcome::Committed(outcome))));
+        });
+
+    if let Err(err) = spawned {
+        let _ = fallback.send(Msg::TaskDone(Box::new(TaskOutcome::Committed(Err(
+            format!("cannot start the commit thread: {err}"),
+        )))));
+    }
+}
+
+/// Reverse the most recent undoable transaction.
+///
+/// The newest first, skipping what cannot be undone — which is
+/// [`undo::latest`]'s rule and `mpdfm undo` with no argument. A transaction that
+/// is merely *blocked* because something has changed since comes back as an
+/// error naming what changed; nothing is forced from here, because `--force`
+/// skips steps and skipping a step is not a thing to do to somebody by accident.
+pub fn undo(tx: Sender<Msg>, config: Config, log: Arc<Log>) {
+    let fallback = tx.clone();
+    let spawned = thread::Builder::new()
+        .name("mpdfm-undo".to_owned())
+        .spawn(move || {
+            let outcome = reverse_latest(&config, &log);
+            if let Err(err) = &outcome {
+                log.line(format!("undo: {err}"));
+            }
+            let _ = tx.send(Msg::TaskDone(Box::new(TaskOutcome::Undone(outcome))));
+        });
+
+    if let Err(err) = spawned {
+        let _ = fallback.send(Msg::TaskDone(Box::new(TaskOutcome::Undone(Err(format!(
+            "cannot start the undo thread: {err}"
+        ))))));
+    }
+}
+
+/// The body of [`undo`], synchronously, with every error already rendered.
+fn reverse_latest(
+    config: &Config,
+    log: &Log,
+) -> Result<Box<mpdfm_core::journal::Reversed>, String> {
+    let store = Store::at(&config.data_dir);
+    let record = undo::latest(&store).map_err(|err| err.to_string())?;
+    log.line(format!("undo: reversing {}", record.txid));
+
+    let mpd = MpdLink::open(config, log);
+    let update = |dirs: &[DirPath]| mpd.update(dirs);
+    let options = undo::Options {
+        force: false,
+        update: mpd.connected().then_some(&update as commit::Updater<'_>),
+    };
+    undo::undo(&store, &record, config, &options)
+        .map(Box::new)
+        .map_err(|err| err.to_string())
+}
+
+/// The TUI's half of the MPD arrangement, for the one thing a commit needs from
+/// the daemon: `update`.
+///
+/// Not [`cli::mpd::Link`][crate::cli::mpd::Link], which reports what went wrong
+/// on stderr — here that is the alternate screen, and a warning printed over a
+/// drawn frame is a corrupted frame. This logs instead.
+///
+/// It also deliberately does **not** read the queue. The preview was made with
+/// [`Live::default`][mpdfm_core::ops::Live], commit re-validates with whatever it
+/// is given, and a queue read here would make the two disagree — which is
+/// [`Drift`][commit::Drift] and a refused commit, not extra information.
+struct MpdLink {
+    /// Behind a [`RefCell`] because core takes the updater as a `Fn`, and talking
+    /// on a socket needs `&mut`. One connection, one use.
+    client: Option<RefCell<Mpd>>,
+}
+
+impl MpdLink {
+    /// Connect, or note why there is no connection. Never fails: an MPD that is
+    /// not running is a normal state of the world and the filesystem is the
+    /// source of truth (`docs/PLAN.md` D6).
+    fn open(config: &Config, log: &Log) -> Self {
+        let client = match mpd::connect_if_enabled(config, mpd::DEFAULT_TIMEOUT, None) {
+            Ok(client) => client,
+            Err(err) => {
+                log.line(format!("mpd: {err}"));
+                None
+            }
+        };
+        Self {
+            client: client.map(RefCell::new),
+        }
+    }
+
+    /// Whether there is a daemon to tell about a commit.
+    fn connected(&self) -> bool {
+        self.client.is_some()
+    }
+
+    /// Ask MPD to rescan these directories.
+    fn update(&self, dirs: &[DirPath]) -> Result<(), String> {
+        let Some(client) = &self.client else {
+            return Ok(());
+        };
+        client
+            .borrow_mut()
+            .update_dirs(dirs)
+            .map(|_jobs| ())
+            .map_err(|err| err.to_string())
+    }
 }

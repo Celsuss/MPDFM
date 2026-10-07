@@ -17,8 +17,14 @@
 //!
 //! Task 20 owns the shell the views live in and the one guarantee that is hard to
 //! add later — **the terminal is always restored**, see `terminal.rs` — task 21
-//! owns the vocabulary they dispatch through, and task 22 the first of them.
-//! Tasks 23–26 fill in the rest.
+//! owns the vocabulary they dispatch through, task 22 the browser and task 23 the
+//! tag editor. Tasks 24–26 fill in the rest.
+//!
+//! Task 23 is also where `work` grew the two jobs that *write* — a commit and an
+//! undo — for a stronger reason than responsiveness: a tag write copies the whole
+//! original file into the transaction's backup before touching it, so `W` on two
+//! hundred marked files is seconds of I/O on a thread that must not be the one
+//! drawing.
 //!
 //! # Start-up order
 //!

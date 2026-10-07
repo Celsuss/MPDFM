@@ -530,3 +530,49 @@ fn a_bulk_edit_is_undone_by_one_undo() {
 
     before.assert_same(&Snapshot::capture(txn.fx.music_dir()));
 }
+
+/// Two edit sets over the same files fold into one operation per file, and the
+/// later set wins the field they share.
+///
+/// `tags::merge` moved into core when the TUI's tag editor needed it (task 23):
+/// the editor folds its typed fields together with the per-file actions the user
+/// accepted, which is exactly what `mpdfm tag set --genre X --renumber-tracks`
+/// does. One definition, so the two front-ends cannot disagree about which of
+/// two edits to one field is the one that happens.
+#[test]
+fn merging_edit_sets_gives_one_operation_per_file_and_the_later_set_wins() {
+    let one = rel("a/1.mp3");
+    let two = rel("a/2.mp3");
+
+    let merged = tags::merge(vec![
+        vec![
+            (one.clone(), TagDelta::new().set(Field::Genre, "Hip Hop")),
+            (two.clone(), TagDelta::new().set(Field::Genre, "Hip Hop")),
+        ],
+        // A typed track, then a renumbering of the same field.
+        vec![(one.clone(), TagDelta::new().set(Field::Track, "3/9"))],
+        vec![(one.clone(), TagDelta::new().set(Field::Track, "1/2"))],
+        // And a delta that folds down to nothing at all.
+        vec![(two.clone(), TagDelta::new())],
+    ]);
+
+    assert_eq!(merged.len(), 2, "one entry per file: {merged:?}");
+    let (first, delta) = &merged[0];
+    assert_eq!(first, &one);
+    assert_eq!(delta.len(), 2, "both fields in one operation");
+    assert_eq!(
+        delta.get(Field::Track),
+        Some(&Edit::Set(Values::one("1/2"))),
+        "the later set is the one that happens"
+    );
+    assert_eq!(merged[1].0, two);
+    assert_eq!(merged[1].1.len(), 1, "the empty delta added nothing");
+}
+
+/// A file whose every edit folds away is left out entirely, so a merge cannot
+/// produce an operation that would write nothing.
+#[test]
+fn merging_nothing_produces_nothing() {
+    assert!(tags::merge(Vec::new()).is_empty());
+    assert!(tags::merge(vec![vec![(rel("a/1.mp3"), TagDelta::new())]]).is_empty());
+}

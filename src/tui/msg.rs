@@ -22,7 +22,9 @@
 use std::time::Duration;
 
 use crossterm::event::Event;
+use mpdfm_core::journal::Reversed;
 use mpdfm_core::library::{Library, ScanProgress};
+use mpdfm_core::ops::commit::Committed;
 use mpdfm_core::paths::RelPath;
 use mpdfm_core::playlist::{IndexWarning, PlaylistIndex};
 use mpdfm_core::tags::{AudioInfo, TagSet};
@@ -55,8 +57,9 @@ pub enum Msg {
     /// the start rather than retrofitted onto it.
     MpdStatus(Box<MpdSnapshot>),
 
-    /// A worker that was not a scan finished. Tag reads for a window (task 22)
-    /// arrive here, and commits (task 24) will.
+    /// A worker that was not a scan finished. Tag reads for a window (task 22),
+    /// the tag editor's selection and the transactions it commits (task 23) all
+    /// arrive here.
     TaskDone(Box<TaskOutcome>),
 
     /// The process was asked to stop — `SIGTERM`, `SIGHUP`, or a `SIGINT` from
@@ -117,19 +120,34 @@ pub struct MpdState {
 
 /// What a worker that was not a scan produced.
 ///
-/// The point of the type is that task 22's tag reads and task 24's commits have
-/// a way home that does not involve adding a variant to [`Msg`] and touching the
-/// loop.
+/// The point of the type is that task 22's tag reads and the transactions tasks
+/// 23 and 24 commit have a way home that does not involve adding a variant to
+/// [`Msg`] and touching the loop.
 #[derive(Debug)]
 pub enum TaskOutcome {
     /// A window of files was read for the browser (task 22).
     ///
-    /// One entry per path asked for, in the order they were asked for, each
-    /// holding either what was read or the reason that one file failed — the
-    /// same shape [`read_many`][mpdfm_core::tags::read_many] uses, and for the
-    /// same reason: one corrupt track in an album of fourteen must not take the
-    /// other thirteen's metadata away.
-    Tags(Vec<(RelPath, Result<TrackInfo, String>)>),
+    /// See [`Reads`] for the shape, which is also the one a failure takes.
+    Tags(Reads),
+
+    /// Every file the tag editor was opened on was read (task 23).
+    ///
+    /// A whole selection and not a window, which is why it is not
+    /// [`TaskOutcome::Tags`]: the editor cannot say `<multiple>` honestly until
+    /// it has every file's tags, so this is up to a few hundred files read in one
+    /// go — on a worker, with the form on screen saying what it is waiting for.
+    Selection(Reads),
+
+    /// A transaction was committed, or refused before anything was written.
+    ///
+    /// Task 24 owns the pending view's version of this, with the progress
+    /// indicator and the cancellation. What task 23 needs is the answer: `W` in
+    /// the tag editor rewrites up to a few hundred files, and the thread that
+    /// draws must never be the thread that waits for them.
+    Committed(Result<Box<Committed>, String>),
+
+    /// A transaction was reversed, or could not be.
+    Undone(Result<Box<Reversed>, String>),
 
     /// Something went wrong on a worker thread, with the full message.
     ///
@@ -143,6 +161,15 @@ pub enum TaskOutcome {
         message: String,
     },
 }
+
+/// What a batch of tag reads produced: one entry per path asked for, in the
+/// order they were asked for, each holding either what was read or the reason
+/// that one file failed.
+///
+/// The same shape [`read_many`][mpdfm_core::tags::read_many] uses, and for the
+/// same reason: one corrupt track in an album of fourteen must not take the other
+/// thirteen's metadata away.
+pub type Reads = Vec<(RelPath, Result<TrackInfo, String>)>;
 
 /// What one tag read produced: the metadata, and the properties of the audio
 /// itself.

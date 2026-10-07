@@ -267,10 +267,15 @@ impl Browser {
 
     /// Everything marked, in path order — what a staged operation would take.
     ///
-    /// The seam to task 24: it is the plan builder's input, and until there is
-    /// one the only caller is the test that proves marks survive a change of
-    /// directory.
-    #[cfg(test)]
+    /// The seam to the tasks that change things: the tag editor opens on this
+    /// (task 23) and the plan builder will stage it (task 24). Path order and not
+    /// mark order, because a selection of two hundred files across two albums has
+    /// to be *readable* in the preview, and the order somebody happened to press
+    /// `space` in is not.
+    ///
+    /// Directories can be marked too ([`Browser::mark_all`] marks them), so what
+    /// comes back is paths and not tracks; the caller decides what a directory
+    /// means to it.
     #[must_use]
     pub fn marks(&self) -> Vec<RelPath> {
         let mut marks: Vec<RelPath> = self.marks.iter().cloned().collect();

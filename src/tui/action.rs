@@ -125,6 +125,26 @@ actions! {
 
     /// Open the tag editor on the marks, or on the row under the cursor.
     EditTags => "edit_tags", "edit tags";
+    /// Type into the field under the cursor.
+    ///
+    /// The tag editor's `i`. Separate from [`Action::Open`] because a form has
+    /// two states — moving between fields and typing into one — and `enter`
+    /// means "accept" in the second of them.
+    EditField => "edit_field", "type into this field";
+    /// Remove the field under the cursor from every selected file.
+    ///
+    /// The explicit clear a `<multiple>` field needs: leaving such a field alone
+    /// and asking for it to be emptied are different requests
+    /// (`docs/tasks/18-tag-bulk.md`).
+    ClearField => "clear_field", "clear this field";
+    /// Give every selected file its title from its own file name.
+    TitleFromFilename => "title_from_filename", "titles from filenames";
+    /// Number the selected files 1..n in the order they are shown.
+    RenumberTracks => "renumber_tracks", "renumber tracks";
+    /// Stage the tag editor's changes into the pending plan.
+    StageTags => "stage_tags", "stage the tag edit";
+    /// Stage the tag editor's changes and commit the plan at once.
+    StageAndCommit => "stage_and_commit", "stage the tag edit and commit";
     /// Stage a move of the marks.
     StageMove => "stage_move", "stage a move of the marks";
     /// Rename the row under the cursor.

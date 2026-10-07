@@ -51,7 +51,7 @@ pub mod model;
 pub mod read;
 pub mod write;
 
-pub use bulk::{BulkView, FieldValue, MULTIPLE, title_from_filename};
+pub use bulk::{BulkView, FieldValue, MULTIPLE, merge, title_from_filename};
 pub use model::{
     AudioInfo, FIELDS, Field, NumberPair, SEPARATOR, TagSet, Values, parse_pair, render_pair,
 };

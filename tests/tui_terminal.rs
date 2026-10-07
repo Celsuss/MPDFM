@@ -188,9 +188,14 @@ fn pty_inner(world: &World, scratch: &Utf8Path, shell: &str, typing: Typing<'_>)
             // A second of grace before the first key, so the scan has landed and
             // the loop is drawing; a third of a second between them, which is
             // three hundred times a frame.
+            // `%b` and not `%s`, so a key that is not a character can be
+            // written as its escape: `\\033` is `esc` and `\\n` is `enter`,
+            // which the tag editor's tests need and no plain character can
+            // spell. A key that holds no backslash — every letter, and a `ï` —
+            // goes through `%b` unchanged.
             let mut feeder = String::from("sleep 1");
             for key in keys {
-                feeder.push_str(&format!("; printf '%s' {key:?}; sleep 0.3"));
+                feeder.push_str(&format!("; printf '%b' {key:?}; sleep 0.3"));
             }
             format!("{{ {feeder}; }} | {script}")
         }
@@ -704,4 +709,59 @@ fn the_browser_walks_into_a_directory_and_reads_what_is_on_screen() {
         visible.contains('\u{25cf}'),
         "nothing was marked:\n{visible}"
     );
+}
+
+/// The form the user spends most of their time in, on a terminal that is really a
+/// terminal (task 23).
+///
+/// What this adds to the in-process tests: **a multi-byte character typed as a
+/// keypress.** A `TestBackend` test constructs a `KeyEvent::Char('ï')` and proves
+/// the form does the right thing with it; only a pty proves that two bytes
+/// arriving from a terminal become one character in the field. It also exercises
+/// the terminal's own cursor being placed inside a field, which has no in-process
+/// equivalent either.
+///
+/// Read-only, like every other test in this file: the editor is opened and typed
+/// into, and nothing is staged or committed.
+#[test]
+fn the_tag_editor_takes_a_multi_byte_character_typed_at_a_real_terminal() {
+    if !have_script() {
+        skip("the_tag_editor_takes_a_multi_byte_character_typed_at_a_real_terminal");
+        return;
+    }
+    let world = World::realistic();
+    world.assert_hermetic();
+
+    // `l j l l` is the walk the browser test takes into `electronic/KREAM …`,
+    // `e` opens the editor on the track under the cursor, `i` starts typing into
+    // the title, and `esc` leaves the field — which is when the form works out
+    // what is modified.
+    let run = pty_typed(
+        &world,
+        &scratch(&world, "tagedit"),
+        "\"$BIN\" --config \"$CONFIG\" --no-mpd & \
+         pid=$!; sleep 7; kill -TERM $pid; wait $pid",
+        &["l", "j", "l", "l", "e", "i", "H", "ï", "\\033"],
+    );
+
+    assert_eq!(run.code, 0, "{}", run.visible());
+    run.assert_terminal_restored();
+
+    let visible = run.visible();
+    assert!(visible.contains("Edit tags"), "{visible}");
+    // Every field has a row, including the one whose label is two words.
+    assert!(visible.contains("Album artist"), "{visible}");
+    // The two bytes became one character in the field.
+    assert!(
+        visible.contains("Hï"),
+        "the typed character did not reach the field:\n{visible}"
+    );
+    // And leaving the field is what listed it as modified — which is also the
+    // proof that `esc` closed the field rather than the form.
+    assert!(
+        visible.contains("modified: title"),
+        "the form did not record the edit:\n{visible}"
+    );
+    // Nothing was staged, and nothing was written.
+    assert!(visible.contains("0 pending"), "{visible}");
 }
