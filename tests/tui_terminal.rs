@@ -118,6 +118,30 @@ fn skip(test: &str) {
 /// surrounding script captures `stty -g` on both sides of it, which is the
 /// measurement these tests exist for.
 fn pty(world: &World, scratch: &Utf8Path, shell: &str, keys: &str) -> PtyRun {
+    pty_inner(world, scratch, shell, Typing::AtOnce(keys))
+}
+
+/// [`pty`], but typing the keys one at a time with a pause between them.
+///
+/// Fed from a file, the whole script is in the pty's input queue before the TUI
+/// has entered raw mode, and what the line discipline does with it then is not
+/// something a test should depend on — task 21 found the same thing with
+/// `enter`. Driving `script`'s stdin from a pipe with `sleep`s in it makes each
+/// key a real keypress at a moment the loop is running, which is what a test
+/// about *sequences* of keys needs.
+fn pty_typed(world: &World, scratch: &Utf8Path, shell: &str, keys: &[&str]) -> PtyRun {
+    pty_inner(world, scratch, shell, Typing::Paced(keys))
+}
+
+/// How the keys reach the pty.
+enum Typing<'a> {
+    /// All at once, from a file. Fine for one key, and for none.
+    AtOnce(&'a str),
+    /// One at a time, with a pause between them.
+    Paced(&'a [&'a str]),
+}
+
+fn pty_inner(world: &World, scratch: &Utf8Path, shell: &str, typing: Typing<'_>) -> PtyRun {
     std::fs::create_dir_all(scratch).expect("the fixture root is writable");
     let runner = scratch.join("run.sh");
     let keyfile = scratch.join("keys");
@@ -148,9 +172,31 @@ fn pty(world: &World, scratch: &Utf8Path, shell: &str, keys: &str) -> PtyRun {
         ),
     )
     .expect("writing the runner");
-    std::fs::write(&keyfile, keys).expect("writing the keys");
 
-    let mut command = Command::new("script");
+    // One command line either way, so the two paths differ in how stdin is fed
+    // and in nothing else.
+    let script = format!(
+        "script --quiet --return --command {:?} /dev/null",
+        format!("sh {runner}")
+    );
+    let line = match typing {
+        Typing::AtOnce(keys) => {
+            std::fs::write(&keyfile, keys).expect("writing the keys");
+            format!("{script} < {keyfile:?}", keyfile = keyfile.as_str())
+        }
+        Typing::Paced(keys) => {
+            // A second of grace before the first key, so the scan has landed and
+            // the loop is drawing; a third of a second between them, which is
+            // three hundred times a frame.
+            let mut feeder = String::from("sleep 1");
+            for key in keys {
+                feeder.push_str(&format!("; printf '%s' {key:?}; sleep 0.3"));
+            }
+            format!("{{ {feeder}; }} | {script}")
+        }
+    };
+
+    let mut command = Command::new("sh");
     command
         .env_clear()
         // A real terminal type: `TERM=dumb`, which the rest of this directory
@@ -159,10 +205,8 @@ fn pty(world: &World, scratch: &Utf8Path, shell: &str, keys: &str) -> PtyRun {
         .env("TERM", "xterm-256color")
         .env("BIN", env!("CARGO_BIN_EXE_mpdfm"))
         .env("CONFIG", world.config_file().as_str())
-        .args(["--quiet", "--return", "--command"])
-        .arg(format!("sh {runner}"))
-        .arg("/dev/null")
-        .stdin(std::fs::File::open(&keyfile).expect("the key file is readable"))
+        .args(["-c", &line])
+        .stdin(std::process::Stdio::null())
         .stdout(std::fs::File::create(&recorded).expect("the fixture root is writable"))
         .stderr(std::process::Stdio::piped());
 
@@ -606,4 +650,58 @@ fn the_help_overlay_documents_the_keymap_the_run_is_actually_using() {
     // first page, which is what makes the negative assertion above mean something.
     assert!(visible.contains("move"), "{visible}");
     assert!(visible.contains("first"), "{visible}");
+}
+
+/// Task 22, through the real binary: the browser walks into a directory, reads
+/// the tags of the rows on screen and marks a file.
+///
+/// Everything here is covered in process in `src/tui/views/browser.rs` against a
+/// `TestBackend`. What is only testable here is that the whole chain works on a
+/// terminal that is really a terminal: a worker thread opening real audio files
+/// while the loop draws, a listing of names with a `ï` in them going through a
+/// pty, and a mark reaching the status bar. It is also the one place the tag
+/// reader runs against files on disk rather than against a payload a test
+/// constructed.
+#[test]
+fn the_browser_walks_into_a_directory_and_reads_what_is_on_screen() {
+    if !have_script() {
+        skip("the_browser_walks_into_a_directory_and_reads_what_is_on_screen");
+        return;
+    }
+    let world = World::realistic();
+
+    // `l` moves the keyboard to the listing, `j` steps from `coding-music` to
+    // `electronic`, `l` enters it, `l` again enters the one album inside, and
+    // `space` marks its first track. Ended by a signal rather than a `q`,
+    // because the loop folds everything already in the pty's buffer into one
+    // frame and a trailing `q` would quit before any of this was drawn.
+    let run = pty_typed(
+        &world,
+        &scratch(&world, "browse"),
+        "\"$BIN\" --config \"$CONFIG\" --no-mpd & \
+         pid=$!; sleep 5; kill -TERM $pid; wait $pid",
+        &["l", "j", "l", "l", " "],
+    );
+
+    assert_eq!(run.code, 0, "{}", run.visible());
+    run.assert_terminal_restored();
+
+    let visible = run.visible();
+    // It got into `electronic/KREAM - So Hï …` and listed what is in it. The
+    // `ï` survived the round trip through a real terminal, which is the half of
+    // the non-ASCII criterion a `TestBackend` cannot check.
+    assert!(visible.contains("KREAM"), "{visible}");
+    assert!(visible.contains("So H\u{ef}"), "{visible}");
+
+    // A tag read came back for a row on screen — only the worker can have
+    // produced a bitrate, because the scan never opens a file.
+    assert!(visible.contains("kbps"), "{visible}");
+
+    // And the mark is drawn. The status bar's count is a one-character diff in
+    // the recording (`0 marked` → `1 marked`, with only the digit re-sent), so
+    // the glyph on the row is the assertion that reads.
+    assert!(
+        visible.contains('\u{25cf}'),
+        "nothing was marked:\n{visible}"
+    );
 }

@@ -25,6 +25,7 @@ signal-hook = "=0.3.18"
 tempfile = "=3.27.0"
 thiserror = "=2.0.21"
 toml = "=1.1.6"
+unicode-width = "=0.2.2"
 walkdir = "=2.5.0"
 
 [workspace.package]
@@ -64,6 +65,10 @@ thiserror.workspace = true
 # the keymap is parsed here and not there because a key binding is `crossterm`'s
 # vocabulary, which core does not have (`crates/core/tests/manifest_deps.rs`).
 toml.workspace = true
+# Column arithmetic for the browser (task 22). `ratatui` already pulls this in to
+# place a `Span`; naming it here is what lets `src/tui/widgets` truncate and pad a
+# `ノスタルジア` to an exact number of cells rather than to a number of `char`s.
+unicode-width.workspace = true
 
 # `tests/` drives the built binary against a `Fixture`, which lives behind
 # core's `testing` feature. Cargo unifies this with the dependency above, so the

@@ -23,7 +23,9 @@ use std::time::Duration;
 
 use crossterm::event::Event;
 use mpdfm_core::library::{Library, ScanProgress};
+use mpdfm_core::paths::RelPath;
 use mpdfm_core::playlist::{IndexWarning, PlaylistIndex};
+use mpdfm_core::tags::{AudioInfo, TagSet};
 
 /// One thing that happened.
 #[derive(Debug)]
@@ -54,15 +56,7 @@ pub enum Msg {
     MpdStatus(Box<MpdSnapshot>),
 
     /// A worker that was not a scan finished. Tag reads for a window (task 22)
-    /// and commits (task 24) arrive here.
-    ///
-    /// Handled but not yet sent, for the same reason [`TaskOutcome::Failed`] is:
-    /// there is no worker but the scan yet. The expectation turns into a warning
-    /// of its own the moment one exists, which is when this note should go.
-    #[expect(
-        dead_code,
-        reason = "handled by the loop, sent by the first non-scan worker (task 22)"
-    )]
+    /// arrive here, and commits (task 24) will.
     TaskDone(Box<TaskOutcome>),
 
     /// The process was asked to stop — `SIGTERM`, `SIGHUP`, or a `SIGINT` from
@@ -123,25 +117,46 @@ pub struct MpdState {
 
 /// What a worker that was not a scan produced.
 ///
-/// One variant for now. The point of the type is that task 22's tag reads and
-/// task 24's commits already have a way home that does not involve adding a
-/// variant to [`Msg`] and touching the loop.
+/// The point of the type is that task 22's tag reads and task 24's commits have
+/// a way home that does not involve adding a variant to [`Msg`] and touching the
+/// loop.
 #[derive(Debug)]
 pub enum TaskOutcome {
+    /// A window of files was read for the browser (task 22).
+    ///
+    /// One entry per path asked for, in the order they were asked for, each
+    /// holding either what was read or the reason that one file failed — the
+    /// same shape [`read_many`][mpdfm_core::tags::read_many] uses, and for the
+    /// same reason: one corrupt track in an album of fourteen must not take the
+    /// other thirteen's metadata away.
+    Tags(Vec<(RelPath, Result<TrackInfo, String>)>),
+
     /// Something went wrong on a worker thread, with the full message.
     ///
-    /// Handled — [`App::update`][crate::tui::app::App::update] opens the error
-    /// panel on it — but not yet constructed; see [`Msg::TaskDone`].
-    #[expect(
-        dead_code,
-        reason = "handled by the loop, constructed by the first non-scan worker (task 22)"
-    )]
+    /// Not for a single file that would not read — that is an `Err` inside
+    /// [`TaskOutcome::Tags`] and belongs next to the row it is about. This is for
+    /// a worker that could not do its job at all.
     Failed {
         /// What the worker was doing, in the user's words: "scan", "commit".
         what: String,
         /// The whole error chain. Never truncated here; the UI decides.
         message: String,
     },
+}
+
+/// What one tag read produced: the metadata, and the properties of the audio
+/// itself.
+///
+/// Both, from one open, because the browser shows a duration and a bitrate next
+/// to the title and reading the file twice to get them would double the I/O for
+/// exactly the rows the user is looking at. See `docs/tasks/22-browser-view.md`
+/// for the measurement that says this is affordable.
+#[derive(Debug, Clone)]
+pub struct TrackInfo {
+    /// What the file says it is.
+    pub tags: TagSet,
+    /// What the audio is: duration, bitrate, sample rate, real container.
+    pub info: AudioInfo,
 }
 
 impl Msg {

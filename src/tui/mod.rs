@@ -15,9 +15,10 @@
 //! | `app` | the state, the loop, and the frame |
 //! | `log` | where diagnostics go, which is never the screen |
 //!
-//! Tasks 22–26 fill in the views. Task 20 owns the shell they live in and the one
-//! guarantee that is hard to add later — **the terminal is always restored**, see
-//! `terminal.rs` — and task 21 owns the vocabulary they dispatch through.
+//! Task 20 owns the shell the views live in and the one guarantee that is hard to
+//! add later — **the terminal is always restored**, see `terminal.rs` — task 21
+//! owns the vocabulary they dispatch through, and task 22 the first of them.
+//! Tasks 23–26 fill in the rest.
 //!
 //! # Start-up order
 //!
@@ -59,6 +60,8 @@ mod keys;
 mod log;
 mod msg;
 mod terminal;
+mod views;
+mod widgets;
 mod work;
 
 use std::process::ExitCode;

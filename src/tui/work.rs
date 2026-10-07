@@ -23,14 +23,16 @@ use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use mpdfm_core::config::Config;
 use mpdfm_core::library::Library;
 use mpdfm_core::mpd::{self};
+use mpdfm_core::paths::RelPath;
 use mpdfm_core::playlist::PlaylistIndex;
+use mpdfm_core::tags;
 
 use super::log::Log;
-use super::msg::{MpdSnapshot, MpdState, Msg, ScanOutcome};
+use super::msg::{MpdSnapshot, MpdState, Msg, ScanOutcome, TaskOutcome, TrackInfo};
 
 /// How long MPD gets to answer the status poll.
 ///
@@ -114,6 +116,64 @@ pub fn scan(tx: Sender<Msg>, music_dir: Utf8PathBuf, playlist_dir: Utf8PathBuf, 
             elapsed: Duration::ZERO,
         })));
     }
+}
+
+/// Read the tags and audio properties of the rows the browser is showing.
+///
+/// The one worker whose cost is proportional to what is on screen rather than to
+/// the library: the browser asks for the visible rows and no others
+/// (`docs/tasks/22-browser-view.md`), so this is forty files at the very most and
+/// usually a handful.
+///
+/// Exactly one [`Msg::TaskDone`] comes back, whatever happened, because the app
+/// holds a "a read is out" flag and would otherwise never ask again. A file that
+/// will not read is an `Err` in its own slot and not an end of the batch: the
+/// other rows on screen still get their numbers.
+pub fn read_tags(tx: Sender<Msg>, paths: Vec<RelPath>, root: Utf8PathBuf, log: Arc<Log>) {
+    let fallback = tx.clone();
+    let spawned = thread::Builder::new()
+        .name("mpdfm-tags".to_owned())
+        .spawn(move || {
+            let started = Instant::now();
+            let reads = read_window(&paths, &root);
+            if log.is_on() {
+                let failed = reads.iter().filter(|(_, read)| read.is_err()).count();
+                log.line(format!(
+                    "tags: read {} file(s) in {} µs, {failed} failed",
+                    reads.len(),
+                    started.elapsed().as_micros()
+                ));
+            }
+            let _ = tx.send(Msg::TaskDone(Box::new(TaskOutcome::Tags(reads))));
+        });
+
+    if let Err(err) = spawned {
+        let _ = fallback.send(Msg::TaskDone(Box::new(TaskOutcome::Failed {
+            what: "read tags".to_owned(),
+            message: format!("cannot start the tag thread: {err}"),
+        })));
+    }
+}
+
+/// The body of [`read_tags`], synchronously.
+///
+/// Separated so a test can count what one window costs — in
+/// [`library::audio_reads`][mpdfm_core::library::audio_reads] and in wall-clock —
+/// without a thread in the way.
+#[must_use]
+pub fn read_window(
+    paths: &[RelPath],
+    root: &Utf8Path,
+) -> Vec<(RelPath, Result<TrackInfo, String>)> {
+    paths
+        .iter()
+        .map(|rel| {
+            let read = tags::read(&rel.to_abs(root))
+                .map(|(tags, info)| TrackInfo { tags, info })
+                .map_err(|err| err.to_string());
+            (rel.clone(), read)
+        })
+        .collect()
 }
 
 /// Ask MPD what it is doing, once.
