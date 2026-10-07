@@ -27,6 +27,8 @@
 //!
 //! [run]: super::app::App::run_command
 
+use super::widgets::input::Input;
+
 /// A command typed at `:`.
 ///
 /// One variant per entry in the task's list. The arguments are kept as the user
@@ -238,15 +240,14 @@ fn name_of(typed: &str) -> &'static str {
 
 /// The `:` line being typed.
 ///
-/// A deliberately small editor: insert, backspace, move, clear. There is no
-/// history and no completion, which task 26 can add — what is here is what
-/// `:move hiphop/MF DOOM` needs, including fixing a typo in the middle of it
-/// without retyping the rest.
+/// The editing is [`Input`]'s — the same one every field of the tag editor uses,
+/// so that backspacing over a `ï` cannot work in one of them and not the other.
+/// What this adds is the one thing a command line has that a tag field does not:
+/// the parser's last complaint, held next to the text that caused it so the user
+/// can edit it rather than retype it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CommandLine {
-    text: String,
-    /// Where the next character goes, as a byte offset on a character boundary.
-    cursor: usize,
+    line: Input,
     /// The last thing the parser said about this line, shown beneath it.
     error: Option<String>,
 }
@@ -261,7 +262,7 @@ impl CommandLine {
     /// What has been typed, without the leading `:`.
     #[must_use]
     pub fn text(&self) -> &str {
-        &self.text
+        self.line.text()
     }
 
     /// The complaint to show under the line, if the last attempt failed.
@@ -273,7 +274,7 @@ impl CommandLine {
     /// Where the cursor is, as a byte offset into [`CommandLine::text`].
     #[must_use]
     pub fn cursor(&self) -> usize {
-        self.cursor
+        self.line.cursor()
     }
 
     /// Record why the line could not be run, and leave it open to be edited.
@@ -286,52 +287,34 @@ impl CommandLine {
     /// Editing clears the error: a message about the text as it was is misleading
     /// once the text has changed.
     pub fn insert(&mut self, c: char) -> bool {
-        self.text.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
         self.error = None;
-        true
+        self.line.insert(c)
     }
 
     /// Delete the character before the cursor. Returns whether there was one.
     pub fn backspace(&mut self) -> bool {
-        let Some(previous) = self.text[..self.cursor].chars().next_back() else {
+        if !self.line.backspace() {
             return false;
-        };
-        self.cursor -= previous.len_utf8();
-        self.text.remove(self.cursor);
+        }
         self.error = None;
         true
     }
 
     /// Throw the whole line away. Returns whether there was anything to throw.
     pub fn clear(&mut self) -> bool {
-        let had = !self.text.is_empty() || self.error.is_some();
-        self.text.clear();
-        self.cursor = 0;
+        let had = self.line.clear() || self.error.is_some();
         self.error = None;
         had
     }
 
     /// Cursor one character left. Returns whether it moved.
     pub fn left(&mut self) -> bool {
-        match self.text[..self.cursor].chars().next_back() {
-            Some(previous) => {
-                self.cursor -= previous.len_utf8();
-                true
-            }
-            None => false,
-        }
+        self.line.left()
     }
 
     /// Cursor one character right. Returns whether it moved.
     pub fn right(&mut self) -> bool {
-        match self.text[self.cursor..].chars().next() {
-            Some(next) => {
-                self.cursor += next.len_utf8();
-                true
-            }
-            None => false,
-        }
+        self.line.right()
     }
 
     /// The command this line holds.
@@ -341,7 +324,7 @@ impl CommandLine {
     /// Whatever [`parse`] says, which the caller puts back on the line with
     /// [`CommandLine::fail`].
     pub fn parse(&self) -> Result<Command, CommandError> {
-        parse(&self.text)
+        parse(self.text())
     }
 }
 

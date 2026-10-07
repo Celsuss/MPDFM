@@ -20,10 +20,10 @@
 //! line. [`Mode`] is the discriminator, so the table is keyed by `(Mode, KeySeq)`
 //! and each mode is configured by its own section of `keys.toml`.
 //!
-//! Only [`Mode::Browser`] and [`Mode::Command`] can be reached today; the views
-//! that put the app into the other three arrive with tasks 23–25. Their default
-//! bindings are here and tested anyway, because what those tasks need from this one
-//! is a table they can bind into rather than a table they have to invent.
+//! Only [`Mode::Browser`], [`Mode::TagEdit`] and [`Mode::Command`] can be reached
+//! today; the views that put the app into the other two arrive with tasks 24 and
+//! 25. Their default bindings are here and tested anyway, because what those tasks
+//! need from this one is a table they can bind into rather than one to invent.
 //!
 //! # Normalization, and the `shift` problem
 //!
@@ -712,19 +712,35 @@ const DEFAULTS: &[(Mode, &[(&str, Action)])] = &[
         ],
     ),
     (
-        // Task 23. A form with text fields in it, so no bare letter is bound:
-        // every one of them has to reach the field being edited.
+        // Task 23. The one mode with two states in it: moving between the form's
+        // fields, where a bare letter is a verb, and typing into one of them,
+        // where it is a letter. Only the text-editing actions are in force while a
+        // field is open — see `App::on_key` — so `j` moves between fields and
+        // still types a `j` into one, without a second mode for a user to
+        // configure.
         Mode::TagEdit,
         &[
-            ("up", Action::Up),
+            ("j", Action::Down),
             ("down", Action::Down),
+            ("k", Action::Up),
+            ("up", Action::Up),
+            ("gg", Action::Top),
+            ("G", Action::Bottom),
+            ("tab", Action::Down),
+            ("backtab", Action::Up),
             ("left", Action::Left),
             ("right", Action::Right),
-            ("tab", Action::SwitchPane),
+            ("i", Action::EditField),
             ("enter", Action::Submit),
+            ("C", Action::ClearField),
+            ("T", Action::TitleFromFilename),
+            ("N", Action::RenumberTracks),
+            ("w", Action::StageTags),
+            ("W", Action::StageAndCommit),
             ("backspace", Action::DeleteChar),
             ("ctrl-u", Action::ClearLine),
             ("esc", Action::Cancel),
+            ("?", Action::Help),
         ],
     ),
     (

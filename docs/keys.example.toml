@@ -73,12 +73,20 @@
 
 # -- the tag editor (task 23) -----------------------------------------------
 #
-# A form with text fields in it, so no bare letter is bound by default: every one
-# of them has to reach the field being edited. Bind one here and it stops being
-# typeable.
+# One mode with two states in it. Between the form's fields a bare letter is a
+# verb — `j` and `k` move, `i` types, `w` stages, `T` and `N` run the per-file
+# actions, `C` clears a field. Inside a field that is open for typing, a key that
+# types a character types it and nothing else, so `j` is a `j` in there; every
+# other key keeps its binding, filtered to the actions a field can use (left,
+# right, up, down, delete_char, clear_line, submit, cancel).
+#
+# So a letter bound here is a verb between fields and still typeable in one, and
+# the only bindings that change what typing does are those eight.
 #
 # [tagedit]
-# "ctrl-s" = "submit"
+# "ctrl-s" = "stage_tags"
+# "ctrl-w" = "stage_and_commit"
+# "a" = "edit_field"
 
 
 # -- the search line (task 25) ----------------------------------------------
@@ -117,6 +125,12 @@
 #
 # Changing things
 #   edit_tags            edit tags
+#   edit_field           type into this field
+#   clear_field          clear this field
+#   title_from_filename  titles from filenames
+#   renumber_tracks      renumber tracks
+#   stage_tags           stage the tag edit
+#   stage_and_commit     stage the tag edit and commit
 #   stage_move           stage a move of the marks
 #   rename               rename
 #   stage_delete         stage a delete

@@ -70,8 +70,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use mpdfm_core::config::Config;
-use mpdfm_core::library::{Library, ScanProgress};
-use mpdfm_core::ops::Plan;
+use mpdfm_core::library::{DirPath, Library, ScanProgress};
+use mpdfm_core::ops::{Effects, Operation, Plan};
+use mpdfm_core::paths::RelPath;
 use mpdfm_core::playlist::PlaylistIndex;
 use ratatui::Terminal;
 use ratatui::backend::Backend;
@@ -85,11 +86,13 @@ use super::command::{self, Command, CommandLine};
 use super::event::Events;
 use super::keys::{KeyChord, KeyMap, KeyWarning, Keys, Mode, Resolution};
 use super::log::Log;
-use super::msg::{MpdSnapshot, Msg, ScanOutcome, TaskOutcome};
+use super::msg::{MpdSnapshot, Msg, Reads, ScanOutcome, TaskOutcome};
 use super::terminal::{MIN_SIZE, fits};
 use super::views::browser::{Browser, Enter, Pane, Sort, TreeRow};
+use super::views::tagedit::{Begin, FileAction, Hints, Preview, Started, TagEdit};
 use super::widgets::details::DetailsPane;
 use super::widgets::filelist::FileList;
+use super::widgets::input::Input;
 use super::widgets::{fit, pad};
 use super::{PANIC_AT, work};
 
@@ -112,6 +115,28 @@ const DETAILS_FROM: u16 = 90;
 
 /// Cells given to the details pane when it is shown.
 const DETAILS_W: u16 = 26;
+
+/// The actions that still mean something while a tag field is open for typing.
+///
+/// A key that types a character types it instead, whatever it is bound to —
+/// see [`App::on_field_key`], which is where this is used and why it is a list
+/// rather than a `match`.
+const IN_FIELD: &[Action] = &[
+    Action::Left,
+    Action::Right,
+    Action::Up,
+    Action::Down,
+    Action::DeleteChar,
+    Action::ClearLine,
+    Action::Submit,
+    Action::Cancel,
+];
+
+/// How much of the body a per-file action's preview box takes, in percent.
+///
+/// Named because two things need the same number: the box the frame draws, and
+/// the estimate of how far one keypress scrolls it.
+const PREVIEW_PERCENT: usize = 80;
 
 /// How many messages may be waiting for the bottom line.
 ///
@@ -171,6 +196,11 @@ impl Focus {
 pub enum View {
     /// The library browser. Task 22.
     Browser,
+    /// The tag editor, on the marks or on the file under the cursor. Task 23.
+    ///
+    /// Boxed because it holds every selected file's tags — two hundred `TagSet`s
+    /// is not a thing to move through a `match` every time a key is pressed.
+    TagEdit(Box<TagEdit>),
     /// The key help, generated from the live keymap for the mode it was opened
     /// from. Task 26 adds the other modes' sections and the grouping.
     Help {
@@ -215,7 +245,11 @@ impl View {
     fn is_modal(&self) -> bool {
         matches!(
             self,
-            Self::Help { .. } | Self::Confirm(_) | Self::Notice { .. } | Self::Error(_)
+            Self::Help { .. }
+                | Self::Confirm(_)
+                | Self::Notice { .. }
+                | Self::Error(_)
+                | Self::TagEdit(_)
         )
     }
 
@@ -223,6 +257,7 @@ impl View {
     fn name(&self) -> &'static str {
         match self {
             Self::Browser => "browser",
+            Self::TagEdit(_) => "tagedit",
             Self::Help { .. } => "help",
             Self::Command(_) => "command",
             Self::Confirm(_) => "confirm",
@@ -241,8 +276,22 @@ impl View {
 pub struct Confirm {
     /// What the user is being asked.
     question: String,
-    /// The action a `y` dispatches.
-    on_yes: Action,
+    /// What a `y` means.
+    on_yes: Answer,
+}
+
+/// What saying yes to a [`Confirm`] does.
+///
+/// Most answers are an action, which is what makes `q` → "2 staged operations
+/// would be lost" → `y` work without a second code path. One is not: throwing
+/// away a form's unsaved fields is not a verb in the vocabulary and should not
+/// become one, because nothing outside the tag editor could mean it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Answer {
+    /// Dispatch this action.
+    Act(Action),
+    /// Close the tag editor, throwing away what was typed into it.
+    DiscardEdits,
 }
 
 /// How serious a message is, and therefore whether it expires.
@@ -327,6 +376,13 @@ pub struct App {
     mpd: Option<MpdSnapshot>,
     /// Whether an MPD poll is already out, so the tick does not stack them up.
     mpd_in_flight: bool,
+    /// Whether a commit or an undo is running on a worker.
+    ///
+    /// One flag for both, because they are the same thing from the library's
+    /// point of view — a transaction in progress — and two of those at once would
+    /// have the second one's preview made against a library the first is in the
+    /// middle of changing.
+    writing: bool,
     /// Where workers send their answers.
     tx: Sender<Msg>,
     /// `--log`, or nothing.
@@ -356,6 +412,7 @@ impl App {
             scan: ScanState::Idle,
             mpd: None,
             mpd_in_flight: false,
+            writing: false,
             tx,
             log,
             quit: false,
@@ -499,6 +556,12 @@ impl App {
             return self.on_confirm_key(&confirm, key);
         }
 
+        // A form field being typed into is the other place a key means something
+        // it does not mean anywhere else: a letter.
+        if self.tagedit().is_some_and(TagEdit::is_editing) {
+            return self.on_field_key(key);
+        }
+
         let mode = self.mode();
         match self.keys.press(mode, key, Instant::now()) {
             Resolution::Act(action) => self.dispatch(action),
@@ -511,13 +574,13 @@ impl App {
 
     /// Which set of bindings is in force.
     ///
-    /// Tasks 23–25 add the views that reach the other three modes. Until then an
-    /// overlay is something to dismiss rather than a mode, which is why a panel
-    /// resolves as [`Mode::Browser`] and then has its keys filtered in
-    /// [`App::dispatch`].
+    /// Tasks 24 and 25 add the views that reach the other two modes. A panel is
+    /// something to dismiss rather than a mode, which is why one resolves as
+    /// [`Mode::Browser`] and then has its keys filtered in [`App::dispatch`].
     fn mode(&self) -> Mode {
         match self.views.last() {
             Some(View::Command(_)) => Mode::Command,
+            Some(View::TagEdit(_)) => Mode::TagEdit,
             _ => Mode::Browser,
         }
     }
@@ -527,7 +590,19 @@ impl App {
         match key.code {
             KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
                 self.views.pop();
-                self.dispatch(confirm.on_yes);
+                match &confirm.on_yes {
+                    Answer::Act(action) => {
+                        self.dispatch(*action);
+                    }
+                    // The editor is what the question was in front of, so it is
+                    // what is on top now.
+                    Answer::DiscardEdits => {
+                        if matches!(self.views.last(), Some(View::TagEdit(_))) {
+                            self.log.line("tagedit: changes discarded");
+                            self.views.pop();
+                        }
+                    }
+                }
                 true
             }
             KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc => {
@@ -552,6 +627,41 @@ impl App {
         }
     }
 
+    /// A keypress while one of the tag editor's fields is open for typing.
+    ///
+    /// The rule, in one sentence: **a key that types a character types it, and
+    /// every other key keeps its binding** — filtered to the verbs a field can
+    /// use ([`IN_FIELD`]). So `j` and `G`, which move between fields everywhere
+    /// else in this mode, type a `j` and a `G`; `ctrl-u` still clears the line,
+    /// `backspace` still deletes, `tab` and the arrows still move, and all four
+    /// still follow a remap.
+    ///
+    /// That is what lets one `[tagedit]` section in `keys.toml` serve both halves
+    /// of the form. The alternative was a second mode, which would mean a user
+    /// configuring the editor had to know which of two sections each key lands
+    /// in, and a section that must be left unbound for the letters to stay
+    /// letters.
+    ///
+    /// The keymap is not consulted for a character at all, which also settles
+    /// what a half-finished sequence means in here: the first `g` of a `gg` is a
+    /// letter in a text field, and never a key that is waiting for its second.
+    fn on_field_key(&mut self, key: KeyEvent) -> bool {
+        if let Some(c) = KeyChord::from_event(key).typed() {
+            return self
+                .tagedit_mut()
+                .and_then(TagEdit::input_mut)
+                .is_some_and(|input| input.insert(c));
+        }
+        match self.keys.press(Mode::TagEdit, key, Instant::now()) {
+            Resolution::Act(action) if IN_FIELD.contains(&action) => self.dispatch(action),
+            // A sequence that begins with a named key — `ctrl-x s` — can still be
+            // half-finished in here, and the corner shows it the way it does
+            // anywhere else.
+            Resolution::Partial => true,
+            _ => false,
+        }
+    }
+
     // -- actions -----------------------------------------------------------
 
     /// Do what the user asked for, however they asked for it.
@@ -569,6 +679,13 @@ impl App {
         // library. Anything the line does not claim falls through, so a `ctrl-r`
         // bound under `[command]` still rescans.
         if let Some(dirty) = self.command_action(action) {
+            return dirty;
+        }
+
+        // The tag editor has the keyboard and answers most of the vocabulary
+        // itself. What it does not claim — the help, quitting — falls through to
+        // the panel rules below, which is how `?` opens the help over a form.
+        if let Some(dirty) = self.tagedit_action(action) {
             return dirty;
         }
 
@@ -636,23 +753,42 @@ impl App {
             }
             Action::Quit | Action::ForceQuit => self.quit_action(action),
 
+            // -- changing things ----------------------------------------------
+            Action::EditTags => self.open_tag_editor(),
+            // The one verb task 24 owns that task 23 has to answer anyway: `W`
+            // commits a tag edit, and the next thing a user reaches for after a
+            // commit is the key that takes it back.
+            Action::Undo => self.undo_last(),
+
             // -- the views that are not built yet ---------------------------
-            Action::EditTags => self.not_yet(action.help(), Some("23-tagedit-view.md")),
-            // Staging needs somewhere to show what was staged, and that is task
-            // 24: this task hands it the marks, and that is the whole of the
-            // seam between them.
+            // Staging a move needs somewhere to show what was staged, and that
+            // is task 24: this task hands it the marks, and that is the whole of
+            // the seam between them.
             Action::StageMove
             | Action::Rename
             | Action::StageDelete
             | Action::ShowPending
             | Action::Unstage
             | Action::Commit
-            | Action::DiscardPending
-            | Action::Undo => self.not_yet(action.help(), Some("24-pending-view.md")),
+            | Action::DiscardPending => self.not_yet(action.help(), Some("24-pending-view.md")),
             Action::Search | Action::SearchNext | Action::SearchPrev | Action::Filter => {
                 self.not_yet(action.help(), Some("25-search-and-filter.md"))
             }
             Action::Organize => self.not_yet(action.help(), Some("28-organize-command.md")),
+
+            // -- only meaningful inside the tag editor ----------------------
+            Action::EditField
+            | Action::ClearField
+            | Action::TitleFromFilename
+            | Action::RenumberTracks
+            | Action::StageTags
+            | Action::StageAndCommit => {
+                self.notify(
+                    Level::Warn,
+                    format!("{}: only in the tag editor", action.help()),
+                );
+                true
+            }
 
             // -- only meaningful where there is a line of text --------------
             Action::Submit | Action::DeleteChar | Action::ClearLine => false,
@@ -700,6 +836,421 @@ impl App {
             }
             Enter::File(_) => self.dispatch(Action::EditTags),
             Enter::Nothing => false,
+        }
+    }
+
+    // -- the tag editor ----------------------------------------------------
+
+    /// The editor on the stack, if it is there.
+    fn tagedit(&self) -> Option<&TagEdit> {
+        match self.views.last() {
+            Some(View::TagEdit(form)) => Some(form),
+            _ => None,
+        }
+    }
+
+    /// The editor on the stack, to change.
+    fn tagedit_mut(&mut self) -> Option<&mut TagEdit> {
+        match self.views.last_mut() {
+            Some(View::TagEdit(form)) => Some(form),
+            _ => None,
+        }
+    }
+
+    /// `e`: open the tag editor on the marks, or on the row under the cursor.
+    ///
+    /// The tags are **not** read here. Two hundred marked files is two hundred
+    /// opens, so the form goes on screen saying what it is waiting for and a
+    /// worker answers with [`TaskOutcome::Selection`].
+    fn open_tag_editor(&mut self) -> bool {
+        let Some(library) = &self.library else {
+            return false;
+        };
+        let (files, skipped) = tag_targets(&self.browser, library);
+        if files.is_empty() {
+            self.notify(
+                Level::Warn,
+                "nothing to edit: mark some audio files, or put the cursor on one",
+            );
+            return true;
+        }
+
+        let root = library.root().to_path_buf();
+        self.log.line(format!(
+            "tagedit: opening on {} file(s), {skipped} skipped",
+            files.len()
+        ));
+        if skipped > 0 {
+            // Not silent: a user who marked an album and its `.nfo` should be
+            // told the `.nfo` was left out rather than left to wonder about the
+            // count in the title.
+            let plural = if skipped == 1 { "" } else { "s" };
+            self.notify(
+                Level::Warn,
+                format!("{skipped} marked path{plural} hold no audio and were left out"),
+            );
+        }
+        work::read_selection(self.tx.clone(), files.clone(), root, Arc::clone(&self.log));
+        self.push(View::TagEdit(Box::new(TagEdit::opening(files))))
+    }
+
+    /// The tag editor's share of the actions, or `None` if it wants none of them.
+    ///
+    /// Three states, and they claim different verbs: a preview waiting to be
+    /// answered, a field open for typing, and the form itself.
+    fn tagedit_action(&mut self, action: Action) -> Option<bool> {
+        let form = self.tagedit()?;
+        if form.preview().is_some() {
+            return Some(self.preview_action(action));
+        }
+        if form.is_editing() {
+            return Some(self.field_action(action));
+        }
+        self.form_action(action)
+    }
+
+    /// A key while a per-file action's preview is on screen.
+    ///
+    /// Nothing else happens until it is answered: it is a question about every
+    /// file in the selection, and a list that could be navigated away from
+    /// without answering would be a preview nobody had to look at.
+    fn preview_action(&mut self, action: Action) -> bool {
+        let rows = self.preview_rows();
+        let step = self.page_step();
+        let mut applied = None;
+
+        let dirty = {
+            let Some(form) = self.tagedit_mut() else {
+                return false;
+            };
+            match action {
+                Action::Submit => {
+                    let what = form.preview().map(|preview| preview.action);
+                    let dirty = form.accept_preview();
+                    applied = what;
+                    dirty
+                }
+                Action::Cancel => form.cancel_preview(),
+                Action::Down => form.scroll_preview(1, rows),
+                Action::Up => form.scroll_preview(-1, rows),
+                Action::HalfPageDown => form.scroll_preview(step, rows),
+                Action::HalfPageUp => form.scroll_preview(-step, rows),
+                Action::Top => form.scroll_preview(isize::MIN, rows),
+                Action::Bottom => form.scroll_preview(isize::MAX, rows),
+                _ => false,
+            }
+        };
+
+        if let Some(what) = applied {
+            self.notify(
+                Level::Info,
+                format!("{what}: in the form, not yet written · stage it to write it"),
+            );
+        }
+        dirty
+    }
+
+    /// A key while a field is open for typing, already filtered down to the verbs
+    /// that are about text ([`IN_FIELD`]).
+    fn field_action(&mut self, action: Action) -> bool {
+        let Some(form) = self.tagedit_mut() else {
+            return false;
+        };
+        match action {
+            // Both leave the field, keeping what was typed. They can, because
+            // leaving a field writes nothing anywhere — the task is explicit
+            // about that — so there is no asymmetry for two keys to express.
+            Action::Submit | Action::Cancel => form.end(),
+            // Accept the field and move on, which is what a form does.
+            Action::Down => {
+                form.end();
+                form.move_cursor(1);
+                true
+            }
+            Action::Up => {
+                form.end();
+                form.move_cursor(-1);
+                true
+            }
+            Action::Left => form.input_mut().is_some_and(Input::left),
+            Action::Right => form.input_mut().is_some_and(Input::right),
+            Action::DeleteChar => form.input_mut().is_some_and(Input::backspace),
+            Action::ClearLine => form.input_mut().is_some_and(Input::clear),
+            _ => false,
+        }
+    }
+
+    /// A key on the form itself, between fields.
+    fn form_action(&mut self, action: Action) -> Option<bool> {
+        let step = self.page_step();
+        Some(match action {
+            Action::Down => self.tagedit_mut()?.move_cursor(1),
+            Action::Up => self.tagedit_mut()?.move_cursor(-1),
+            Action::HalfPageDown => self.tagedit_mut()?.move_cursor(step),
+            Action::HalfPageUp => self.tagedit_mut()?.move_cursor(-step),
+            Action::Top => self.tagedit_mut()?.set_cursor(0),
+            Action::Bottom => self.tagedit_mut()?.set_cursor(usize::MAX),
+            Action::EditField | Action::Submit | Action::Open | Action::Right => self.begin_field(),
+            Action::ClearField => self.tagedit_mut()?.clear_field(),
+            Action::TitleFromFilename => self.file_action(FileAction::TitleFromFilename),
+            Action::RenumberTracks => self.file_action(FileAction::RenumberTracks),
+            Action::StageTags => self.stage_tags(false),
+            Action::StageAndCommit => self.stage_tags(true),
+            Action::Cancel => self.close_tag_editor(),
+            // Everything else — the help, quitting, a browser verb somebody bound
+            // in here — is the panel rules' business.
+            _ => return None,
+        })
+    }
+
+    /// `i`: start typing into the field under the cursor, or say why not.
+    fn begin_field(&mut self) -> bool {
+        let Some(form) = self.tagedit_mut() else {
+            return false;
+        };
+        let field = form.field();
+        match form.begin() {
+            Begin::Opened => true,
+            Begin::PerFile(action) => {
+                // Named rather than merely refused: "every file wants its own
+                // title" is half an answer without the key that does it.
+                let key = self.keys.map().key_for(Mode::TagEdit, action_for(action));
+                let how = match key {
+                    Some(key) => format!("press {key} for `{action}`"),
+                    None => format!("use `{action}`"),
+                };
+                self.notify(
+                    Level::Warn,
+                    format!("every file wants its own {field} — {how}"),
+                );
+                true
+            }
+            Begin::NotReady => false,
+        }
+    }
+
+    /// `T` / `N`: work out what a per-file action would do, and show it.
+    fn file_action(&mut self, action: FileAction) -> bool {
+        let Some(form) = self.tagedit_mut() else {
+            return false;
+        };
+        match form.start_action(action) {
+            Started::Shown => true,
+            Started::Nothing => {
+                self.notify(
+                    Level::Info,
+                    format!("{action}: nothing to do · every file already says that"),
+                );
+                true
+            }
+            Started::NotReady => false,
+        }
+    }
+
+    /// `esc` on the form: leave, asking first if there is anything to lose.
+    fn close_tag_editor(&mut self) -> bool {
+        let Some(form) = self.tagedit() else {
+            return false;
+        };
+        if !form.is_modified() {
+            return self.pop();
+        }
+        let fields: Vec<String> = form.modified().iter().map(ToString::to_string).collect();
+        let files = form.deltas().len();
+        self.push(View::Confirm(Confirm {
+            question: format!(
+                "{} not staged, across {files} file(s).\nThrow the changes away?",
+                fields.join(", ")
+            ),
+            on_yes: Answer::DiscardEdits,
+        }))
+    }
+
+    /// `w` / `W`: turn the form into operations and stage them.
+    ///
+    /// Four refusals, in this order, and **nothing is staged unless all four
+    /// pass**: a value that will not parse, a per-file field typed across a
+    /// selection, a form that would change nothing, and a plan that cannot be
+    /// committed — which is where a file MPDFM may not write is reported, by
+    /// name, before anything is staged.
+    fn stage_tags(&mut self, and_commit: bool) -> bool {
+        // Everything the form has to say, taken out of it in one borrow so that
+        // the refusals below can put messages on screen.
+        let Some(form) = self.tagedit() else {
+            return false;
+        };
+        if form.is_loading() {
+            return false;
+        }
+        let files = form.len();
+        let errors: Vec<String> = form
+            .errors()
+            .iter()
+            .map(|(field, why)| format!("{field}: {why}"))
+            .collect();
+        let per_file: Vec<String> = form
+            .per_file_refused()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let fields: Vec<String> = form.modified().iter().map(ToString::to_string).collect();
+        let deltas = form.deltas();
+
+        if !errors.is_empty() {
+            self.notify(
+                Level::Warn,
+                format!("nothing staged — {}", errors.join("; ")),
+            );
+            return true;
+        }
+        if !per_file.is_empty() {
+            self.notify(
+                Level::Warn,
+                format!(
+                    "nothing staged — {} cannot be one value across {files} files",
+                    per_file.join(" and ")
+                ),
+            );
+            return true;
+        }
+        if deltas.is_empty() {
+            self.notify(
+                Level::Info,
+                "nothing to change: every selected file already says that",
+            );
+            return true;
+        }
+
+        let count = deltas.len();
+        let mut planned = self.plan.clone();
+        for (target, changes) in deltas {
+            planned.push(Operation::WriteTags { target, changes });
+        }
+
+        // The preflight. A tag edit against a file MPDFM cannot write is a
+        // `Conflict::NotTaggable`, which is how "a non-writable file in the
+        // selection is reported before staging, naming it" is answered — by the
+        // same validation the CLI and the pending view use, rather than by a
+        // check this view invented for itself.
+        let Some(effects) = self.preview_plan(&planned) else {
+            return true;
+        };
+        if !effects.is_committable() {
+            let reasons: Vec<String> = effects.conflicts.iter().map(ToString::to_string).collect();
+            self.fail(format!(
+                "nothing was staged — this edit cannot be committed:\n\n{}",
+                reasons.join("\n")
+            ));
+            return true;
+        }
+
+        self.plan = planned;
+        self.log
+            .line(format!("tagedit: staged {count} tag edit(s)"));
+        // The form's work is done: it has become operations, and the plan is
+        // where those live now.
+        self.pop();
+
+        if and_commit {
+            return self.commit_plan(effects);
+        }
+        let plural = if count == 1 { "" } else { "s" };
+        self.notify(
+            Level::Info,
+            format!(
+                "staged {}: {count} file{plural} · {} pending",
+                fields.join(", "),
+                self.plan.len()
+            ),
+        );
+        true
+    }
+
+    /// What a plan would do, or the reason it cannot be worked out. Touches
+    /// nothing.
+    ///
+    /// The library and the playlist index arrive together from a scan, so one
+    /// without the other means no scan has landed and there is nothing to
+    /// validate against yet.
+    fn preview_plan(&mut self, plan: &Plan) -> Option<Effects> {
+        let (Some(library), Some(index)) = (&self.library, &self.index) else {
+            self.notify(Level::Warn, "no library yet · rescan first");
+            return None;
+        };
+        Some(plan.validate(library, index, &self.config))
+    }
+
+    /// Commit everything staged, on a worker.
+    ///
+    /// `effects` is what the user was shown and agreed to. Commit re-validates
+    /// and refuses as drift if the answer has changed since, which is what makes
+    /// handing a worker a clone of the model safe.
+    fn commit_plan(&mut self, effects: Effects) -> bool {
+        if self.writing {
+            self.notify(Level::Warn, "a transaction is already running");
+            return true;
+        }
+        let Some(library) = self.library.clone() else {
+            return false;
+        };
+        let ops = self.plan.len();
+        self.writing = true;
+        self.log
+            .line(format!("commit: starting, {ops} operation(s)"));
+        work::commit(
+            self.tx.clone(),
+            self.plan.clone(),
+            library,
+            effects,
+            self.config.clone(),
+            Arc::clone(&self.log),
+        );
+        let plural = if ops == 1 { "" } else { "s" };
+        self.notify(Level::Info, format!("committing {ops} operation{plural}…"));
+        true
+    }
+
+    /// `u`: reverse the most recent undoable transaction.
+    ///
+    /// The whole of what task 23 needs from undo: `W` wrote some tags and the
+    /// user wants them back. Task 24 owns the version that offers it from the
+    /// pending view and names the transaction it is about.
+    fn undo_last(&mut self) -> bool {
+        if self.writing {
+            self.notify(Level::Warn, "a transaction is already running");
+            return true;
+        }
+        self.writing = true;
+        self.log.line("undo: starting");
+        work::undo(self.tx.clone(), self.config.clone(), Arc::clone(&self.log));
+        self.notify(Level::Info, "undoing the last transaction…");
+        true
+    }
+
+    /// How many rows a preview box has room for, from the last size the terminal
+    /// reported.
+    ///
+    /// An estimate, like [`App::list_rows`], and allowed to be: it decides how
+    /// far one keypress scrolls, and the frame itself measures the real box.
+    fn preview_rows(&self) -> usize {
+        usize::from(self.body().height)
+            .saturating_mul(PREVIEW_PERCENT)
+            .saturating_div(100)
+            .saturating_sub(2)
+            .max(1)
+    }
+
+    /// The keys the tag editor's own text names, read off the live keymap.
+    fn tagedit_hints(&self) -> Hints {
+        let key = |action| self.keys.map().key_for(Mode::TagEdit, action);
+        Hints {
+            titles: key(Action::TitleFromFilename),
+            renumber: key(Action::RenumberTracks),
+            clear: key(Action::ClearField),
+            stage: key(Action::StageTags),
+            commit: key(Action::StageAndCommit),
+            accept: key(Action::Submit),
+            cancel: key(Action::Cancel),
         }
     }
 
@@ -822,7 +1373,7 @@ impl App {
                 question: format!(
                     "{count} staged operation{plural} would be lost.\nQuit without committing?"
                 ),
-                on_yes: Action::ForceQuit,
+                on_yes: Answer::Act(Action::ForceQuit),
             }));
         }
         self.quit = true;
@@ -966,9 +1517,100 @@ impl App {
                 // of fourteen would be a modal dialogue nobody asked for.
                 self.browser.tags_arrived(reads)
             }
+            TaskOutcome::Selection(reads) => self.on_selection(reads),
+            TaskOutcome::Committed(result) => self.on_committed(result),
+            TaskOutcome::Undone(result) => self.on_undone(result),
             TaskOutcome::Failed { what, message } => {
                 self.tags_in_flight = false;
                 self.fail(format!("{what}: {message}"));
+                true
+            }
+        }
+    }
+
+    /// The tag editor's files have been read.
+    ///
+    /// A file that would not read refuses the whole form, which is the rule
+    /// `mpdfm tag set` follows and for the same reason: a bulk view of nine of
+    /// ten files answers a question nobody asked, and `<multiple>` computed over
+    /// a selection that is missing a file is a lie about that selection.
+    fn on_selection(&mut self, reads: Reads) -> bool {
+        // The user may have left while the read was out, in which case the answer
+        // is of no interest — the form it was for is gone.
+        let Some(form) = self.tagedit_mut() else {
+            return false;
+        };
+        match form.arrived(reads) {
+            Ok(()) => true,
+            Err(unreadable) => {
+                self.views.pop();
+                let list: Vec<String> = unreadable
+                    .iter()
+                    .map(|message| format!("  - {message}"))
+                    .collect();
+                self.fail(format!(
+                    "these file(s) could not be read, so the editor was not opened:\n\n{}",
+                    list.join("\n")
+                ));
+                true
+            }
+        }
+    }
+
+    /// A commit finished.
+    ///
+    /// The plan is emptied only on success: a refused commit wrote nothing and
+    /// the operations are still what the user staged, which is what they need in
+    /// order to fix whatever was wrong.
+    fn on_committed(
+        &mut self,
+        result: Result<Box<mpdfm_core::ops::commit::Committed>, String>,
+    ) -> bool {
+        self.writing = false;
+        match result {
+            Ok(committed) => {
+                self.plan = Plan::new();
+                for warning in &committed.warnings {
+                    self.notify(Level::Warn, warning.to_string());
+                }
+                let undo = self
+                    .keys
+                    .map()
+                    .key_for(Mode::Browser, Action::Undo)
+                    .map_or_else(String::new, |key| format!(" \u{b7} {key} to undo"));
+                self.notify(Level::Info, format!("{}{undo}", committed.headline()));
+                // The library on screen is a version behind: a tag write changed
+                // the files the browser is showing numbers from, and the browser
+                // drops its tag cache on a rescan. This is what makes the change
+                // visible immediately rather than on the next keypress that
+                // happens to re-read something.
+                self.rescan();
+                true
+            }
+            Err(message) => {
+                self.fail(message);
+                true
+            }
+        }
+    }
+
+    /// An undo finished.
+    fn on_undone(&mut self, result: Result<Box<mpdfm_core::journal::Reversed>, String>) -> bool {
+        self.writing = false;
+        match result {
+            Ok(reversed) => {
+                for warning in &reversed.warnings {
+                    self.notify(Level::Warn, warning.to_string());
+                }
+                self.notify(Level::Info, reversed.headline());
+                self.rescan();
+                true
+            }
+            // Including "there is nothing to undo", which is a thing to read
+            // rather than a thing to notice: it means the journal is not what the
+            // user thought it was.
+            Err(message) => {
+                self.fail(message);
                 true
             }
         }
@@ -1366,6 +2008,7 @@ impl App {
             // covered the listing would hide what the command is about.
             View::Browser | View::Command(_) => {}
             View::Help { mode, scroll } => self.render_help(*mode, *scroll, body, frame),
+            View::TagEdit(form) => self.render_tagedit(form, body, frame),
             View::Confirm(confirm) => panel(
                 " confirm ",
                 &format!("{}\n\ny to quit · n or esc to stay", confirm.question),
@@ -1388,6 +2031,85 @@ impl App {
                 frame,
             ),
         }
+    }
+
+    /// The tag editor: the form, and the preview of a per-file action over it.
+    ///
+    /// The whole body and not a centred box. It is not a dialogue — the task calls
+    /// it "the form the user will spend most of their time in" — and ten fields
+    /// plus the actions and the modified line do not fit in three quarters of a
+    /// 24-row terminal.
+    fn render_tagedit(&self, form: &TagEdit, body: Rect, frame: &mut ratatui::Frame) {
+        let hints = self.tagedit_hints();
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(Color::Cyan))
+            .title(fit(&form.title(), inner_width(body)))
+            .title_bottom(fit(&form.footer(&hints), inner_width(body)));
+
+        let inner = block.inner(body);
+        frame.render_widget(Clear, body);
+        frame.render_widget(block, body);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        let cells = usize::from(inner.width);
+        Paragraph::new(form.lines(cells, &hints)).render(inner, frame.buffer_mut());
+
+        // The terminal's own cursor, where the next character goes — only when
+        // this form is the top view, so a help overlay pushed over it does not
+        // get a cursor sitting on it.
+        if matches!(self.views.last(), Some(View::TagEdit(_)))
+            && let Some((column, row)) = form.caret(cells, &hints)
+            && row < inner.height
+        {
+            frame.set_cursor_position((
+                inner
+                    .x
+                    .saturating_add(column.min(inner.width.saturating_sub(1))),
+                inner.y.saturating_add(row),
+            ));
+        }
+
+        if let Some(preview) = form.preview() {
+            self.render_preview(preview, body, frame, &hints);
+        }
+    }
+
+    /// A per-file action's preview, over the form.
+    ///
+    /// Scrolled and never truncated: two hundred renumbered tracks is two hundred
+    /// rows a user can read through, because a hidden change is the thing this
+    /// program exists to prevent.
+    fn render_preview(
+        &self,
+        preview: &Preview,
+        body: Rect,
+        frame: &mut ratatui::Frame,
+        hints: &Hints,
+    ) {
+        let percent = u16::try_from(PREVIEW_PERCENT).unwrap_or(80);
+        let [area] = Layout::horizontal([Constraint::Percentage(percent)])
+            .flex(Flex::Center)
+            .areas(body);
+        let [area] = Layout::vertical([Constraint::Percentage(percent)])
+            .flex(Flex::Center)
+            .areas(area);
+
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(Color::Yellow))
+            .title(fit(&preview.title(), inner_width(area)))
+            .title_bottom(fit(&preview.footer(hints), inner_width(area)));
+        let inner = block.inner(area);
+        frame.render_widget(Clear, area);
+        frame.render_widget(block, area);
+        if inner.width == 0 {
+            return;
+        }
+        Paragraph::new(preview.lines(usize::from(inner.width), usize::from(inner.height)))
+            .render(inner, frame.buffer_mut());
     }
 
     /// The help overlay, generated from the live keymap.
@@ -1653,6 +2375,70 @@ fn panes(body: Rect) -> [Rect; 3] {
     .areas(body)
 }
 
+/// The audio files the tag editor would open on, and how many marked paths were
+/// left out of them.
+///
+/// What is marked, or what the cursor is on when nothing is. A marked
+/// **directory** stands for the audio files in it, one level down, which is
+/// `mpdfm tag set` without `--recursive`: marking an album means that album, and
+/// a multi-disc set's own root holds no audio to be ambiguous about.
+///
+/// Everything else that can be marked — a `.cue`, a `folder.jpg`, an `.nfo` —
+/// is counted and left out rather than refused, because a user who marked a whole
+/// listing with `a` meant the tracks in it and should not have to unmark the
+/// clutter first.
+///
+/// The result is sorted by path and deduplicated. That order matters for more
+/// than tidiness: it is the order `renumber tracks` numbers in, and a path that
+/// was both marked and inside a marked directory must not become two operations
+/// on one file, which the planner refuses as a duplicate edit.
+fn tag_targets(browser: &Browser, library: &Library) -> (Vec<RelPath>, usize) {
+    let mut marks = browser.marks();
+    if marks.is_empty() {
+        marks.extend(browser.focused_path(library));
+    }
+
+    let mut files: Vec<RelPath> = Vec::new();
+    let mut skipped = 0;
+    for rel in marks {
+        match library.get(&rel) {
+            Some(entry) if entry.is_audio() => files.push(rel),
+            Some(_) => skipped += 1,
+            // Not a file in the library, so it is one of the directories the
+            // listing also lets you mark.
+            None => {
+                let Ok(dir) = DirPath::parse(rel.as_str()) else {
+                    skipped += 1;
+                    continue;
+                };
+                let audio: Vec<RelPath> = library
+                    .files_in(&dir)
+                    .filter(|entry| entry.is_audio())
+                    .map(|entry| entry.rel.clone())
+                    .collect();
+                if audio.is_empty() {
+                    skipped += 1;
+                }
+                files.extend(audio);
+            }
+        }
+    }
+    files.sort_unstable();
+    files.dedup();
+    (files, skipped)
+}
+
+/// The action that carries out a per-file field's named alternative.
+///
+/// One mapping, here, so the message that refuses a typed `title` and the key
+/// that does it instead cannot name two different things.
+fn action_for(action: FileAction) -> Action {
+    match action {
+        FileAction::TitleFromFilename => Action::TitleFromFilename,
+        FileAction::RenumberTracks => Action::RenumberTracks,
+    }
+}
+
 /// How many cells a bordered pane has inside it.
 fn inner_width(area: Rect) -> usize {
     usize::from(area.width.saturating_sub(2))
@@ -1758,6 +2544,7 @@ mod tests {
     use std::sync::mpsc;
 
     use mpdfm_core::library::DirPath;
+    use mpdfm_core::tags::{Field, TagDelta, WriteOpts};
     use mpdfm_core::testing::Fixture;
     use ratatui::backend::TestBackend;
 
@@ -2647,10 +3434,10 @@ mod tests {
         app.update(scanned(&fx));
         app.toasts.clear();
 
-        assert!(app.update(press('e')), "`e` is bound to edit_tags");
+        assert!(app.update(press('m')), "`m` is bound to stage_move");
         let toast = app.toasts.front().expect("it should say something");
-        assert!(toast.text.contains("edit tags"), "{}", toast.text);
-        assert!(toast.text.contains("23-tagedit-view.md"), "{}", toast.text);
+        assert!(toast.text.contains("stage a move"), "{}", toast.text);
+        assert!(toast.text.contains("24-pending-view.md"), "{}", toast.text);
         assert_eq!(
             toast.level,
             Level::Warn,
@@ -3540,5 +4327,840 @@ mod tests {
             "the details pane should say why:\n{}",
             text(&terminal)
         );
+    }
+
+    // -- the tag editor (task 23) ------------------------------------------
+
+    /// An album of three mp3s and one piece of clutter.
+    ///
+    /// Every mp3 the fixture stamps out is byte-identical, so a selection of
+    /// them agrees about every field and there is no `<multiple>` until
+    /// [`retag`] makes one.
+    fn album_fixture() -> Fixture {
+        Fixture::builder()
+            .album(
+                "hiphop/Mm..Food",
+                &["01 Beef Rap.mp3", "02 Hoe Cakes.mp3", "03 Potholderz.mp3"],
+            )
+            .aux("hiphop/Mm..Food", &["folder.jpg"])
+            .build()
+    }
+
+    /// Give one file its own value for a field, so a selection disagrees.
+    fn retag(fx: &Fixture, rel: &str, field: Field, value: &str) {
+        mpdfm_core::tags::write(
+            &fx.abs(rel),
+            &TagDelta::new().set(field, value),
+            &WriteOpts::new(),
+        )
+        .expect("the fixture is ours to write");
+    }
+
+    /// What one file says about a field, read off the disk.
+    fn tag_of(fx: &Fixture, rel: &str, field: Field) -> String {
+        mpdfm_core::tags::read_tags(&fx.abs(rel))
+            .expect("the file reads")
+            .get(field)
+            .joined()
+    }
+
+    /// Feed the app every worker answer that arrives, until it is in the state
+    /// the test is waiting for.
+    ///
+    /// The workers are real threads here, which is the point: this exercises the
+    /// path a keypress actually takes, channel included. What it waits for is a
+    /// thread start — the fixture's files are a few kilobytes each.
+    fn settle_until(app: &mut App, rx: &mpsc::Receiver<Msg>, done: impl Fn(&App) -> bool) {
+        for _ in 0..100 {
+            if done(app) {
+                return;
+            }
+            let Ok(msg) = rx.recv_timeout(Duration::from_secs(10)) else {
+                break;
+            };
+            app.update(msg);
+        }
+        assert!(
+            done(app),
+            "no worker answer put the app in the state the test was waiting for (writing={}, scan={:?}, cached={})",
+            app.writing,
+            app.scan,
+            app.browser.cached()
+        );
+    }
+
+    /// Put the browser in a directory with the listing focused, as walking there
+    /// would have.
+    fn in_dir(app: &mut App, dir: &str) {
+        let library = app
+            .library
+            .clone()
+            .expect("a library has landed before navigating");
+        app.browser
+            .open(DirPath::parse(dir).expect("a directory"), &library);
+        app.focus = Focus::Files;
+    }
+
+    /// Mark the first `n` rows of the listing, the way `n` presses of `space`
+    /// would: the mark key steps down after itself.
+    fn mark_first(app: &mut App, n: usize) {
+        app.dispatch(Action::Top);
+        for _ in 0..n {
+            app.dispatch(Action::ToggleMark);
+        }
+    }
+
+    /// Open the tag editor and wait for the selection's tags.
+    fn open_editor(app: &mut App, rx: &mpsc::Receiver<Msg>) {
+        assert!(app.dispatch(Action::EditTags), "the editor should open");
+        settle_until(app, rx, |app| {
+            app.tagedit().is_some_and(|form| !form.is_loading())
+        });
+    }
+
+    /// Replace a field's value as a user would: `i`, `ctrl-u`, the characters,
+    /// `esc`.
+    ///
+    /// The characters go through [`App::update`] rather than a method, because
+    /// "a letter reaches the field instead of the verb it is bound to" is half of
+    /// what this task's key handling has to get right.
+    fn type_field(app: &mut App, field: Field, text: &str) {
+        go_to_field(app, field);
+        assert!(app.dispatch(Action::EditField), "{field} would not open");
+        app.dispatch(Action::ClearLine);
+        for c in text.chars() {
+            app.update(press(c));
+        }
+        app.dispatch(Action::Cancel);
+    }
+
+    /// Walk the form's cursor onto a field.
+    fn go_to_field(app: &mut App, field: Field) {
+        let row = mpdfm_core::tags::FIELDS
+            .iter()
+            .position(|other| *other == field)
+            .expect("a field MPDFM models");
+        app.dispatch(Action::Top);
+        for _ in 0..row {
+            app.dispatch(Action::Down);
+        }
+        assert_eq!(
+            app.tagedit().map(TagEdit::field),
+            Some(field),
+            "the cursor is not on {field}"
+        );
+    }
+
+    /// The tag edits a plan holds, as `(path, field, value)`.
+    fn staged_edits(app: &App) -> Vec<(String, String, String)> {
+        app.plan
+            .ops()
+            .iter()
+            .flat_map(|op| match op {
+                mpdfm_core::ops::Operation::WriteTags { target, changes } => changes
+                    .edits()
+                    .iter()
+                    .map(|(field, edit)| {
+                        (
+                            target.to_string(),
+                            field.to_string(),
+                            edit.values()
+                                .map(mpdfm_core::tags::Values::joined)
+                                .unwrap_or_else(|| "<cleared>".to_owned()),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn e_opens_the_editor_on_the_marks_and_reads_them_on_a_worker() {
+        let fx = album_fixture();
+        let (mut app, rx) = app(&fx);
+        let mut terminal = screen(100, 30);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/Mm..Food");
+        mark_first(&mut app, 3);
+
+        // The key, not the action: `e` is what a user presses.
+        assert!(app.update(press('e')));
+        assert!(matches!(app.views.last(), Some(View::TagEdit(_))));
+        // The form is on screen before the tags are, saying what it waits for.
+        draw(&mut app, &mut terminal);
+        assert!(
+            text(&terminal).contains("reading 3 file(s)"),
+            "{}",
+            text(&terminal)
+        );
+
+        settle_until(&mut app, &rx, |app| {
+            app.tagedit().is_some_and(|form| !form.is_loading())
+        });
+        let form = app.tagedit().expect("the editor is open");
+        assert_eq!(form.len(), 3);
+        assert_eq!(
+            form.files()
+                .iter()
+                .map(|rel| rel.file_name().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["01 Beef Rap.mp3", "02 Hoe Cakes.mp3", "03 Potholderz.mp3"],
+            "the clutter is not in the selection, and the order is the listing's"
+        );
+
+        draw(&mut app, &mut terminal);
+        let shown = text(&terminal);
+        assert!(shown.contains("Edit tags — 3 files selected"), "{shown}");
+        assert!(
+            shown.contains("Album artist"),
+            "every field has a row:\n{shown}"
+        );
+        assert!(shown.contains("modified: nothing"), "{shown}");
+    }
+
+    #[test]
+    fn a_marked_directory_stands_for_the_audio_files_in_it() {
+        let fx = album_fixture();
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+        // At the root of `hiphop/`, the only row is the album directory.
+        in_dir(&mut app, "hiphop");
+        mark_first(&mut app, 1);
+
+        open_editor(&mut app, &rx);
+        assert_eq!(
+            app.tagedit().map(TagEdit::len),
+            Some(3),
+            "a marked album means its tracks"
+        );
+    }
+
+    #[test]
+    fn nothing_to_edit_says_so_rather_than_opening_an_empty_form() {
+        let fx = album_fixture();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/Mm..Food");
+        // The cursor is on the clutter, and nothing is marked.
+        app.dispatch(Action::Bottom);
+        app.toasts.clear();
+
+        assert!(app.dispatch(Action::EditTags));
+        assert!(matches!(app.views.last(), Some(View::Browser)));
+        let toast = app.toasts.front().expect("it should say something");
+        assert!(toast.text.contains("nothing to edit"), "{}", toast.text);
+    }
+
+    #[test]
+    fn editing_one_files_genre_and_staging_produces_one_write_tags_op() {
+        let fx = album_fixture();
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/Mm..Food");
+        app.dispatch(Action::Top);
+        open_editor(&mut app, &rx);
+
+        type_field(&mut app, Field::Genre, "Nu Jazz");
+        assert!(app.dispatch(Action::StageTags));
+
+        assert_eq!(app.plan.len(), 1, "one file, one operation");
+        assert_eq!(
+            staged_edits(&app),
+            vec![(
+                "hiphop/Mm..Food/01 Beef Rap.mp3".to_owned(),
+                "genre".to_owned(),
+                "Nu Jazz".to_owned()
+            )]
+        );
+        // Staging closes the form: its work has become operations.
+        assert!(matches!(app.views.last(), Some(View::Browser)));
+        // And nothing has been written.
+        assert_ne!(
+            tag_of(&fx, "hiphop/Mm..Food/01 Beef Rap.mp3", Field::Genre),
+            "Nu Jazz"
+        );
+    }
+
+    #[test]
+    fn a_multiple_field_left_alone_stages_no_change_for_it() {
+        // The critical test. Three files that disagree about the title, one
+        // field edited, and not one delta may mention the title.
+        let fx = album_fixture();
+        retag(
+            &fx,
+            "hiphop/Mm..Food/02 Hoe Cakes.mp3",
+            Field::Title,
+            "Hoe Cakes",
+        );
+        retag(
+            &fx,
+            "hiphop/Mm..Food/03 Potholderz.mp3",
+            Field::Title,
+            "Potholderz",
+        );
+
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/Mm..Food");
+        mark_first(&mut app, 3);
+        open_editor(&mut app, &rx);
+
+        let mut terminal = screen(100, 30);
+        draw(&mut app, &mut terminal);
+        assert!(
+            text(&terminal).contains("<multiple>"),
+            "three titles and no `<multiple>`:\n{}",
+            text(&terminal)
+        );
+
+        type_field(&mut app, Field::Genre, "Nu Jazz");
+        app.dispatch(Action::StageTags);
+
+        assert_eq!(app.plan.len(), 3);
+        for (path, field, value) in staged_edits(&app) {
+            assert_eq!(
+                field, "genre",
+                "{path} had its {field} written to {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn typing_into_a_multiple_field_writes_to_every_file() {
+        let fx = album_fixture();
+        retag(
+            &fx,
+            "hiphop/Mm..Food/02 Hoe Cakes.mp3",
+            Field::Genre,
+            "Soul",
+        );
+
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/Mm..Food");
+        mark_first(&mut app, 3);
+        open_editor(&mut app, &rx);
+
+        type_field(&mut app, Field::Genre, "Nu Jazz");
+        app.dispatch(Action::StageTags);
+
+        assert_eq!(
+            app.plan.len(),
+            3,
+            "all three, including the one that differed"
+        );
+        assert!(
+            staged_edits(&app)
+                .iter()
+                .all(|(_, field, value)| field == "genre" && value == "Nu Jazz")
+        );
+    }
+
+    #[test]
+    fn opening_a_multiple_field_and_leaving_it_stages_nothing() {
+        let fx = album_fixture();
+        retag(
+            &fx,
+            "hiphop/Mm..Food/02 Hoe Cakes.mp3",
+            Field::Genre,
+            "Soul",
+        );
+
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/Mm..Food");
+        mark_first(&mut app, 3);
+        open_editor(&mut app, &rx);
+
+        go_to_field(&mut app, Field::Genre);
+        app.dispatch(Action::EditField);
+        // Look at it, move the text cursor, change your mind.
+        app.dispatch(Action::Left);
+        app.dispatch(Action::Cancel);
+
+        assert_eq!(app.tagedit().map(TagEdit::is_modified), Some(false));
+        app.toasts.clear();
+        app.dispatch(Action::StageTags);
+        assert!(app.plan.is_empty(), "{:?}", app.plan.ops());
+        let toast = app.toasts.front().expect("it should say why");
+        assert!(toast.text.contains("nothing to change"), "{}", toast.text);
+    }
+
+    #[test]
+    fn a_letter_reaches_the_field_rather_than_the_verb_it_is_bound_to() {
+        // `j`, `k` and `G` move between fields on the form and must still type
+        // into one. The keymap is not consulted for a character at all.
+        let fx = album_fixture();
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/Mm..Food");
+        app.dispatch(Action::Top);
+        open_editor(&mut app, &rx);
+
+        go_to_field(&mut app, Field::Genre);
+        app.dispatch(Action::EditField);
+        app.dispatch(Action::ClearLine);
+        for c in "jkGgi".chars() {
+            app.update(press(c));
+        }
+        assert_eq!(
+            app.tagedit().map(TagEdit::field),
+            Some(Field::Genre),
+            "a letter moved the cursor"
+        );
+        app.dispatch(Action::Cancel);
+        type_field_assert(&app, Field::Genre, "jkGgi");
+    }
+
+    /// What the form would stage for one field.
+    fn type_field_assert(app: &App, field: Field, value: &str) {
+        let edits = app
+            .tagedit()
+            .expect("the editor is open")
+            .edits()
+            .get(&field)
+            .cloned();
+        assert_eq!(
+            edits,
+            Some(mpdfm_core::tags::Edit::Set(mpdfm_core::tags::Values::one(
+                value
+            )))
+        );
+    }
+
+    #[test]
+    fn an_invalid_year_shows_the_reason_and_blocks_staging() {
+        let fx = album_fixture();
+        let (mut app, rx) = app(&fx);
+        let mut terminal = screen(100, 30);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/Mm..Food");
+        app.dispatch(Action::Top);
+        open_editor(&mut app, &rx);
+
+        type_field(&mut app, Field::Year, "20x4");
+        draw(&mut app, &mut terminal);
+        assert!(
+            text(&terminal).contains("not a year"),
+            "the error is not inline:\n{}",
+            text(&terminal)
+        );
+
+        app.toasts.clear();
+        assert!(app.dispatch(Action::StageTags));
+        assert!(app.plan.is_empty(), "a bad year was staged anyway");
+        assert!(
+            matches!(app.views.last(), Some(View::TagEdit(_))),
+            "the form stays open so the value can be fixed"
+        );
+        let toast = app.toasts.front().expect("it should say why");
+        assert!(toast.text.contains("nothing staged"), "{}", toast.text);
+        assert!(toast.text.contains("year"), "{}", toast.text);
+
+        // Fixed, it stages. A full date rather than a year, because the fixture
+        // already says 2004 and an edit to what is there changes nothing.
+        type_field(&mut app, Field::Year, "2019-03-15");
+        assert!(app.dispatch(Action::StageTags));
+        assert_eq!(app.plan.len(), 1);
+        assert_eq!(
+            staged_edits(&app),
+            vec![(
+                "hiphop/Mm..Food/01 Beef Rap.mp3".to_owned(),
+                "year".to_owned(),
+                "2019-03-15".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_per_file_field_will_not_open_across_a_selection_and_names_the_key_that_does_it() {
+        let fx = album_fixture();
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/Mm..Food");
+        mark_first(&mut app, 3);
+        open_editor(&mut app, &rx);
+
+        go_to_field(&mut app, Field::Title);
+        app.toasts.clear();
+        assert!(app.dispatch(Action::EditField));
+        assert_eq!(app.tagedit().map(TagEdit::is_editing), Some(false));
+        let toast = app.toasts.front().expect("it should say why");
+        assert!(
+            toast.text.contains("every file wants its own title"),
+            "{}",
+            toast.text
+        );
+        assert!(
+            toast.text.contains('T') && toast.text.contains("titles from filenames"),
+            "the refusal does not name the action that does it: {}",
+            toast.text
+        );
+    }
+
+    #[test]
+    fn esc_without_modifications_leaves_and_with_them_asks_first() {
+        let fx = album_fixture();
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/Mm..Food");
+        app.dispatch(Action::Top);
+        open_editor(&mut app, &rx);
+
+        // Nothing typed: straight out.
+        app.dispatch(Action::Cancel);
+        assert!(matches!(app.views.last(), Some(View::Browser)));
+
+        // Something typed: a question, and `n` keeps the form and the edit.
+        open_editor(&mut app, &rx);
+        type_field(&mut app, Field::Genre, "Nu Jazz");
+        app.dispatch(Action::Cancel);
+        let Some(View::Confirm(confirm)) = app.views.last() else {
+            panic!("esc with changes should ask: {:?}", app.views);
+        };
+        assert!(confirm.question.contains("genre"), "{}", confirm.question);
+
+        app.update(press('n'));
+        assert!(matches!(app.views.last(), Some(View::TagEdit(_))));
+        assert_eq!(app.tagedit().map(TagEdit::is_modified), Some(true));
+
+        // And `y` throws the edit away.
+        app.dispatch(Action::Cancel);
+        app.update(press('y'));
+        assert!(matches!(app.views.last(), Some(View::Browser)));
+        assert!(app.plan.is_empty());
+    }
+
+    #[test]
+    fn esc_inside_a_field_leaves_the_field_and_not_the_form() {
+        let fx = album_fixture();
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/Mm..Food");
+        app.dispatch(Action::Top);
+        open_editor(&mut app, &rx);
+
+        go_to_field(&mut app, Field::Genre);
+        app.dispatch(Action::EditField);
+        app.update(key(KeyCode::Esc));
+        assert!(matches!(app.views.last(), Some(View::TagEdit(_))));
+        assert_eq!(app.tagedit().map(TagEdit::is_editing), Some(false));
+    }
+
+    #[test]
+    fn an_action_previews_and_must_be_answered_before_anything_else() {
+        let fx = album_fixture();
+        let (mut app, rx) = app(&fx);
+        let mut terminal = screen(100, 30);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/Mm..Food");
+        mark_first(&mut app, 3);
+        open_editor(&mut app, &rx);
+
+        assert!(app.dispatch(Action::TitleFromFilename));
+        draw(&mut app, &mut terminal);
+        let shown = text(&terminal);
+        assert!(shown.contains("titles from filenames"), "{shown}");
+        assert!(
+            shown.contains("Hoe Cakes"),
+            "the new value is not shown:\n{shown}"
+        );
+        // Two of three: the first file's title already is what its own name
+        // says, and an edit that would change nothing is not in the preview.
+        assert!(shown.contains("2 files would change"), "{shown}");
+
+        // The form's own keys do not reach it: the preview is a question.
+        app.dispatch(Action::ClearField);
+        assert_eq!(app.tagedit().map(TagEdit::is_modified), Some(false));
+
+        app.dispatch(Action::Submit);
+        assert!(app.tagedit().is_some_and(|form| form.preview().is_none()));
+        assert_eq!(
+            app.tagedit().map(TagEdit::modified),
+            Some(vec![Field::Title])
+        );
+
+        app.dispatch(Action::StageTags);
+        assert_eq!(
+            app.plan.len(),
+            2,
+            "the file that was already right is left alone"
+        );
+        assert!(
+            staged_edits(&app)
+                .iter()
+                .all(|(_, field, _)| field == "title")
+        );
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_written_is_named_before_anything_is_staged() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fx = album_fixture();
+        let rel = "hiphop/Mm..Food/02 Hoe Cakes.mp3";
+        let abs = fx.abs(rel);
+        let was = std::fs::metadata(abs.as_std_path())
+            .expect("the fixture is there")
+            .permissions();
+        std::fs::set_permissions(abs.as_std_path(), std::fs::Permissions::from_mode(0o444))
+            .expect("the fixture is ours");
+
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/Mm..Food");
+        mark_first(&mut app, 3);
+        open_editor(&mut app, &rx);
+        type_field(&mut app, Field::Genre, "Nu Jazz");
+
+        assert!(app.dispatch(Action::StageTags));
+        assert!(
+            app.plan.is_empty(),
+            "something was staged: {:?}",
+            app.plan.ops()
+        );
+        let Some(View::Error(message)) = app.views.last() else {
+            panic!("a refusal has to be read, not noticed: {:?}", app.views);
+        };
+        assert!(message.contains("nothing was staged"), "{message}");
+        assert!(
+            message.contains("02 Hoe Cakes.mp3"),
+            "the refusal does not name the file:\n{message}"
+        );
+
+        std::fs::set_permissions(abs.as_std_path(), was).expect("the fixture is ours");
+    }
+
+    #[test]
+    fn capital_w_commits_and_the_browser_shows_the_change_afterwards() {
+        let fx = album_fixture();
+        let rel = "hiphop/Mm..Food/01 Beef Rap.mp3";
+        let (mut app, rx) = app(&fx);
+        let mut terminal = screen(100, 30);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/Mm..Food");
+        app.dispatch(Action::Top);
+        open_editor(&mut app, &rx);
+
+        type_field(&mut app, Field::Genre, "Nu Jazz");
+        assert!(app.dispatch(Action::StageAndCommit));
+        assert!(app.writing, "the commit runs on a worker");
+
+        settle_until(&mut app, &rx, |app| !app.writing);
+        assert!(app.plan.is_empty(), "a committed plan is not still pending");
+        assert_eq!(
+            tag_of(&fx, rel, Field::Genre),
+            "Nu Jazz",
+            "the file on disk"
+        );
+
+        // The commit asks for a rescan, so the browser is looking at the new
+        // library rather than the one the edit was made against.
+        settle_until(&mut app, &rx, |app| {
+            matches!(app.scan, ScanState::Done { .. })
+        });
+        // A frame first: how many rows of tags to read ahead comes from the size
+        // the terminal last reported, and nothing has been drawn in this test.
+        draw(&mut app, &mut terminal);
+        app.update(Msg::Tick);
+        settle_until(&mut app, &rx, |app| app.browser.cached() > 0);
+        draw(&mut app, &mut terminal);
+        assert!(
+            text(&terminal).contains("Nu Jazz"),
+            "the browser is still showing the old genre:\n{}",
+            text(&terminal)
+        );
+    }
+
+    #[test]
+    fn undo_from_the_browser_reverses_a_committed_tag_edit() {
+        let fx = album_fixture();
+        let rel = "hiphop/Mm..Food/01 Beef Rap.mp3";
+        let before = tag_of(&fx, rel, Field::Genre);
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/Mm..Food");
+        app.dispatch(Action::Top);
+        open_editor(&mut app, &rx);
+
+        type_field(&mut app, Field::Genre, "Nu Jazz");
+        app.dispatch(Action::StageAndCommit);
+        settle_until(&mut app, &rx, |app| !app.writing);
+        assert_eq!(tag_of(&fx, rel, Field::Genre), "Nu Jazz");
+
+        app.toasts.clear();
+        assert!(app.dispatch(Action::Undo), "`u` in the browser");
+        settle_until(&mut app, &rx, |app| !app.writing);
+
+        assert_eq!(
+            tag_of(&fx, rel, Field::Genre),
+            before,
+            "undo did not put the genre back"
+        );
+        assert!(
+            app.views.iter().all(|view| !matches!(view, View::Error(_))),
+            "{:?}",
+            app.views
+        );
+    }
+
+    #[test]
+    fn utf8_typed_into_a_field_is_written_to_the_file() {
+        let fx = album_fixture();
+        let rel = "hiphop/Mm..Food/01 Beef Rap.mp3";
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/Mm..Food");
+        app.dispatch(Action::Top);
+        open_editor(&mut app, &rx);
+
+        // A CJK album and an accented artist, both typed one keypress at a time.
+        type_field(&mut app, Field::Album, "ノスタルジア");
+        type_field(&mut app, Field::Artist, "KREAM - So Hï");
+        app.dispatch(Action::StageAndCommit);
+        settle_until(&mut app, &rx, |app| !app.writing);
+
+        assert_eq!(tag_of(&fx, rel, Field::Album), "ノスタルジア");
+        assert_eq!(tag_of(&fx, rel, Field::Artist), "KREAM - So Hï");
+    }
+
+    #[test]
+    fn two_hundred_files_across_two_albums_open_and_preview_correctly() {
+        let names: Vec<String> = (1..=100).map(|n| format!("{n:03} Track.mp3")).collect();
+        let tracks: Vec<&str> = names.iter().map(String::as_str).collect();
+        let fx = Fixture::builder()
+            .album("hiphop/Mm..Food", &tracks)
+            .album("hiphop/Madvillainy", &tracks)
+            .build();
+
+        let (mut app, rx) = app(&fx);
+        let mut terminal = screen(100, 30);
+        app.update(scanned(&fx));
+        // Both album directories marked, from the listing that holds them.
+        in_dir(&mut app, "hiphop");
+        mark_first(&mut app, 2);
+        open_editor(&mut app, &rx);
+
+        assert_eq!(app.tagedit().map(TagEdit::len), Some(200));
+        draw(&mut app, &mut terminal);
+        assert!(
+            text(&terminal).contains("200 files selected"),
+            "{}",
+            text(&terminal)
+        );
+
+        // Two albums, so the album field disagrees — and it stays that way.
+        type_field(&mut app, Field::Genre, "Nu Jazz");
+        assert!(app.dispatch(Action::RenumberTracks));
+        draw(&mut app, &mut terminal);
+        let shown = text(&terminal);
+        assert!(shown.contains("200 files would change"), "{shown}");
+        assert!(
+            shown.contains("200/200") || shown.contains("1/200"),
+            "{shown}"
+        );
+        app.dispatch(Action::Submit);
+
+        app.dispatch(Action::StageTags);
+        assert_eq!(app.plan.len(), 200);
+        let edits = staged_edits(&app);
+        assert_eq!(edits.len(), 400, "two fields per file and nothing else");
+        assert!(
+            edits
+                .iter()
+                .all(|(_, field, _)| field == "genre" || field == "track"),
+            "the album was flattened across two albums"
+        );
+    }
+
+    #[test]
+    fn one_file_also_shows_what_the_audio_is_and_where_it_lives() {
+        let fx = album_fixture();
+        let (mut app, rx) = app(&fx);
+        let mut terminal = screen(100, 30);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/Mm..Food");
+        app.dispatch(Action::Top);
+        open_editor(&mut app, &rx);
+
+        draw(&mut app, &mut terminal);
+        let shown = text(&terminal);
+        assert!(shown.contains("hiphop/Mm..Food/01 Beef Rap.mp3"), "{shown}");
+        assert!(shown.contains("kbps") && shown.contains("Hz"), "{shown}");
+        assert!(shown.contains("Edit tags — 01 Beef Rap.mp3"), "{shown}");
+    }
+
+    #[test]
+    fn an_emptied_field_says_cleared_and_stages_a_clear() {
+        let fx = album_fixture();
+        let (mut app, rx) = app(&fx);
+        let mut terminal = screen(100, 30);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/Mm..Food");
+        app.dispatch(Action::Top);
+        open_editor(&mut app, &rx);
+
+        go_to_field(&mut app, Field::Comment);
+        assert!(app.dispatch(Action::ClearField));
+        draw(&mut app, &mut terminal);
+        assert!(
+            text(&terminal).contains("<cleared>"),
+            "the user cannot tell an emptied field from an empty one:\n{}",
+            text(&terminal)
+        );
+    }
+
+    #[test]
+    fn the_terminal_cursor_sits_in_the_field_being_typed_into() {
+        let fx = album_fixture();
+        let (mut app, rx) = app(&fx);
+        let mut terminal = screen(100, 30);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/Mm..Food");
+        app.dispatch(Action::Top);
+        open_editor(&mut app, &rx);
+
+        go_to_field(&mut app, Field::Genre);
+        app.dispatch(Action::EditField);
+        draw(&mut app, &mut terminal);
+
+        let at = terminal
+            .get_cursor_position()
+            .expect("a test backend has a cursor");
+        let (column, row) = (at.x, at.y);
+        // The form fills the body, which starts one row below the header; the
+        // genre is the eighth of the ten field rows.
+        let genre_row = mpdfm_core::tags::FIELDS
+            .iter()
+            .position(|field| *field == Field::Genre)
+            .expect("genre is a field");
+        assert_eq!(
+            usize::from(row),
+            2 + genre_row,
+            "the form's border is row 1"
+        );
+        assert!(column > 14, "the cursor is in the label column: {column}");
+    }
+
+    #[test]
+    fn the_help_overlay_opens_over_the_form_and_lists_its_keys() {
+        let fx = album_fixture();
+        let (mut app, rx) = app(&fx);
+        let mut terminal = screen(100, 30);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/Mm..Food");
+        app.dispatch(Action::Top);
+        open_editor(&mut app, &rx);
+
+        app.update(press('?'));
+        draw(&mut app, &mut terminal);
+        let shown = text(&terminal);
+        assert!(shown.contains("help · tagedit"), "{shown}");
+        assert!(shown.contains("stage the tag edit"), "{shown}");
+
+        // And closing it leaves the form exactly where it was.
+        app.update(key(KeyCode::Esc));
+        assert!(matches!(app.views.last(), Some(View::TagEdit(_))));
     }
 }

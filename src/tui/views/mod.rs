@@ -4,8 +4,9 @@
 //! | module | owns |
 //! | --- | --- |
 //! | `browser` | the library browser — where you are, what is marked, what is sorted how |
+//! | `tagedit` | the tag editor — the selection, what was typed into it, what that would write |
 //!
-//! Tasks 23–25 add the tag editor, the pending view and the search state here.
+//! Tasks 24 and 25 add the pending view and the search state here.
 //! The shape they all follow is the one `browser` sets:
 //!
 //! - **the view owns its own cursor.** Not [`App`][crate::tui::app::App], which is
@@ -18,3 +19,4 @@
 //!   `update`, never in `render`.
 
 pub mod browser;
+pub mod tagedit;

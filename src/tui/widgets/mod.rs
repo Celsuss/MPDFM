@@ -4,6 +4,7 @@
 //! | --- | --- |
 //! | `filelist` | the listing: a window of rows, marks, flags, duration, bitrate |
 //! | `details` | the narrow third column: tags, audio properties, playlists |
+//! | `input` | one line of text being typed, and the window of it that fits |
 //!
 //! # Why the width math is here and not inlined
 //!
@@ -26,6 +27,7 @@
 
 pub mod details;
 pub mod filelist;
+pub mod input;
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 

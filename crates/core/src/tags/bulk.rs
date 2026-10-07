@@ -370,6 +370,57 @@ impl BulkView {
     }
 }
 
+/// Fold several per-file edit sets into one [`TagDelta`] per file.
+///
+/// A selection can be edited in more than one way at once — `--genre X` together
+/// with `--renumber-tracks`, or a typed `album` together with the tag editor's
+/// `title from filename` — and each of those produces its own set. One file must
+/// still end up with **one** operation holding all of them, because the unit of
+/// reversal is the file and [`Conflict::DuplicateEdit`][crate::ops::Conflict::DuplicateEdit]
+/// refuses two edits of the same one.
+///
+/// **Later sets win on a field they share**, which is the order the caller applied
+/// them in: an explicit `track 3/9` alongside a renumbering means the renumbering,
+/// because that is the more specific request and the one that cannot be expressed
+/// any other way. Files come back in path order, and a file whose delta folded
+/// down to nothing is left out.
+///
+/// Shared by the CLI (`mpdfm tag set`) and the TUI's tag editor, so the two cannot
+/// disagree about which of two edits to the same field is the one that happens.
+///
+/// ```
+/// use mpdfm_core::paths::RelPath;
+/// use mpdfm_core::tags::{self, Field, TagDelta};
+///
+/// # fn main() -> Result<(), mpdfm_core::paths::PathError> {
+/// let rel = RelPath::parse("a/1.mp3")?;
+/// let merged = tags::merge(vec![
+///     vec![(rel.clone(), TagDelta::new().set(Field::Genre, "Hip Hop"))],
+///     vec![(rel.clone(), TagDelta::new().set(Field::Track, "1/9"))],
+/// ]);
+///
+/// assert_eq!(merged.len(), 1, "one file, one operation");
+/// assert_eq!(merged[0].1.len(), 2, "holding both fields");
+/// # Ok(())
+/// # }
+/// ```
+#[must_use]
+pub fn merge(sets: Vec<Vec<(RelPath, TagDelta)>>) -> Vec<(RelPath, TagDelta)> {
+    let mut merged: BTreeMap<RelPath, TagDelta> = BTreeMap::new();
+    for set in sets {
+        for (rel, delta) in set {
+            let into = merged.entry(rel).or_default();
+            for (field, edit) in delta.edits() {
+                *into = std::mem::take(into).with(*field, edit.clone());
+            }
+        }
+    }
+    merged
+        .into_iter()
+        .filter(|(_, delta)| !delta.is_empty())
+        .collect()
+}
+
 /// A map holding one edit, for the single-field actions.
 fn one(field: Field, edit: Edit) -> BTreeMap<Field, Edit> {
     let mut edits = BTreeMap::new();

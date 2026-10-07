@@ -352,7 +352,7 @@ fn edits(view: &BulkView, fields: &TagFields) -> Result<Vec<(RelPath, TagDelta)>
     if fields.trim_whitespace {
         sets.push(view.trim_whitespace());
     }
-    Ok(merge(sets))
+    Ok(tags::merge(sets))
 }
 
 /// The `--field value` flags that were given, in display order.
@@ -386,28 +386,6 @@ fn field(name: &str) -> Result<Field> {
                 .join(", ")
         )
     })
-}
-
-/// Fold several per-file edit sets into one delta per file.
-///
-/// Later sets win on a field they share, which is the order the flags are
-/// applied in — an explicit `--track 3/9` alongside `--renumber-tracks` means the
-/// renumbering, because that is the more specific request and the one that cannot
-/// be expressed any other way.
-fn merge(sets: Vec<Vec<(RelPath, TagDelta)>>) -> Vec<(RelPath, TagDelta)> {
-    let mut merged: BTreeMap<RelPath, TagDelta> = BTreeMap::new();
-    for set in sets {
-        for (rel, delta) in set {
-            let into = merged.entry(rel).or_default();
-            for (field, edit) in delta.edits() {
-                *into = std::mem::take(into).with(*field, edit.clone());
-            }
-        }
-    }
-    merged
-        .into_iter()
-        .filter(|(_, delta)| !delta.is_empty())
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
