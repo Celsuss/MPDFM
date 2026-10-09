@@ -64,6 +64,110 @@ const INDENT: &str = "        ";
 /// up and says `<per file>`.
 const MAX_TAG_VALUES: usize = 3;
 
+/// How wide the indent in front of a playlist's name is.
+///
+/// Two cells, and named because the pending view draws its `▸` / `▾` expansion
+/// marker *in* them rather than in front of them — so a playlist row is the same
+/// width and the same string in both front-ends
+/// (`docs/tasks/24-pending-view.md`).
+pub const PLAYLIST_INDENT: usize = 2;
+
+/// One line of the preview, and what it is about.
+///
+/// [`Effects::render`] is these lines joined with newlines, and that is what the
+/// CLI prints. The TUI needs the `kind` as well: which line is which operation,
+/// so a cursor can sit on one and `dd` can drop it, and which line is which
+/// playlist, so the per-line diff can be unfolded underneath it. Both front-ends
+/// therefore draw the same strings, which is what makes the anti-divergence
+/// check in `docs/tasks/24-pending-view.md` something that can be asserted
+/// rather than hoped for.
+///
+/// How many lines there are, and what kind each is, does **not** depend on
+/// `width` — only the text does. That is what lets a caller work out what is
+/// selectable without knowing how wide the pane is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewLine {
+    /// The line, already fitted to the width it was rendered at.
+    pub text: String,
+    /// What it is about.
+    pub kind: LineKind,
+}
+
+/// What a [`PreviewLine`] is about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LineKind {
+    /// The first line: how much is staged, and whether it can be committed.
+    Header,
+
+    /// A section heading, or the blank line in front of one.
+    Section,
+
+    /// One staged operation.
+    Op {
+        /// Its index in [`Plan::ops`][super::op::Plan::ops].
+        op: usize,
+        /// Whether a [`Conflict`] names it.
+        refused: bool,
+    },
+
+    /// The line under an operation that says what it costs.
+    Detail {
+        /// The operation it belongs to.
+        op: usize,
+    },
+
+    /// One changed tag field, collapsed across every operation that writes it.
+    ///
+    /// Not one operation but several: a bulk edit is one
+    /// [`Operation::WriteTags`][super::op::Operation::WriteTags] per file and the
+    /// preview shows one row per *field*, so this carries every staged operation
+    /// the row stands for.
+    Tag {
+        /// The staged operations this row stands for, ascending.
+        ops: Vec<usize>,
+        /// Whether a [`Conflict`] names any of them.
+        refused: bool,
+    },
+
+    /// One conflict.
+    Conflict {
+        /// Its index into [`Effects::conflicts`].
+        at: usize,
+    },
+
+    /// One affected playlist.
+    Playlist {
+        /// Its index into [`Effects::playlist_edits`], or `None` for MPD's saved
+        /// queue — whose edits are [`Effects::state_edits`].
+        at: Option<usize>,
+    },
+
+    /// One warning.
+    Warning {
+        /// Its index into [`Effects::warnings`].
+        at: usize,
+    },
+
+    /// A line that only qualifies the one above it.
+    Note,
+}
+
+impl LineKind {
+    /// The staged operations this line is about, if any.
+    ///
+    /// One for an [`LineKind::Op`] row, every file's edit for a
+    /// [`LineKind::Tag`] row, and none for everything else. What the pending
+    /// view's `dd` takes off the plan.
+    #[must_use]
+    pub fn ops(&self) -> Vec<usize> {
+        match self {
+            Self::Op { op, .. } | Self::Detail { op } => vec![*op],
+            Self::Tag { ops, .. } => ops.clone(),
+            _ => Vec::new(),
+        }
+    }
+}
+
 impl Effects {
     /// Render the preview at `width` columns.
     ///
@@ -71,49 +175,69 @@ impl Effects {
     /// larger message or the whole of one.
     #[must_use]
     pub fn render(&self, width: usize) -> String {
-        let width = width.max(MIN_WIDTH);
-        let mut out: Vec<String> = Vec::new();
+        self.lines(width)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
-        out.push(self.header());
+    /// The preview as lines that know what they are about.
+    ///
+    /// [`Effects::render`] is this, joined. See [`PreviewLine`] for why the TUI
+    /// takes this shape and the CLI takes the string.
+    #[must_use]
+    pub fn lines(&self, width: usize) -> Vec<PreviewLine> {
+        let width = width.max(MIN_WIDTH);
+        let mut out: Vec<PreviewLine> = Vec::new();
+
+        out.push(line(self.header(), LineKind::Header));
         for op in &self.ops {
             // Tag edits get their own section, by field rather than by file.
             if matches!(op.op, super::op::Operation::WriteTags { .. }) {
                 continue;
             }
-            out.push(op_line(op, width));
-            out.push(format!(
-                "{INDENT}{}",
-                fit(&detail(op), width - INDENT.len())
+            out.push(line(
+                op_line(op, width),
+                LineKind::Op {
+                    op: op.index,
+                    refused: op.refused,
+                },
+            ));
+            out.push(line(
+                format!("{INDENT}{}", fit(&detail(op), width - INDENT.len())),
+                LineKind::Detail { op: op.index },
             ));
         }
         out.extend(self.tag_rows(width));
 
         if !self.conflicts.is_empty() {
-            out.push(String::new());
-            out.push(format!("Conflicts ({})", self.conflicts.len()));
-            out.extend(
-                self.conflicts
-                    .iter()
-                    .map(|conflict| marked('x', conflict, width)),
-            );
+            out.push(line(String::new(), LineKind::Section));
+            out.push(line(
+                format!("Conflicts ({})", self.conflicts.len()),
+                LineKind::Section,
+            ));
+            out.extend(self.conflicts.iter().enumerate().map(|(at, conflict)| {
+                line(marked('x', conflict, width), LineKind::Conflict { at })
+            }));
         }
 
         if !self.playlist_edits.is_empty() || !self.state_edits.is_empty() {
-            out.push(String::new());
-            out.push("Playlists".to_owned());
+            out.push(line(String::new(), LineKind::Section));
+            out.push(line("Playlists".to_owned(), LineKind::Section));
             out.extend(self.playlist_rows(width));
         }
 
         if !self.warnings.is_empty() {
-            out.push(String::new());
+            out.push(line(String::new(), LineKind::Section));
             out.extend(
-                self.warnings
-                    .iter()
-                    .map(|warning| marked('!', warning, width)),
+                self.warnings.iter().enumerate().map(|(at, warning)| {
+                    line(marked('!', warning, width), LineKind::Warning { at })
+                }),
             );
         }
 
-        out.join("\n")
+        out
     }
 
     /// The first line: how much is staged, and whether it can be committed.
@@ -141,12 +265,15 @@ impl Effects {
     /// filename` — collapses to one row per distinct value, and once there are
     /// more than [`MAX_TAG_VALUES`] of them it says `<per file>` instead of
     /// listing four hundred numbers.
-    fn tag_rows(&self, width: usize) -> Vec<String> {
+    ///
+    /// Each row carries the staged operations it stands for, because one row on
+    /// screen has to be one thing the pending view can drop.
+    fn tag_rows(&self, width: usize) -> Vec<PreviewLine> {
         use super::op::Operation;
 
-        // `(field, rendered edit)` → how many files, keeping field order and
-        // then first-seen order within a field.
-        let mut counts: Vec<((crate::tags::Field, String), usize)> = Vec::new();
+        // `(field, rendered edit)` → the operations that write it, keeping field
+        // order and then first-seen order within a field.
+        let mut counts: Vec<((crate::tags::Field, String), Vec<usize>)> = Vec::new();
         let mut refused = false;
         for effect in &self.ops {
             let Operation::WriteTags { changes, .. } = &effect.op else {
@@ -156,8 +283,8 @@ impl Effects {
             for (field, edit) in changes.edits() {
                 let key = (*field, edit.rendered());
                 match counts.iter_mut().find(|(seen, _)| *seen == key) {
-                    Some((_, count)) => *count += 1,
-                    None => counts.push((key, 1)),
+                    Some((_, ops)) => ops.push(effect.index),
+                    None => counts.push((key, vec![effect.index])),
                 }
             }
         }
@@ -168,9 +295,15 @@ impl Effects {
 
         let mut rows = Vec::new();
         let mut field = None;
-        let mut group: Vec<(String, usize)> = Vec::new();
-        let mut flush = |field: crate::tags::Field, group: &mut Vec<(String, usize)>| {
-            let files: usize = group.iter().map(|(_, count)| count).sum();
+        let mut group: Vec<(String, Vec<usize>)> = Vec::new();
+        let mut flush = |field: crate::tags::Field, group: &mut Vec<(String, Vec<usize>)>| {
+            let files: usize = group.iter().map(|(_, ops)| ops.len()).sum();
+            let mut ops: Vec<usize> = group
+                .iter()
+                .flat_map(|(_, ops)| ops.iter().copied())
+                .collect();
+            ops.sort_unstable();
+            ops.dedup();
             let body = if group.len() > MAX_TAG_VALUES {
                 format!("{field} <per file>")
             } else {
@@ -183,21 +316,24 @@ impl Effects {
             let label = format!("{:<7}", "TAG");
             let note = plural(files, "file", "files");
             let room = width.saturating_sub(label.chars().count() + note.len() + 4);
-            rows.push(format!("{label}{}  {note}", fit(&body, room.max(8))));
+            rows.push(line(
+                format!("{label}{}  {note}", fit(&body, room.max(8))),
+                LineKind::Tag { ops, refused },
+            ));
             group.clear();
         };
-        for ((this, value), count) in counts {
+        for ((this, value), ops) in counts {
             if field.is_some_and(|seen| seen != this) {
                 flush(field.expect("just checked"), &mut group);
             }
             field = Some(this);
-            group.push((value, count));
+            group.push((value, ops));
         }
         if let Some(field) = field {
             flush(field, &mut group);
         }
         if refused {
-            rows.push(format!("{INDENT}REFUSED"));
+            rows.push(line(format!("{INDENT}REFUSED"), LineKind::Note));
         }
         rows
     }
@@ -205,12 +341,14 @@ impl Effects {
     /// One row per affected playlist, plus MPD's saved queue when task 14 has
     /// filled it in. The names are padded to a common column so the counts line
     /// up; a name too long for the width is shortened like any other path.
-    fn playlist_rows(&self, width: usize) -> Vec<String> {
-        let mut rows: Vec<(String, String)> = self
+    fn playlist_rows(&self, width: usize) -> Vec<PreviewLine> {
+        let mut rows: Vec<(Option<usize>, String, String)> = self
             .playlist_edits
             .iter()
-            .map(|edit| {
+            .enumerate()
+            .map(|(at, edit)| {
                 (
+                    Some(at),
                     edit.file_name.clone(),
                     lines_note(edit.rewrites(), edit.removals()),
                 )
@@ -220,28 +358,49 @@ impl Effects {
         if !self.state_edits.is_empty() {
             let removed = self.state_edits.iter().filter(|e| e.is_removal()).count();
             rows.push((
+                None,
                 "MPD saved queue".to_owned(),
                 lines_note(self.state_edits.len() - removed, removed),
             ));
         }
 
         // Two columns, each capped so that name + gap + note always fits.
-        let widest_note = rows.iter().map(|(_, note)| note.len()).max().unwrap_or(0);
-        let name_room = width.saturating_sub(2 + 1 + widest_note).max(8);
+        let widest_note = rows
+            .iter()
+            .map(|(_, _, note)| note.len())
+            .max()
+            .unwrap_or(0);
+        let name_room = width
+            .saturating_sub(PLAYLIST_INDENT + 1 + widest_note)
+            .max(8);
         let name_column = rows
             .iter()
-            .map(|(name, _)| fit(name, name_room).chars().count())
+            .map(|(_, name, _)| fit(name, name_room).chars().count())
             .max()
             .unwrap_or(0);
 
         rows.into_iter()
-            .map(|(name, note)| {
+            .map(|(at, name, note)| {
                 let name = fit(&name, name_room);
                 let pad = name_column.saturating_sub(name.chars().count());
-                format!("  {name}{:pad$} {note}", "", pad = pad)
+                line(
+                    format!(
+                        "{:indent$}{name}{:pad$} {note}",
+                        "",
+                        "",
+                        indent = PLAYLIST_INDENT,
+                        pad = pad
+                    ),
+                    LineKind::Playlist { at },
+                )
             })
             .collect()
     }
+}
+
+/// A [`PreviewLine`], at the call sites that build one of each.
+fn line(text: String, kind: LineKind) -> PreviewLine {
+    PreviewLine { text, kind }
 }
 
 /// `MOVE    from → to`, or `DELETE  target`.
@@ -496,5 +655,181 @@ mod tests {
         assert_eq!(bytes(999), "999 B");
         assert_eq!(bytes(1_000), "1.0 kB");
         assert_eq!(bytes(61_200_000), "61.2 MB");
+    }
+
+    // -- the two shapes ----------------------------------------------------
+
+    /// A plan with one of everything in it: two operations, a tag edit, a
+    /// conflict, two playlists and a warning.
+    fn everything() -> Effects {
+        use crate::paths::RelPath;
+        use crate::playlist::rewrite::{LineEdit, PlaylistEdit};
+        use crate::tags::{Field, TagDelta};
+
+        use super::super::op::Operation;
+
+        let rel = |s: &str| RelPath::parse(s).expect("a relative path");
+        let effect = |index: usize, op: Operation, refused: bool| OpEffect {
+            index,
+            op,
+            files: 3,
+            audio: 2,
+            bytes: 4_200_000,
+            playlists: 1,
+            refused,
+        };
+
+        Effects {
+            ops: vec![
+                effect(
+                    0,
+                    Operation::MoveDir {
+                        from: rel("hiphop/MF DOOM - Mm Food"),
+                        to: rel("hiphop/MF DOOM/2004 - Mm..Food"),
+                    },
+                    false,
+                ),
+                effect(
+                    1,
+                    Operation::Delete {
+                        target: rel("hiphop/MF DOOM - Mm Food/folder.nfo"),
+                    },
+                    true,
+                ),
+                effect(
+                    2,
+                    Operation::WriteTags {
+                        target: rel("hiphop/MF DOOM - Mm Food/01 Beef Rap.mp3"),
+                        changes: TagDelta::new().set(Field::Genre, "Hip Hop"),
+                    },
+                    false,
+                ),
+            ],
+            conflicts: vec![Conflict::DeleteDisabled {
+                op: 1,
+                target: rel("hiphop/MF DOOM - Mm Food/folder.nfo"),
+            }],
+            playlist_edits: vec![PlaylistEdit {
+                playlist: 0,
+                file_name: "Coding flow.m3u".to_owned(),
+                real_path: "/playlists/Coding flow.m3u".into(),
+                line_edits: vec![LineEdit {
+                    entry: 2,
+                    old: "hiphop/MF DOOM - Mm Food/01 Beef Rap.mp3".to_owned(),
+                    new: Some("hiphop/MF DOOM/2004 - Mm..Food/01 Beef Rap.mp3".to_owned()),
+                }],
+            }],
+            state_edits: vec![LineEdit {
+                entry: 7,
+                old: "hiphop/MF DOOM - Mm Food/02 Hoe Cakes.mp3".to_owned(),
+                new: None,
+            }],
+            warnings: vec![Warning::InMpdQueue {
+                path: rel("hiphop/MF DOOM - Mm Food/01 Beef Rap.mp3"),
+            }],
+            ..Effects::default()
+        }
+    }
+
+    #[test]
+    fn the_string_the_cli_prints_is_the_lines_the_tui_draws() {
+        let effects = everything();
+        for width in [40, 72, 80, 200] {
+            let joined = effects
+                .lines(width)
+                .into_iter()
+                .map(|line| line.text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(joined, effects.render(width), "at {width} columns");
+        }
+    }
+
+    #[test]
+    fn how_many_lines_there_are_and_what_they_are_about_does_not_depend_on_the_width() {
+        // What `docs/tasks/24-pending-view.md` needs from this: the pending view
+        // works out what the cursor can land on without knowing how wide its
+        // pane is, and unfolds a playlist's diff under a row it identified at
+        // one width and drew at another.
+        let effects = everything();
+        let kinds = |width| {
+            effects
+                .lines(width)
+                .into_iter()
+                .map(|line| line.kind)
+                .collect::<Vec<_>>()
+        };
+        let at_eighty = kinds(80);
+        for width in [1, 40, 41, 79, 120, 1000] {
+            assert_eq!(kinds(width), at_eighty, "at {width} columns");
+        }
+    }
+
+    #[test]
+    fn every_row_knows_which_staged_operations_it_stands_for() {
+        let lines = everything().lines(80);
+        let ops_of = |kind: fn(&LineKind) -> bool| {
+            lines
+                .iter()
+                .filter(|line| kind(&line.kind))
+                .map(|line| line.kind.ops())
+                .collect::<Vec<_>>()
+        };
+
+        // The move and the delete, in execution order, one operation each.
+        assert_eq!(
+            ops_of(|kind| matches!(kind, LineKind::Op { .. })),
+            vec![vec![0], vec![1]]
+        );
+        // The tag edit is rendered by field, and the field's row stands for the
+        // one operation that writes it — fourteen of them for an album.
+        assert_eq!(
+            ops_of(|kind| matches!(kind, LineKind::Tag { .. })),
+            vec![vec![2]]
+        );
+        // The conflict named operation 1, so its row says so.
+        assert!(lines.iter().any(|line| matches!(
+            line.kind,
+            LineKind::Op {
+                op: 1,
+                refused: true
+            }
+        )));
+        // A section heading is about no operation at all, so nothing can be
+        // dropped from one.
+        assert!(
+            lines
+                .iter()
+                .filter(|line| matches!(line.kind, LineKind::Section | LineKind::Header))
+                .all(|line| line.kind.ops().is_empty())
+        );
+    }
+
+    #[test]
+    fn the_playlist_rows_name_their_edits_and_the_saved_queue_names_none() {
+        let lines = everything().lines(80);
+        let playlists: Vec<(Option<usize>, String)> = lines
+            .iter()
+            .filter_map(|line| match line.kind {
+                LineKind::Playlist { at } => Some((at, line.text.clone())),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(playlists.len(), 2, "{playlists:?}");
+        assert_eq!(playlists[0].0, Some(0));
+        assert!(
+            playlists[0].1.starts_with("  Coding flow.m3u"),
+            "{playlists:?}"
+        );
+        // MPD's saved queue is not in `playlist_edits`, and the pending view has
+        // to be able to tell: its diff comes from `state_edits` instead.
+        assert_eq!(playlists[1].0, None);
+        assert!(playlists[1].1.contains("MPD saved queue"), "{playlists:?}");
+
+        // The indent the pending view puts its expansion marker in.
+        for (_, text) in &playlists {
+            assert!(text.starts_with(&" ".repeat(PLAYLIST_INDENT)), "{text:?}");
+        }
     }
 }

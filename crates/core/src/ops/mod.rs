@@ -55,8 +55,9 @@ pub mod op;
 pub mod plan;
 pub mod render;
 
-pub use commit::{CommitError, CommitWarning, Committed, Previewed};
+pub use commit::{CommitError, CommitWarning, Committed, Previewed, Progress};
 pub use effects::{Conflict, Effects, OpEffect, Summary, Warning};
 pub use exec_fs::Merge;
 pub use op::{Operation, Plan};
 pub use plan::{Live, Prefs};
+pub use render::{LineKind, PLAYLIST_INDENT, PreviewLine};

@@ -64,6 +64,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
@@ -71,7 +72,8 @@ use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use mpdfm_core::config::Config;
 use mpdfm_core::library::{DirPath, Library, ScanProgress};
-use mpdfm_core::ops::{Effects, Operation, Plan};
+use mpdfm_core::ops::commit::Progress;
+use mpdfm_core::ops::{Effects, Live, Operation, Plan};
 use mpdfm_core::paths::RelPath;
 use mpdfm_core::playlist::PlaylistIndex;
 use ratatui::Terminal;
@@ -86,9 +88,10 @@ use super::command::{self, Command, CommandLine};
 use super::event::Events;
 use super::keys::{KeyChord, KeyMap, KeyWarning, Keys, Mode, Resolution};
 use super::log::Log;
-use super::msg::{MpdSnapshot, Msg, Reads, ScanOutcome, TaskOutcome};
+use super::msg::{MpdSnapshot, Msg, NotCommitted, Reads, ScanOutcome, TaskOutcome};
 use super::terminal::{MIN_SIZE, fits};
 use super::views::browser::{Browser, Enter, Pane, Sort, TreeRow};
+use super::views::pending::{self, Pending, Report};
 use super::views::tagedit::{Begin, FileAction, Hints, Preview, Started, TagEdit};
 use super::widgets::details::DetailsPane;
 use super::widgets::filelist::FileList;
@@ -201,6 +204,16 @@ pub enum View {
     /// Boxed because it holds every selected file's tags — two hundred `TagSet`s
     /// is not a thing to move through a `match` every time a key is pressed.
     TagEdit(Box<TagEdit>),
+    /// What is staged, what it would do, and the `c` that says yes. Task 24.
+    ///
+    /// Boxed for the same reason as the editor: it holds an `Effects`, which for
+    /// a two-thousand-file organize is every filesystem step and every playlist
+    /// line in the plan.
+    ///
+    /// It holds the *preview* and not the plan. The plan is `App::plan`, which is
+    /// what makes staged operations survive `esc` and a resize — popping this
+    /// view throws away a cursor and some folds, and nothing else.
+    Pending(Box<Pending>),
     /// The key help, generated from the live keymap for the mode it was opened
     /// from. Task 26 adds the other modes' sections and the grouping.
     Help {
@@ -250,6 +263,7 @@ impl View {
                 | Self::Notice { .. }
                 | Self::Error(_)
                 | Self::TagEdit(_)
+                | Self::Pending(_)
         )
     }
 
@@ -258,6 +272,7 @@ impl View {
         match self {
             Self::Browser => "browser",
             Self::TagEdit(_) => "tagedit",
+            Self::Pending(_) => "pending",
             Self::Help { .. } => "help",
             Self::Command(_) => "command",
             Self::Confirm(_) => "confirm",
@@ -292,6 +307,12 @@ enum Answer {
     Act(Action),
     /// Close the tag editor, throwing away what was typed into it.
     DiscardEdits,
+    /// Throw the staged plan away.
+    ///
+    /// Not an action for the same reason as `DiscardEdits`: `x` is the verb, and
+    /// it is the thing that *asks*. A second action that discarded without
+    /// asking would be a key a user could bind and lose a plan to.
+    DiscardPlan,
 }
 
 /// How serious a message is, and therefore whether it expires.
@@ -317,6 +338,65 @@ pub struct Toast {
     /// queue, because a message that waited behind two others has not been read
     /// yet and its clock should not have been running.
     expires: Option<Instant>,
+}
+
+/// A transaction on a worker, and what it has said so far.
+///
+/// One of these at a time: a commit and an undo are the same thing from the
+/// library's point of view — a transaction in progress — and the second of two
+/// would be previewed against a library the first is in the middle of changing.
+#[derive(Debug)]
+struct Running {
+    /// What it is, for the message line: `committing`, `undoing`.
+    what: &'static str,
+    /// How many operations it is about, for the same.
+    ops: usize,
+    /// The last thing the worker said. `None` until the first word of it.
+    progress: Option<Progress>,
+    /// Set from this thread to call a commit off.
+    ///
+    /// Shared with the worker rather than sent to it: by the time a message had
+    /// been received the commit would be past the one boundary where it can
+    /// still be abandoned with nothing to put back (`commit::Options::cancel`).
+    cancel: Arc<AtomicBool>,
+    /// Whether the user has asked for that and the worker has not answered yet.
+    cancelling: bool,
+}
+
+impl Running {
+    /// The line the message bar shows while this is going on.
+    fn line(&self) -> String {
+        if self.cancelling {
+            return format!("{}: stopping before anything is changed…", self.what);
+        }
+        let plural = if self.ops == 1 { "" } else { "s" };
+        let detail = match self.progress {
+            None => "starting…".to_owned(),
+            Some(Progress::Validating) => "re-checking the library…".to_owned(),
+            Some(Progress::BackingUp { steps }) => {
+                format!("backing up, {steps} step(s) to run…")
+            }
+            Some(Progress::Steps { done, steps }) => {
+                let percent = done.saturating_mul(100) / steps.max(1);
+                format!("{done}/{steps} files ({percent}%)")
+            }
+            Some(Progress::Playlists { playlists }) => {
+                format!("rewriting {playlists} playlist(s)…")
+            }
+            Some(Progress::Finishing) => "finishing…".to_owned(),
+        };
+        format!("{} {} operation{plural} · {detail}", self.what, self.ops)
+    }
+
+    /// Whether this can still be called off.
+    ///
+    /// Only before the first mutation, which is while the plan is being
+    /// re-validated. After that the honest answer is that the transaction has to
+    /// finish or be recovered, and a key that pretended otherwise would be
+    /// worse than no key.
+    fn is_cancellable(&self) -> bool {
+        !self.cancelling && matches!(self.progress, None | Some(Progress::Validating))
+    }
 }
 
 /// What the status line says about a scan.
@@ -376,13 +456,16 @@ pub struct App {
     mpd: Option<MpdSnapshot>,
     /// Whether an MPD poll is already out, so the tick does not stack them up.
     mpd_in_flight: bool,
-    /// Whether a commit or an undo is running on a worker.
+    /// The commit or undo on a worker, when there is one, and how far it has got.
+    running: Option<Running>,
+    /// MPD's live queue, as the last poll that asked for it found it.
     ///
-    /// One flag for both, because they are the same thing from the library's
-    /// point of view — a transaction in progress — and two of those at once would
-    /// have the second one's preview made against a library the first is in the
-    /// middle of changing.
-    writing: bool,
+    /// Only polled for while something is staged, and held here because the
+    /// preview and the commit must be given the *same* answer: whether the
+    /// daemon is holding a queue decides whether a move rewrites MPD's saved
+    /// queue or warns that it will need a requeue, and disagreeing about that
+    /// between the two is drift and a refused commit.
+    queue: Option<Vec<RelPath>>,
     /// Where workers send their answers.
     tx: Sender<Msg>,
     /// `--log`, or nothing.
@@ -412,7 +495,8 @@ impl App {
             scan: ScanState::Idle,
             mpd: None,
             mpd_in_flight: false,
-            writing: false,
+            running: None,
+            queue: None,
             tx,
             log,
             quit: false,
@@ -493,6 +577,7 @@ impl App {
             Msg::ScanDone(outcome) => self.on_scan_done(*outcome),
             Msg::MpdStatus(snapshot) => self.on_mpd(*snapshot),
             Msg::TaskDone(outcome) => self.on_task_done(*outcome),
+            Msg::Committing(progress) => self.on_committing(progress),
             Msg::Shutdown => {
                 self.log.line("shutdown: asked to stop");
                 self.quit = true;
@@ -581,6 +666,7 @@ impl App {
         match self.views.last() {
             Some(View::Command(_)) => Mode::Command,
             Some(View::TagEdit(_)) => Mode::TagEdit,
+            Some(View::Pending(_)) => Mode::Pending,
             _ => Mode::Browser,
         }
     }
@@ -601,6 +687,9 @@ impl App {
                             self.log.line("tagedit: changes discarded");
                             self.views.pop();
                         }
+                    }
+                    Answer::DiscardPlan => {
+                        self.discard_plan();
                     }
                 }
                 true
@@ -689,6 +778,12 @@ impl App {
             return dirty;
         }
 
+        // And so does the pending view, for the same reason and in the same
+        // place: `d` unstages in there and stages a delete everywhere else.
+        if let Some(dirty) = self.pending_action(action) {
+            return dirty;
+        }
+
         // A panel has the keyboard: only the things that get rid of it work — and,
         // for the help, the ones that move around inside it.
         if self.views.last().is_some_and(View::is_modal) {
@@ -755,22 +850,28 @@ impl App {
 
             // -- changing things ----------------------------------------------
             Action::EditTags => self.open_tag_editor(),
-            // The one verb task 24 owns that task 23 has to answer anyway: `W`
-            // commits a tag edit, and the next thing a user reaches for after a
-            // commit is the key that takes it back.
-            Action::Undo => self.undo_last(),
+            Action::Undo => self.undo_last(None),
+
+            // -- staging, and the view that shows what was staged -------------
+            Action::StageMove => self.stage_move(),
+            Action::Rename => self.rename(),
+            Action::StageDelete => self.stage_delete(),
+            Action::ShowPending => self.show_pending(),
+            Action::Commit => self.commit_pending(),
+            Action::DiscardPending => self.discard_pending(),
+            // The one verb that needs a staged operation to point at, so the
+            // browser has nothing to do with it.
+            Action::Unstage => {
+                let key = self.keys.map().key_for(Mode::Pending, Action::ShowPending);
+                let how = key.map_or_else(
+                    || "open the pending view first".to_owned(),
+                    |key| format!("press {key} for the pending view"),
+                );
+                self.notify(Level::Warn, format!("nothing to unstage here — {how}"));
+                true
+            }
 
             // -- the views that are not built yet ---------------------------
-            // Staging a move needs somewhere to show what was staged, and that
-            // is task 24: this task hands it the marks, and that is the whole of
-            // the seam between them.
-            Action::StageMove
-            | Action::Rename
-            | Action::StageDelete
-            | Action::ShowPending
-            | Action::Unstage
-            | Action::Commit
-            | Action::DiscardPending => self.not_yet(action.help(), Some("24-pending-view.md")),
             Action::Search | Action::SearchNext | Action::SearchPrev | Action::Filter => {
                 self.not_yet(action.help(), Some("25-search-and-filter.md"))
             }
@@ -1177,7 +1278,10 @@ impl App {
             self.notify(Level::Warn, "no library yet · rescan first");
             return None;
         };
-        Some(plan.validate(library, index, &self.config))
+        // `validate_live` and not `validate`: whether MPD is holding a queue
+        // decides whether its saved queue is rewritten or merely warned about,
+        // and the commit is given the same answer (`App::queue`).
+        Some(plan.validate_live(library, index, &self.config, &self.live()))
     }
 
     /// Commit everything staged, on a worker.
@@ -1186,7 +1290,7 @@ impl App {
     /// and refuses as drift if the answer has changed since, which is what makes
     /// handing a worker a clone of the model safe.
     fn commit_plan(&mut self, effects: Effects) -> bool {
-        if self.writing {
+        if self.running.is_some() {
             self.notify(Level::Warn, "a transaction is already running");
             return true;
         }
@@ -1194,37 +1298,590 @@ impl App {
             return false;
         };
         let ops = self.plan.len();
-        self.writing = true;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.running = Some(Running {
+            what: "committing",
+            ops,
+            progress: None,
+            cancel: Arc::clone(&cancel),
+            cancelling: false,
+        });
         self.log
             .line(format!("commit: starting, {ops} operation(s)"));
         work::commit(
             self.tx.clone(),
-            self.plan.clone(),
-            library,
-            effects,
-            self.config.clone(),
-            Arc::clone(&self.log),
+            work::CommitJob {
+                plan: self.plan.clone(),
+                library,
+                effects,
+                config: self.config.clone(),
+                // The same answer the preview was given, or commit refuses as
+                // drift. See `App::queue`.
+                queue: self.queue.clone(),
+                cancel,
+                log: Arc::clone(&self.log),
+            },
         );
-        let plural = if ops == 1 { "" } else { "s" };
-        self.notify(Level::Info, format!("committing {ops} operation{plural}…"));
         true
     }
 
-    /// `u`: reverse the most recent undoable transaction.
+    /// `u`: reverse a committed transaction — the one the pending view has just
+    /// made, or the most recent undoable one.
     ///
-    /// The whole of what task 23 needs from undo: `W` wrote some tags and the
-    /// user wants them back. Task 24 owns the version that offers it from the
-    /// pending view and names the transaction it is about.
-    fn undo_last(&mut self) -> bool {
-        if self.writing {
+    /// `txid` is what makes the offer after a commit honest: it names the
+    /// transaction the user is looking at, not whichever happens to be newest by
+    /// the time they press the key.
+    fn undo_last(&mut self, txid: Option<String>) -> bool {
+        if self.running.is_some() {
             self.notify(Level::Warn, "a transaction is already running");
             return true;
         }
-        self.writing = true;
-        self.log.line("undo: starting");
-        work::undo(self.tx.clone(), self.config.clone(), Arc::clone(&self.log));
-        self.notify(Level::Info, "undoing the last transaction…");
+        let what = txid.clone().map_or_else(
+            || "the last transaction".to_owned(),
+            |txid| format!("transaction {txid}"),
+        );
+        self.running = Some(Running {
+            what: "undoing",
+            ops: 0,
+            progress: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            cancelling: false,
+        });
+        self.log.line(format!("undo: starting on {what}"));
+        work::undo(
+            self.tx.clone(),
+            self.config.clone(),
+            txid,
+            Arc::clone(&self.log),
+        );
+        self.notify(Level::Info, format!("undoing {what}…"));
         true
+    }
+
+    // -- staging, and the view that shows what is staged -------------------
+
+    /// The pending view on the stack, if it is there.
+    fn pending(&self) -> Option<&Pending> {
+        match self.views.last() {
+            Some(View::Pending(view)) => Some(view),
+            _ => None,
+        }
+    }
+
+    /// The pending view on the stack, to change.
+    fn pending_mut(&mut self) -> Option<&mut Pending> {
+        match self.views.last_mut() {
+            Some(View::Pending(view)) => Some(view),
+            _ => None,
+        }
+    }
+
+    /// The pending view's share of the actions, or `None` if it wants none of
+    /// them.
+    ///
+    /// `d` is the reason this exists and sits beside the tag editor's: in here it
+    /// takes an operation off the plan, and everywhere else it stages a delete.
+    /// One mode, one meaning, and no `match` on a `KeyCode` anywhere.
+    fn pending_action(&mut self, action: Action) -> Option<bool> {
+        self.pending()?;
+        let rows = self.pending_rows();
+        let step = self.page_step();
+        Some(match action {
+            Action::Down => self.pending_mut()?.move_cursor(1, rows),
+            Action::Up => self.pending_mut()?.move_cursor(-1, rows),
+            Action::HalfPageDown => self.pending_mut()?.move_cursor(step, rows),
+            Action::HalfPageUp => self.pending_mut()?.move_cursor(-step, rows),
+            Action::Top => self.pending_mut()?.set_cursor(0, rows),
+            Action::Bottom => self.pending_mut()?.set_cursor(usize::MAX, rows),
+            // Unfolding: `enter` either way, and the two directions for a user
+            // who thinks of it as a tree.
+            Action::Open | Action::Submit => self.pending_mut()?.toggle(),
+            Action::Right => self.pending_mut()?.expand(),
+            Action::Left => self.pending_mut()?.collapse(),
+
+            Action::Unstage => self.unstage_selected(),
+            Action::Commit => self.commit_pending(),
+            Action::DiscardPending => self.discard_pending(),
+            // The transaction this view has just made, by name.
+            Action::Undo => {
+                let txid = match self.pending()?.report() {
+                    Some(Report::Done { txid, .. }) => Some(txid.clone()),
+                    _ => None,
+                };
+                self.undo_last(txid)
+            }
+            // `p` is the key that opened it, so it is the key that closes it.
+            Action::ShowPending => self.pop(),
+            Action::Cancel => self.leave_pending(),
+            // The help, quitting, and anything a user has bound in here that
+            // this view has no opinion about: the panel rules answer those.
+            _ => return None,
+        })
+    }
+
+    /// `esc` in the pending view: call off a commit, dismiss a report, or leave.
+    ///
+    /// In that order, because that is the order of what the user is looking at.
+    fn leave_pending(&mut self) -> bool {
+        if self.cancel_commit() {
+            return true;
+        }
+        if let Some(view) = self.pending_mut()
+            && view.report().is_some()
+        {
+            view.dismiss();
+            // A report about a transaction that emptied the plan has nothing
+            // left behind it, so dismissing it leaves the view as well.
+            return if self.plan.is_empty() {
+                self.pop()
+            } else {
+                true
+            };
+        }
+        self.pop()
+    }
+
+    /// Ask a running commit to stop, if it still can.
+    ///
+    /// Returns whether there was anything to ask. A transaction that is past
+    /// re-validation has already taken backups and written a record, and the way
+    /// out of that one is `mpdfm recover` — so this says so rather than setting a
+    /// flag nothing will read.
+    fn cancel_commit(&mut self) -> bool {
+        let Some(running) = &mut self.running else {
+            return false;
+        };
+        if !running.is_cancellable() {
+            self.notify(
+                Level::Warn,
+                "too late to stop: the transaction is past the point where nothing had changed",
+            );
+            return true;
+        }
+        running.cancel.store(true, Ordering::Relaxed);
+        running.cancelling = true;
+        self.log.line("commit: cancellation asked for");
+        self.notify(Level::Info, "stopping the commit…");
+        true
+    }
+
+    /// `p`: show what is staged, re-validated as of now.
+    fn show_pending(&mut self) -> bool {
+        if matches!(self.views.last(), Some(View::Pending(_))) {
+            return self.pop();
+        }
+        if self.plan.is_empty() {
+            self.notify(Level::Info, "nothing staged");
+            return true;
+        }
+        let plan = self.plan.clone();
+        let Some(effects) = self.preview_plan(&plan) else {
+            return true;
+        };
+        self.push(View::Pending(Box::new(Pending::new(effects))))
+    }
+
+    /// Stage these operations and show what they would do.
+    ///
+    /// Staged first and previewed second, which is the opposite of the tag
+    /// editor's order and deliberately so: a tag edit that cannot be committed is
+    /// refused before it is staged because the form is still open and the user
+    /// can fix it there, while a move that conflicts has nowhere else to be
+    /// fixed. The pending view *is* where it is fixed — the conflict is on the
+    /// row, and `dd` takes it off.
+    fn stage(&mut self, ops: Vec<Operation>, what: &str) -> bool {
+        let count = ops.len();
+        let mut planned = self.plan.clone();
+        for op in ops {
+            planned.push(op);
+        }
+        let Some(effects) = self.preview_plan(&planned) else {
+            return true;
+        };
+
+        self.plan = planned;
+        self.log.line(format!(
+            "plan: staged {count} {what} op(s), {} total",
+            self.plan.len()
+        ));
+        let conflicts = effects.conflicts.len();
+        match self.pending_mut() {
+            Some(view) => {
+                view.dismiss();
+                view.revalidated(effects);
+            }
+            None => {
+                self.push(View::Pending(Box::new(Pending::new(effects))));
+            }
+        }
+        if conflicts > 0 {
+            self.notify(
+                Level::Warn,
+                format!(
+                    "staged {count} {what} op(s) — {conflicts} conflict(s): nothing will commit until they are gone"
+                ),
+            );
+        } else {
+            self.notify(
+                Level::Info,
+                format!("staged {count} {what} op(s) · {} pending", self.plan.len()),
+            );
+        }
+        true
+    }
+
+    /// What a staged move or delete is about: the marks, or the row the cursor is
+    /// on.
+    ///
+    /// The same rule as the tag editor's, and the same reason: a user who has
+    /// marked nothing means the thing they are looking at.
+    fn targets(&self) -> Vec<RelPath> {
+        let Some(library) = &self.library else {
+            return Vec::new();
+        };
+        let mut marks = self.browser.marks();
+        if marks.is_empty() {
+            marks.extend(self.browser.focused_path(library));
+        }
+        marks
+    }
+
+    /// `m`: move the marks into the directory the browser is showing.
+    ///
+    /// Mark, walk to where they belong, press the key — which is the gesture a
+    /// file manager has and a `move` command does not. `:move <dst>` is the other
+    /// door, and the one that can rename.
+    fn stage_move(&mut self) -> bool {
+        let dir = self.browser.dir().clone();
+        let targets = self.targets();
+        if targets.is_empty() {
+            self.notify(
+                Level::Warn,
+                "nothing to move: mark something, or put the cursor on it",
+            );
+            return true;
+        }
+        match self.move_ops_into(&dir, &targets) {
+            Ok(ops) => self.stage_moves(ops),
+            Err(message) => {
+                self.notify(Level::Warn, message);
+                true
+            }
+        }
+    }
+
+    /// `r`: rename the row under the cursor, by opening `:move` on its own path.
+    ///
+    /// The command line and not a prompt of its own: the destination of a rename
+    /// is a path, editing a path is what that line does, and `:move` is already
+    /// the thing that stages one. A user who changes their mind presses `esc`.
+    fn rename(&mut self) -> bool {
+        let Some(library) = &self.library else {
+            return false;
+        };
+        let Some(target) = self.browser.focused_path(library) else {
+            self.notify(Level::Warn, "nothing under the cursor to rename");
+            return true;
+        };
+        self.push(View::Command(CommandLine::of(format!("move {target}"))))
+    }
+
+    /// `:move <dst>` — one source to that exact path, several into that
+    /// directory.
+    ///
+    /// The distinction is what makes the command a rename as well: with one
+    /// thing selected, the destination the user typed is the destination, and
+    /// with several there is nothing else `dst` could sensibly be.
+    fn stage_move_to(&mut self, dst: &str) -> bool {
+        let targets = self.targets();
+        if targets.is_empty() {
+            self.notify(
+                Level::Warn,
+                "nothing to move: mark something, or put the cursor on it",
+            );
+            return true;
+        }
+
+        let ops = match targets.as_slice() {
+            [only] => {
+                let Some(library) = &self.library else {
+                    return false;
+                };
+                RelPath::parse(dst)
+                    .map(|to| vec![move_op(library, only, to)])
+                    .map_err(|err| format!("{dst}: {err}"))
+            }
+            many => DirPath::parse(dst)
+                .map_err(|err| format!("{dst}: {err}"))
+                .and_then(|dir| self.move_ops_into(&dir, many)),
+        };
+        match ops {
+            Ok(ops) => self.stage_moves(ops),
+            Err(message) => {
+                self.notify(Level::Warn, message);
+                true
+            }
+        }
+    }
+
+    /// Each target moved into `dir`, keeping its own name.
+    fn move_ops_into(&self, dir: &DirPath, targets: &[RelPath]) -> Result<Vec<Operation>, String> {
+        let Some(library) = &self.library else {
+            return Ok(Vec::new());
+        };
+        targets
+            .iter()
+            .map(|target| {
+                dir.join(target.file_name())
+                    .map(|to| move_op(library, target, to))
+                    .map_err(|err| format!("{}: {err}", target.file_name()))
+            })
+            .collect()
+    }
+
+    /// Stage these moves, leaving out the ones that would not move anything.
+    ///
+    /// A move of something onto itself is not a conflict to be shown, it is a
+    /// keypress that meant nothing — most often `m` in the directory the marks
+    /// are already in.
+    fn stage_moves(&mut self, mut ops: Vec<Operation>) -> bool {
+        ops.retain(|op| op.destination().is_none_or(|to| to != op.source()));
+        if ops.is_empty() {
+            self.notify(Level::Info, "already there: nothing to move");
+            return true;
+        }
+        self.stage(ops, "move")
+    }
+
+    /// `d`: stage a delete of the marks.
+    ///
+    /// Files only. A delete is per file in the journal, because the unit of
+    /// reversal is the file, and a marked *directory* is left out rather than
+    /// quietly expanded into everything under it — deleting a tree is not a
+    /// thing to infer from one keystroke. `delete_enabled` is what decides
+    /// whether any of it can be committed, and the pending view is where that
+    /// shows.
+    fn stage_delete(&mut self) -> bool {
+        let targets = self.targets();
+        if targets.is_empty() {
+            self.notify(
+                Level::Warn,
+                "nothing to delete: mark something, or put the cursor on it",
+            );
+            return true;
+        }
+        let Some(library) = &self.library else {
+            return false;
+        };
+
+        let mut ops = Vec::new();
+        let mut skipped = 0;
+        for target in targets {
+            if library.get(&target).is_some() {
+                ops.push(Operation::Delete { target });
+            } else {
+                skipped += 1;
+            }
+        }
+        if ops.is_empty() {
+            self.notify(
+                Level::Warn,
+                "nothing staged: a delete is per file, and no file is marked",
+            );
+            return true;
+        }
+        if skipped > 0 {
+            let plural = if skipped == 1 { "y was" } else { "ies were" };
+            self.notify(
+                Level::Warn,
+                format!("{skipped} marked director{plural} left out: a delete is per file"),
+            );
+        }
+        self.stage(ops, "delete")
+    }
+
+    /// `dd`: take the operation under the cursor off the plan.
+    ///
+    /// Re-validates afterwards, which is not housekeeping: dropping one
+    /// operation can make a conflict disappear — the two that wanted the same
+    /// destination — and can equally make one appear, when the operation that
+    /// was going to vacate a directory is the one that went.
+    fn unstage_selected(&mut self) -> bool {
+        let Some(view) = self.pending() else {
+            return false;
+        };
+        if view.report().is_some() {
+            self.notify(Level::Info, "that transaction is already committed");
+            return true;
+        }
+        let ops = view.selected_ops();
+        if ops.is_empty() {
+            self.notify(Level::Warn, "no operation under the cursor");
+            return true;
+        }
+
+        // Descending, so that removing one does not move the next.
+        let mut dropped = Vec::new();
+        for &at in ops.iter().rev() {
+            if let Some(op) = self.plan.remove(at) {
+                dropped.push(op);
+            }
+        }
+        self.log
+            .line(format!("plan: dropped {} operation(s)", dropped.len()));
+
+        if self.plan.is_empty() {
+            self.notify(Level::Info, "nothing staged");
+            self.pop();
+            return true;
+        }
+        self.revalidate();
+        let count = dropped.len();
+        let plural = if count == 1 { "" } else { "s" };
+        self.notify(
+            Level::Info,
+            format!(
+                "dropped {count} operation{plural} · {} pending",
+                self.plan.len()
+            ),
+        );
+        true
+    }
+
+    /// `x`: throw the whole plan away, once the user has said so.
+    fn discard_pending(&mut self) -> bool {
+        if self.plan.is_empty() {
+            self.notify(Level::Info, "nothing staged");
+            return true;
+        }
+        let count = self.plan.len();
+        let plural = if count == 1 { "" } else { "s" };
+        self.push(View::Confirm(Confirm {
+            question: format!("{count} staged operation{plural} will be thrown away."),
+            on_yes: Answer::DiscardPlan,
+        }))
+    }
+
+    /// Throw the plan away, which is what saying yes to that question means.
+    fn discard_plan(&mut self) -> bool {
+        let count = self.plan.len();
+        self.plan = Plan::new();
+        self.log
+            .line(format!("plan: discarded {count} operation(s)"));
+        if matches!(self.views.last(), Some(View::Pending(_))) {
+            self.views.pop();
+        }
+        let plural = if count == 1 { "" } else { "s" };
+        self.notify(
+            Level::Info,
+            format!("discarded {count} staged operation{plural}"),
+        );
+        true
+    }
+
+    /// `c`: commit what is staged, once it is clear that it can be.
+    fn commit_pending(&mut self) -> bool {
+        if self.running.is_some() {
+            self.notify(Level::Warn, "a transaction is already running");
+            return true;
+        }
+        if self.plan.is_empty() {
+            self.notify(Level::Info, "nothing staged");
+            return true;
+        }
+        // What the user is looking at, when they are looking at something:
+        // `c` commits the preview on screen and not a fresh one that may have
+        // moved under it. Commit re-validates anyway and refuses as drift if the
+        // disk no longer matches, which is the honest outcome — and better than
+        // silently committing a plan nobody read.
+        let plan = self.plan.clone();
+        let effects = match self.pending() {
+            Some(view) if view.report().is_none() => view.effects().clone(),
+            _ => {
+                let Some(effects) = self.preview_plan(&plan) else {
+                    return true;
+                };
+                effects
+            }
+        };
+
+        if !effects.is_committable() {
+            // Shown, not described: the view puts the cursor on the first
+            // refused operation with the reason unfolded under it.
+            let conflicts = effects.conflicts.len();
+            match self.pending_mut() {
+                Some(view) => view.revalidated(effects),
+                None => {
+                    self.push(View::Pending(Box::new(Pending::new(effects))));
+                }
+            }
+            self.notify(
+                Level::Warn,
+                if conflicts == 0 {
+                    "there is nothing to do".to_owned()
+                } else {
+                    format!("not committed: {conflicts} conflict(s) to deal with first")
+                },
+            );
+            return true;
+        }
+
+        // Shown before it runs, so that a commit the user started from the
+        // browser has the preview and the progress in front of them.
+        if self.pending().is_none() {
+            self.push(View::Pending(Box::new(Pending::new(effects.clone()))));
+        } else if let Some(view) = self.pending_mut() {
+            view.dismiss();
+        }
+        self.commit_plan(effects)
+    }
+
+    /// Re-validate the staged plan and hand the answer to the open view.
+    ///
+    /// The whole of how this view stays honest: nothing patches [`Effects`], and
+    /// every change to the plan or to the library comes back through here.
+    fn revalidate(&mut self) -> bool {
+        let plan = self.plan.clone();
+        let (Some(library), Some(index)) = (&self.library, &self.index) else {
+            return false;
+        };
+        let effects = plan.validate_live(library, index, &self.config, &self.live());
+        match self.pending_mut() {
+            Some(view) => {
+                view.revalidated(effects);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// What MPD is holding, as the preview and the commit must both be told.
+    fn live(&self) -> Live<'_> {
+        Live {
+            queue: self.queue.as_deref(),
+        }
+    }
+
+    /// How many rows the pending view's body has, from the last size the
+    /// terminal reported.
+    ///
+    /// An estimate, like [`App::list_rows`]: it decides how far a half-page jump
+    /// goes, and the frame itself measures the real pane.
+    fn pending_rows(&self) -> usize {
+        usize::from(self.body().height.saturating_sub(2)).max(1)
+    }
+
+    /// The keys the pending view's own text names, read off the live keymap.
+    fn pending_hints(&self) -> pending::Hints {
+        let key = |action| self.keys.map().key_for(Mode::Pending, action);
+        pending::Hints {
+            commit: key(Action::Commit),
+            drop: key(Action::Unstage),
+            discard: key(Action::DiscardPending),
+            undo: key(Action::Undo),
+            expand: key(Action::Open),
+            back: key(Action::Cancel),
+        }
     }
 
     /// How many rows a preview box has room for, from the last size the terminal
@@ -1318,20 +1975,12 @@ impl App {
             } else {
                 Action::Quit
             }),
-            Command::Move { dst } => {
-                self.not_yet(format!("move to {dst}"), Some("24-pending-view.md"))
-            }
+            Command::Move { dst } => self.stage_move_to(&dst),
             Command::Organize { template } => self.not_yet(
                 format!("organize by {template}"),
                 Some("28-organize-command.md"),
             ),
-            Command::Undo { txid } => {
-                let what = txid.map_or_else(
-                    || "undo the last transaction".to_owned(),
-                    |txid| format!("undo {txid}"),
-                );
-                self.not_yet(what, Some("24-pending-view.md"))
-            }
+            Command::Undo { txid } => self.undo_last(txid),
             Command::Doctor => self.not_yet("doctor", Some("29-doctor.md")),
             Command::Set { key, value } => self.set_setting(&key, &value),
         }
@@ -1425,7 +2074,15 @@ impl App {
 
         if !self.mpd_in_flight {
             self.mpd_in_flight = true;
-            work::poll_mpd(self.tx.clone(), self.config.clone(), Arc::clone(&self.log));
+            // The queue is only worth a round trip when something is staged:
+            // it is the one part of a poll whose cost is the length of the
+            // user's queue, and nothing but a preview reads it.
+            work::poll_mpd(
+                self.tx.clone(),
+                self.config.clone(),
+                !self.plan.is_empty(),
+                Arc::clone(&self.log),
+            );
         }
 
         retired || expired
@@ -1462,6 +2119,12 @@ impl App {
                     self.browser.library_changed(library, self.index.as_ref());
                 }
                 self.tags_in_flight = false;
+                // The preview was worked out against the library that has just
+                // been replaced, which includes the one a commit's own rescan
+                // replaces. Nothing is patched; it is made again.
+                if self.pending().is_some() {
+                    self.revalidate();
+                }
 
                 if warnings == 0 {
                     self.notify(Level::Info, summary);
@@ -1502,7 +2165,32 @@ impl App {
             }
         }
 
+        // The live queue decides whether a staged move rewrites MPD's saved
+        // queue or warns that the daemon will need a requeue, so a queue that
+        // has changed under an open preview is a preview that has to be made
+        // again. Rare — the user has to have touched MPD while reading it —
+        // which is why this is the one thing a poll can cost a re-validation.
+        let requeued = self.queue != snapshot.queue;
+        self.queue = snapshot.queue.clone();
         self.mpd = Some(snapshot);
+        if requeued && self.pending().is_some() && self.revalidate() {
+            return true;
+        }
+        changed
+    }
+
+    /// A commit said how far it has got.
+    ///
+    /// No state a key can act on changes here: it is a line on screen, and the
+    /// one thing it decides is whether `esc` can still call the commit off.
+    fn on_committing(&mut self, progress: Progress) -> bool {
+        let Some(running) = &mut self.running else {
+            // The answer arrived before the last of the progress, which is
+            // possible: two sends, one channel, and the loop drains it.
+            return false;
+        };
+        let changed = running.progress != Some(progress);
+        running.progress = Some(progress);
         changed
     }
 
@@ -1564,31 +2252,66 @@ impl App {
     /// order to fix whatever was wrong.
     fn on_committed(
         &mut self,
-        result: Result<Box<mpdfm_core::ops::commit::Committed>, String>,
+        result: Result<Box<mpdfm_core::ops::commit::Committed>, NotCommitted>,
     ) -> bool {
-        self.writing = false;
+        self.running = None;
         match result {
             Ok(committed) => {
                 self.plan = Plan::new();
-                for warning in &committed.warnings {
-                    self.notify(Level::Warn, warning.to_string());
+                let warnings: Vec<String> =
+                    committed.warnings.iter().map(ToString::to_string).collect();
+                let report = Report::Done {
+                    txid: committed.txid.to_string(),
+                    headline: committed.headline(),
+                    mpd: pending::Mpd::of(&committed.record),
+                    warnings: warnings.clone(),
+                };
+
+                // The view that was watching keeps the txid, the warnings and
+                // the offer to undo, because every one of those is something to
+                // act on rather than to notice. Without one — `W` from the tag
+                // editor — they go on the message line instead.
+                match self.pending_mut() {
+                    Some(view) => view.finished(report),
+                    None => {
+                        for warning in warnings {
+                            self.notify(Level::Warn, warning);
+                        }
+                        let undo = self
+                            .keys
+                            .map()
+                            .key_for(Mode::Browser, Action::Undo)
+                            .map_or_else(String::new, |key| format!(" \u{b7} {key} to undo"));
+                        self.notify(Level::Info, format!("{}{undo}", committed.headline()));
+                    }
                 }
-                let undo = self
-                    .keys
-                    .map()
-                    .key_for(Mode::Browser, Action::Undo)
-                    .map_or_else(String::new, |key| format!(" \u{b7} {key} to undo"));
-                self.notify(Level::Info, format!("{}{undo}", committed.headline()));
-                // The library on screen is a version behind: a tag write changed
-                // the files the browser is showing numbers from, and the browser
-                // drops its tag cache on a rescan. This is what makes the change
-                // visible immediately rather than on the next keypress that
-                // happens to re-read something.
+                // The library on screen is a version behind: the files moved, or
+                // their tags changed, and the browser drops its tag cache on a
+                // rescan. This is what makes the change visible immediately
+                // rather than on the next keypress that happens to re-read
+                // something.
                 self.rescan();
                 true
             }
-            Err(message) => {
-                self.fail(message);
+            // Nothing was written, and the plan is still staged — so the view
+            // says so and stays on what the user was looking at.
+            Err(NotCommitted::Cancelled) => {
+                match self.pending_mut() {
+                    Some(view) => view.finished(Report::Cancelled),
+                    None => self.notify(Level::Info, "the commit was called off"),
+                }
+                true
+            }
+            // Core's message, whole: which step stopped it, and the
+            // `mpdfm recover` that puts it back.
+            Err(NotCommitted::Failed(message)) => {
+                match self.pending_mut() {
+                    Some(view) => view.finished(Report::Failed { message }),
+                    None => self.fail(message),
+                }
+                // Whatever did happen, happened: the browser is a version behind
+                // either way.
+                self.rescan();
                 true
             }
         }
@@ -1596,13 +2319,19 @@ impl App {
 
     /// An undo finished.
     fn on_undone(&mut self, result: Result<Box<mpdfm_core::journal::Reversed>, String>) -> bool {
-        self.writing = false;
+        self.running = None;
         match result {
             Ok(reversed) => {
                 for warning in &reversed.warnings {
                     self.notify(Level::Warn, warning.to_string());
                 }
                 self.notify(Level::Info, reversed.headline());
+                // Back to the browser, which is where the reversal is visible:
+                // a report about a transaction that no longer stands is not
+                // something to leave on screen.
+                if matches!(self.views.last(), Some(View::Pending(_))) {
+                    self.views.pop();
+                }
                 self.rescan();
                 true
             }
@@ -2009,6 +2738,7 @@ impl App {
             View::Browser | View::Command(_) => {}
             View::Help { mode, scroll } => self.render_help(*mode, *scroll, body, frame),
             View::TagEdit(form) => self.render_tagedit(form, body, frame),
+            View::Pending(view) => self.render_pending(view, body, frame),
             View::Confirm(confirm) => panel(
                 " confirm ",
                 &format!("{}\n\ny to quit · n or esc to stay", confirm.question),
@@ -2075,6 +2805,58 @@ impl App {
         if let Some(preview) = form.preview() {
             self.render_preview(preview, body, frame, &hints);
         }
+    }
+
+    /// The pending view: what is staged, and what a running commit is doing
+    /// about it.
+    ///
+    /// The whole body, like the tag editor and for the same reason: this is not a
+    /// dialogue to dismiss but the screen where the user reads a plan, and a plan
+    /// does not fit in three quarters of a 24-row terminal.
+    ///
+    /// The footer is the shell's: while a transaction is running it says so, and
+    /// says whether it can still be stopped — which is a fact about the worker
+    /// and not about the view.
+    fn render_pending(&self, view: &Pending, body: Rect, frame: &mut ratatui::Frame) {
+        let footer = match &self.running {
+            Some(running) => {
+                let stop = if running.is_cancellable() {
+                    self.keys
+                        .map()
+                        .key_for(Mode::Pending, Action::Cancel)
+                        .map_or_else(String::new, |key| format!(" \u{b7} {key} to stop"))
+                } else {
+                    String::new()
+                };
+                format!(" {}{stop} ", running.line())
+            }
+            None => view.footer(&self.pending_hints()),
+        };
+        // The border is the first thing read, so it says the one thing that
+        // matters most: whether anything is going to happen. A plan that will
+        // not commit is in the same red as the conflicts that refuse it.
+        let border = match (&self.running, view.report()) {
+            (Some(_), _) => Color::Cyan,
+            (None, Some(Report::Done { .. })) => Color::Green,
+            (None, Some(Report::Failed { .. })) => Color::Red,
+            (None, Some(Report::Cancelled)) => Color::Yellow,
+            (None, None) if view.is_committable() => Color::Green,
+            (None, None) => Color::Red,
+        };
+
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(border))
+            .title(fit(&view.title(), inner_width(body)))
+            .title_bottom(fit(&footer, inner_width(body)));
+        let inner = block.inner(body);
+        frame.render_widget(Clear, body);
+        frame.render_widget(block, body);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        Paragraph::new(view.lines(usize::from(inner.width), usize::from(inner.height)))
+            .render(inner, frame.buffer_mut());
     }
 
     /// A per-file action's preview, over the form.
@@ -2223,6 +3005,12 @@ impl App {
         if self.browser.in_visual() {
             parts.push("VISUAL".to_owned());
         }
+        if self.running.is_some() {
+            // Shown here as well as on the message line, because the message
+            // line is also where a toast goes and this one must not be possible
+            // to miss.
+            parts.push("WRITING".to_owned());
+        }
         if self.warnings > 0 {
             // A badge, because a scan that skipped a file and said nothing is a
             // browser that is lying about the library. The count is the whole
@@ -2265,6 +3053,20 @@ impl App {
 
     /// The toast, or the scan's progress, or what the keys are.
     fn message_text(&self) -> Paragraph<'_> {
+        // A transaction in flight outranks a toast: it is the only thing on this
+        // line that is still happening, and the one the user is waiting for.
+        if let Some(running) = &self.running {
+            let hint = match (
+                running.is_cancellable(),
+                self.keys.map().key_for(Mode::Pending, Action::Cancel),
+            ) {
+                (true, Some(key)) => format!(" \u{b7} {key} to stop"),
+                _ => String::new(),
+            };
+            return Paragraph::new(
+                Line::from(format!("{}{hint}", running.line())).style(Style::new().fg(Color::Cyan)),
+            );
+        }
         if let Some(toast) = self.toasts.front() {
             let color = match toast.level {
                 Level::Info => Color::Green,
@@ -2428,6 +3230,28 @@ fn tag_targets(browser: &Browser, library: &Library) -> (Vec<RelPath>, usize) {
     (files, skipped)
 }
 
+/// The operation that moves `from` to `to`: a file move, or a directory's.
+///
+/// Which of the two it is, is the library's answer and not the user's: a
+/// directory move takes the aux files with it and a file move does not
+/// (`ops::op`), and a user who marked an album directory meant the album.
+/// Anything the library does not know as a file is treated as a directory, which
+/// is also the right answer for a stale model — the planner refuses it as
+/// `SourceMissing` and the pending view shows the reason.
+fn move_op(library: &Library, from: &RelPath, to: RelPath) -> Operation {
+    if library.get(from).is_some() {
+        Operation::MoveFile {
+            from: from.clone(),
+            to,
+        }
+    } else {
+        Operation::MoveDir {
+            from: from.clone(),
+            to,
+        }
+    }
+}
+
 /// The action that carries out a per-file field's named alternative.
 ///
 /// One mapping, here, so the message that refuses a typed `title` and the key
@@ -2545,7 +3369,7 @@ mod tests {
 
     use mpdfm_core::library::DirPath;
     use mpdfm_core::tags::{Field, TagDelta, WriteOpts};
-    use mpdfm_core::testing::Fixture;
+    use mpdfm_core::testing::{Fixture, names};
     use ratatui::backend::TestBackend;
 
     use super::*;
@@ -3239,6 +4063,7 @@ mod tests {
                 }),
                 enabled: true,
                 problem: None,
+                queue: None,
             }))
         };
 
@@ -3264,6 +4089,7 @@ mod tests {
             state: None,
             enabled: true,
             problem: Some("connection refused".to_owned()),
+            queue: None,
         })));
         terminal
             .draw(|frame| app.render(frame.area(), frame))
@@ -3275,6 +4101,7 @@ mod tests {
             state: None,
             enabled: false,
             problem: Some("MPD is switched off for this run".to_owned()),
+            queue: None,
         })));
         terminal
             .draw(|frame| app.render(frame.area(), frame))
@@ -3291,6 +4118,7 @@ mod tests {
             }),
             enabled: true,
             problem: None,
+            queue: None,
         })));
         terminal
             .draw(|frame| app.render(frame.area(), frame))
@@ -3434,10 +4262,14 @@ mod tests {
         app.update(scanned(&fx));
         app.toasts.clear();
 
-        assert!(app.update(press('m')), "`m` is bound to stage_move");
+        assert!(app.update(press('/')), "`/` is bound to search");
         let toast = app.toasts.front().expect("it should say something");
-        assert!(toast.text.contains("stage a move"), "{}", toast.text);
-        assert!(toast.text.contains("24-pending-view.md"), "{}", toast.text);
+        assert!(toast.text.contains("search"), "{}", toast.text);
+        assert!(
+            toast.text.contains("25-search-and-filter.md"),
+            "{}",
+            toast.text
+        );
         assert_eq!(
             toast.level,
             Level::Warn,
@@ -3642,13 +4474,16 @@ mod tests {
         assert_eq!(cursor(&app), 0);
 
         assert!(app.update(key(KeyCode::Enter)), "enter runs it");
-        assert_eq!(app.views, vec![View::Browser], "and closes the line");
-        let toast = app.toasts.front().expect("it reported something");
+        // It ran: one move is staged, and the view that shows what is staged is
+        // what the command line left behind.
+        assert_eq!(app.plan.len(), 1, "the command staged the move");
         assert!(
-            toast.text.contains("move to hiphop/MF DOOM"),
-            "{}",
-            toast.text
+            matches!(app.views.last(), Some(View::Pending(_))),
+            "{:?}",
+            app.views
         );
+        let toast = app.toasts.front().expect("it reported something");
+        assert!(toast.text.contains("staged 1 move op"), "{}", toast.text);
     }
 
     #[test]
@@ -4383,7 +5218,7 @@ mod tests {
         assert!(
             done(app),
             "no worker answer put the app in the state the test was waiting for (writing={}, scan={:?}, cached={})",
-            app.writing,
+            app.running.is_some(),
             app.scan,
             app.browser.cached()
         );
@@ -4945,9 +5780,9 @@ mod tests {
 
         type_field(&mut app, Field::Genre, "Nu Jazz");
         assert!(app.dispatch(Action::StageAndCommit));
-        assert!(app.writing, "the commit runs on a worker");
+        assert!(app.running.is_some(), "the commit runs on a worker");
 
-        settle_until(&mut app, &rx, |app| !app.writing);
+        settle_until(&mut app, &rx, |app| app.running.is_none());
         assert!(app.plan.is_empty(), "a committed plan is not still pending");
         assert_eq!(
             tag_of(&fx, rel, Field::Genre),
@@ -4986,12 +5821,12 @@ mod tests {
 
         type_field(&mut app, Field::Genre, "Nu Jazz");
         app.dispatch(Action::StageAndCommit);
-        settle_until(&mut app, &rx, |app| !app.writing);
+        settle_until(&mut app, &rx, |app| app.running.is_none());
         assert_eq!(tag_of(&fx, rel, Field::Genre), "Nu Jazz");
 
         app.toasts.clear();
         assert!(app.dispatch(Action::Undo), "`u` in the browser");
-        settle_until(&mut app, &rx, |app| !app.writing);
+        settle_until(&mut app, &rx, |app| app.running.is_none());
 
         assert_eq!(
             tag_of(&fx, rel, Field::Genre),
@@ -5019,7 +5854,7 @@ mod tests {
         type_field(&mut app, Field::Album, "ノスタルジア");
         type_field(&mut app, Field::Artist, "KREAM - So Hï");
         app.dispatch(Action::StageAndCommit);
-        settle_until(&mut app, &rx, |app| !app.writing);
+        settle_until(&mut app, &rx, |app| app.running.is_none());
 
         assert_eq!(tag_of(&fx, rel, Field::Album), "ノスタルジア");
         assert_eq!(tag_of(&fx, rel, Field::Artist), "KREAM - So Hï");
@@ -5162,5 +5997,620 @@ mod tests {
         // And closing it leaves the form exactly where it was.
         app.update(key(KeyCode::Esc));
         assert!(matches!(app.views.last(), Some(View::TagEdit(_))));
+    }
+
+    // -- the pending view (task 24) ----------------------------------------
+
+    /// Mark the first row of `hiphop`, which is the MF DOOM album directory:
+    /// three tracks, five aux files, two playlists and MPD's saved queue.
+    fn mark_the_album(app: &mut App) {
+        in_dir(app, "hiphop");
+        mark_first(app, 1);
+        assert_eq!(app.browser.marked(), 1, "the album directory is marked");
+    }
+
+    /// Stage a move of that album into `electronic`, the way the keys do it:
+    /// mark it, walk to where it belongs, press `m`.
+    fn stage_the_album_move(app: &mut App) {
+        mark_the_album(app);
+        in_dir(app, "electronic");
+        assert!(app.dispatch(Action::StageMove), "`m` stages the move");
+        assert_eq!(app.plan.len(), 1, "one operation, however many files");
+    }
+
+    /// The pending view on the stack, for a test that wants to ask it something.
+    fn pending_view(app: &App) -> &Pending {
+        match app.views.last() {
+            Some(View::Pending(view)) => view,
+            other => panic!("the pending view should be on top, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m_stages_a_move_of_the_marks_and_shows_what_it_would_do() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        // Wide enough for the fixture's scene-release names, which are what the
+        // renderer shortens from the left on an 80-column terminal.
+        let mut terminal = screen(140, 30);
+        app.update(scanned(&fx));
+
+        stage_the_album_move(&mut app);
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+
+        // The operation, what it costs, and every playlist it reaches.
+        assert!(drawn.contains("PENDING (1 op)"), "{drawn}");
+        assert!(drawn.contains("MOVE"), "{drawn}");
+        assert!(drawn.contains("electronic/MF DOOM"), "{drawn}");
+        assert!(drawn.contains(names::HIP_HOP_PLAYLIST), "{drawn}");
+        assert!(drawn.contains(names::MF_DOOM_PLAYLIST), "{drawn}");
+        assert!(drawn.contains("MPD saved queue"), "{drawn}");
+        assert!(drawn.contains("commit"), "the footer offers it: {drawn}");
+    }
+
+    #[test]
+    fn the_preview_unfolds_into_the_playlist_lines_and_matches_the_dry_run() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(100, 30);
+        app.update(scanned(&fx));
+        stage_the_album_move(&mut app);
+
+        // Folded, the body is what `mpdfm move --dry-run` prints — the
+        // anti-divergence criterion, checked again here with the real width the
+        // frame uses.
+        let effects = app.plan.clone().validate(
+            app.library.as_ref().expect("a library"),
+            app.index.as_ref().expect("an index"),
+            &app.config,
+        );
+        let cells = 98;
+        let folded: Vec<String> = pending_view(&app)
+            .body_text(cells)
+            .lines()
+            .map(|line| match line.strip_prefix("▸ ") {
+                Some(rest) => format!("  {rest}"),
+                None => line.to_owned(),
+            })
+            .collect();
+        assert_eq!(folded.join("\n"), effects.render(cells));
+
+        // Unfolded, it shows the lines themselves. `j` down to the first row
+        // that has something to unfold, then `enter`.
+        for _ in 0..40 {
+            if pending_view(&app).can_expand() {
+                break;
+            }
+            app.update(press('j'));
+        }
+        assert!(app.update(key(KeyCode::Enter)), "enter unfolds it");
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+        assert!(drawn.contains("- hiphop/MF DOOM"), "{drawn}");
+        assert!(drawn.contains("+ electronic/MF DOOM"), "{drawn}");
+    }
+
+    #[test]
+    fn staged_operations_survive_leaving_the_view_and_a_resize() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(100, 30);
+        app.update(scanned(&fx));
+        stage_the_album_move(&mut app);
+
+        // Away.
+        assert!(app.update(key(KeyCode::Esc)), "esc leaves the view");
+        assert_eq!(app.views, vec![View::Browser]);
+        assert_eq!(app.plan.len(), 1, "the plan is the shell's, not the view's");
+        draw(&mut app, &mut terminal);
+        assert!(
+            text(&terminal).contains("1 pending"),
+            "the status bar still counts it:\n{}",
+            text(&terminal)
+        );
+
+        // A resize, which is the other thing that must not lose it.
+        app.update(Msg::Input(Event::Resize(60, 20)));
+        assert_eq!(app.plan.len(), 1);
+
+        // And back, with the preview made again rather than remembered.
+        assert!(app.update(press('p')), "`p` shows it again");
+        draw(&mut app, &mut terminal);
+        assert!(
+            text(&terminal).contains("PENDING (1 op)"),
+            "{}",
+            text(&terminal)
+        );
+    }
+
+    #[test]
+    fn dd_drops_one_operation_and_validates_what_is_left() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+
+        // Two moves, the second of which is refused: it lands on an album that
+        // is not going anywhere. (Landing on the *first* album's directory
+        // would be legal — the planner orders a chain — which is exactly the
+        // kind of thing re-validating after a drop has to get right.)
+        mark_the_album(&mut app);
+        in_dir(&mut app, "electronic");
+        app.dispatch(Action::StageMove);
+        // Out of the view first: it is modal, so the browser's own verbs do not
+        // reach the browser while it is up.
+        app.update(key(KeyCode::Esc));
+        app.dispatch(Action::UnmarkAll);
+        in_dir(&mut app, "hiphop");
+        app.dispatch(Action::Top);
+        app.dispatch(Action::Down);
+        app.dispatch(Action::ToggleMark);
+        app.run_command(command::Command::Move {
+            dst: names::KREAM_ALBUM.to_owned(),
+        });
+        assert_eq!(app.plan.len(), 2);
+        assert!(
+            !pending_view(&app).is_committable(),
+            "the second move lands on something that is already there"
+        );
+
+        // `dd` on the refused one — which is where the cursor already is.
+        app.toasts.clear();
+        assert!(matches!(app.mode(), Mode::Pending));
+        app.update(press('d'));
+        assert!(app.update(press('d')), "`dd` drops it");
+
+        assert_eq!(app.plan.len(), 1, "one operation gone");
+        let toast = app.toasts.front().expect("it said so");
+        assert!(toast.text.contains("dropped 1 operation"), "{}", toast.text);
+        // Re-validated, not patched: the conflict went with the operation.
+        assert!(
+            pending_view(&app).is_committable(),
+            "what is left can be committed"
+        );
+    }
+
+    #[test]
+    fn dd_on_something_that_is_not_an_operation_says_so() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        stage_the_album_move(&mut app);
+        app.toasts.clear();
+
+        // Onto a playlist row, and into its diff.
+        for _ in 0..40 {
+            if pending_view(&app).can_expand() {
+                break;
+            }
+            app.update(press('j'));
+        }
+        app.update(key(KeyCode::Enter));
+        app.update(press('j'));
+
+        app.update(press('d'));
+        app.update(press('d'));
+        assert_eq!(app.plan.len(), 1, "nothing was dropped");
+        let toast = app.toasts.front().expect("it said so");
+        assert!(toast.text.contains("no operation"), "{}", toast.text);
+    }
+
+    #[test]
+    fn x_discards_everything_once_the_question_is_answered() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        stage_the_album_move(&mut app);
+
+        assert!(app.update(press('x')), "`x` asks first");
+        assert!(
+            matches!(app.views.last(), Some(View::Confirm(_))),
+            "{:?}",
+            app.views
+        );
+        assert_eq!(app.plan.len(), 1, "nothing is thrown away until it is");
+
+        // Saying no leaves it alone.
+        app.update(press('n'));
+        assert_eq!(app.plan.len(), 1);
+        assert!(matches!(app.views.last(), Some(View::Pending(_))));
+
+        // Saying yes empties the plan and closes the view, because there is
+        // nothing left for it to be about.
+        app.update(press('x'));
+        app.update(press('y'));
+        assert!(app.plan.is_empty(), "discarded");
+        assert_eq!(app.views, vec![View::Browser]);
+    }
+
+    #[test]
+    fn a_conflicting_plan_will_not_commit_and_says_why_on_the_operation() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(120, 30);
+        app.update(scanned(&fx));
+
+        // A move onto something that is already there. MPDFM never overwrites.
+        mark_the_album(&mut app);
+        app.run_command(command::Command::Move {
+            dst: names::SNOOP_ALBUM.to_owned(),
+        });
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+
+        assert!(drawn.contains("REFUSED (1 op, 1 conflict)"), "{drawn}");
+        assert!(drawn.contains("already exists"), "the reason: {drawn}");
+        assert!(drawn.contains("refused"), "the footer: {drawn}");
+
+        // And `c` does not start a transaction.
+        app.toasts.clear();
+        assert!(app.update(press('c')), "`c` answers");
+        assert!(app.running.is_none(), "nothing is being written");
+        let toast = app.toasts.front().expect("it said why");
+        assert!(toast.text.contains("1 conflict"), "{}", toast.text);
+    }
+
+    #[test]
+    fn c_commits_on_a_worker_and_leaves_the_browser_showing_the_result() {
+        let fx = Fixture::realistic();
+        let (mut app, rx) = app(&fx);
+        let mut terminal = screen(100, 30);
+        app.update(scanned(&fx));
+        stage_the_album_move(&mut app);
+
+        assert!(app.update(press('c')), "`c` commits");
+        assert!(app.running.is_some(), "on a worker, not on this thread");
+
+        // A progress indicator while it runs — the frame is drawn from the
+        // worker's own reports.
+        app.update(Msg::Committing(Progress::Steps { done: 3, steps: 8 }));
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+        assert!(drawn.contains("3/8 files"), "{drawn}");
+        assert!(drawn.contains("37%"), "{drawn}");
+
+        settle_until(&mut app, &rx, |app| app.running.is_none());
+        assert!(app.plan.is_empty(), "a committed plan is not still pending");
+
+        // The files moved, and the playlists went with them.
+        assert!(
+            fx.music_dir()
+                .join("electronic/MF DOOM - Mm..Food (2004) [V0] scene-tag/01 Beef Rap.mp3")
+                .exists()
+        );
+        let playlist = std::fs::read_to_string(fx.playlist_dir().join(names::HIP_HOP_PLAYLIST))
+            .expect("the playlist is readable");
+        assert!(playlist.contains("electronic/MF DOOM"), "{playlist}");
+
+        // The report: the txid, and the offer to undo it.
+        let drawn = {
+            draw(&mut app, &mut terminal);
+            text(&terminal)
+        };
+        assert!(drawn.contains("COMMITTED"), "{drawn}");
+        assert!(drawn.contains("undo"), "{drawn}");
+
+        // And the library on screen is the one on disk.
+        settle_until(&mut app, &rx, |app| {
+            matches!(app.scan, ScanState::Done { .. })
+        });
+        let library = app.library.as_ref().expect("a library");
+        assert!(
+            library
+                .dir(
+                    &DirPath::parse("electronic/MF DOOM - Mm..Food (2004) [V0] scene-tag")
+                        .expect("a dir")
+                )
+                .is_some(),
+            "the browser is still showing the old library"
+        );
+    }
+
+    #[test]
+    fn u_after_a_commit_undoes_it_and_the_browser_shows_the_reversal() {
+        let fx = Fixture::realistic();
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+        stage_the_album_move(&mut app);
+
+        app.update(press('c'));
+        settle_until(&mut app, &rx, |app| app.running.is_none());
+        settle_until(&mut app, &rx, |app| {
+            matches!(app.scan, ScanState::Done { .. })
+        });
+        assert!(matches!(
+            pending_view(&app).report(),
+            Some(Report::Done { .. })
+        ));
+
+        // `u`, from the report, about the transaction it names.
+        app.toasts.clear();
+        assert!(app.update(press('u')), "`u` undoes it right there");
+        settle_until(&mut app, &rx, |app| app.running.is_none());
+
+        assert!(
+            fx.music_dir().join(names::MF_DOOM_TRACK).exists(),
+            "the album is back where it was"
+        );
+        let playlist = std::fs::read_to_string(fx.playlist_dir().join(names::HIP_HOP_PLAYLIST))
+            .expect("the playlist is readable");
+        assert!(playlist.contains(names::MF_DOOM_TRACK), "{playlist}");
+
+        // Back on the browser, which is where the reversal is visible.
+        settle_until(&mut app, &rx, |app| {
+            matches!(app.scan, ScanState::Done { .. })
+        });
+        assert_eq!(app.views, vec![View::Browser]);
+        let library = app.library.as_ref().expect("a library");
+        assert!(
+            library
+                .get(&RelPath::parse(names::MF_DOOM_TRACK).expect("a path"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_commit_that_stopped_partway_shows_what_to_run_to_put_it_back() {
+        use mpdfm_core::journal::record::TxId;
+        use mpdfm_core::ops::commit::CommitError;
+        use mpdfm_core::ops::exec_fs::FsError;
+
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(100, 30);
+        app.update(scanned(&fx));
+        stage_the_album_move(&mut app);
+        app.dispatch(Action::Commit);
+
+        // The failure core raises when a filesystem step stops a transaction
+        // that has already journaled some of its work. Simulated here the way
+        // `commit::Inject` simulates it there: the message is core's own, and it
+        // is the one the user has to be able to act on.
+        let failed = CommitError::Step {
+            txid: TxId::parse("20260101T101010Z-abcd").expect("a valid id"),
+            position: 3,
+            step: "rename hiphop/MF DOOM/03 Potholderz.mp3".to_owned(),
+            source: Box::new(FsError::Exists {
+                path: "/music/electronic/MF DOOM/03 Potholderz.mp3".into(),
+            }),
+        };
+        app.update(Msg::TaskDone(Box::new(TaskOutcome::Committed(Err(
+            NotCommitted::Failed(failed.to_string()),
+        )))));
+
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+        assert!(drawn.contains("COMMIT FAILED"), "{drawn}");
+        assert!(
+            drawn.contains("stopped at step 3"),
+            "what did not happen: {drawn}"
+        );
+        assert!(
+            drawn.contains("mpdfm recover 20260101T101010Z-abcd"),
+            "the recovery command: {drawn}"
+        );
+        // The plan is still staged: nothing about a failure says the user has
+        // changed their mind.
+        assert_eq!(app.plan.len(), 1);
+        assert!(app.running.is_none());
+    }
+
+    #[test]
+    fn a_commit_can_be_called_off_before_anything_has_changed() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        stage_the_album_move(&mut app);
+        app.dispatch(Action::Commit);
+
+        // While it is still re-checking the library, `esc` stops it.
+        app.update(Msg::Committing(Progress::Validating));
+        app.toasts.clear();
+        assert!(app.update(key(KeyCode::Esc)), "esc asks it to stop");
+        let running = app.running.as_ref().expect("still on the worker");
+        assert!(running.cancel.load(Ordering::Relaxed), "the worker is told");
+        assert!(running.cancelling);
+
+        // Past that point it says so rather than pretending.
+        app.running.as_mut().expect("running").cancelling = false;
+        app.update(Msg::Committing(Progress::Steps { done: 1, steps: 8 }));
+        app.toasts.clear();
+        app.update(key(KeyCode::Esc));
+        let toast = app.toasts.front().expect("it said so");
+        assert!(toast.text.contains("too late"), "{}", toast.text);
+
+        // And the answer puts the plan back in front of the user, untouched.
+        app.update(Msg::TaskDone(Box::new(TaskOutcome::Committed(Err(
+            NotCommitted::Cancelled,
+        )))));
+        assert_eq!(app.plan.len(), 1, "nothing was committed");
+        assert!(matches!(
+            pending_view(&app).report(),
+            Some(Report::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn the_mpd_queue_warning_shows_when_the_daemon_is_holding_one_of_the_files() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(110, 30);
+        app.update(scanned(&fx));
+
+        // MPD answered, and the file being moved is in its live queue. The
+        // daemon writes that queue over the state file when it stops, so there
+        // is nothing MPDFM can edit — the honest answer is a warning.
+        app.update(Msg::MpdStatus(Box::new(MpdSnapshot {
+            state: Some(MpdState {
+                play_state: mpdfm_core::mpd::PlayState::Play,
+                song: Some(names::MF_DOOM_TRACK.to_owned()),
+                updating: false,
+            }),
+            enabled: true,
+            problem: None,
+            queue: Some(vec![RelPath::parse(names::MF_DOOM_TRACK).expect("a path")]),
+        })));
+        stage_the_album_move(&mut app);
+
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+        assert!(
+            drawn.contains("will need a requeue"),
+            "the requeue warning: {drawn}"
+        );
+        // And the saved queue is not also being rewritten, which would be the
+        // edit the daemon then overwrote.
+        assert!(
+            !drawn.contains("MPD saved queue"),
+            "it cannot be both: {drawn}"
+        );
+    }
+
+    #[test]
+    fn d_stages_a_delete_of_the_marks_and_a_directory_is_left_out_of_it() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(100, 30);
+        app.update(scanned(&fx));
+
+        in_dir(&mut app, names::MF_DOOM_ALBUM);
+        mark_first(&mut app, 2);
+        assert!(app.update(press('d')), "`d` stages a delete");
+
+        assert_eq!(app.plan.len(), 2, "one operation per file");
+        draw(&mut app, &mut terminal);
+        assert!(text(&terminal).contains("DELETE"), "{}", text(&terminal));
+    }
+
+    #[test]
+    fn r_opens_the_command_line_on_the_path_under_the_cursor() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(100, 30);
+        app.update(scanned(&fx));
+        in_dir(&mut app, names::MF_DOOM_ALBUM);
+        app.dispatch(Action::Top);
+
+        assert!(
+            app.update(press('r')),
+            "`r` is a move with the path filled in"
+        );
+        assert_eq!(app.mode(), Mode::Command);
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+        assert!(drawn.contains(":move hiphop/MF DOOM"), "{drawn}");
+        assert!(drawn.contains("01 Beef Rap.mp3"), "{drawn}");
+    }
+
+    #[test]
+    fn q_with_a_staged_move_still_asks_before_throwing_it_away() {
+        // The same question task 20 wired up, now with something real behind it.
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        stage_the_album_move(&mut app);
+
+        assert!(app.update(press('q')), "`q` asks");
+        assert!(!app.quit, "and does not leave yet");
+        assert!(
+            matches!(app.views.last(), Some(View::Confirm(_))),
+            "{:?}",
+            app.views
+        );
+        app.update(press('y'));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn a_four_hundred_line_diff_scrolls_at_well_under_a_frame_a_millisecond() {
+        // The pitfall this task names is a plan whose diff is too long to show,
+        // and the answer is to scroll it rather than cut it — which is only an
+        // answer if scrolling is cheap. Every frame here lays out 400 operations
+        // and 800 unfolded diff rows from scratch: nothing is cached between
+        // frames, because the preview is never patched.
+        let count = 400;
+        let tracks: Vec<String> = (0..count).map(|n| format!("{n:03} track.mp3")).collect();
+        let refs: Vec<&str> = tracks.iter().map(String::as_str).collect();
+        let lines: Vec<String> = tracks.iter().map(|name| format!("big/{name}")).collect();
+        let in_playlist: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let fx = Fixture::builder()
+            .album("big", &refs)
+            .playlist("Everything.m3u", &in_playlist)
+            .build();
+
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(120, 40);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "");
+        mark_first(&mut app, 1);
+        in_dir(&mut app, "elsewhere");
+        app.run_command(command::Command::Move {
+            dst: "elsewhere/big".to_owned(),
+        });
+        assert_eq!(app.plan.len(), 1);
+        assert_eq!(
+            pending_view(&app).effects().playlist_edits[0]
+                .line_edits
+                .len(),
+            count,
+            "every line of the playlist changes"
+        );
+
+        // Unfold it, then scroll a row per frame.
+        for _ in 0..40 {
+            if pending_view(&app).can_expand() {
+                break;
+            }
+            app.update(press('j'));
+        }
+        app.update(key(KeyCode::Enter));
+
+        let frames = 400;
+        let started = Instant::now();
+        for _ in 0..frames {
+            app.update(press('j'));
+            terminal
+                .draw(|frame| app.render(frame.area(), frame))
+                .expect("drawing should work");
+        }
+        let each = started.elapsed() / frames;
+        eprintln!(
+            "400-line diff: {} µs per frame ({} build)",
+            each.as_micros(),
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }
+        );
+        // 530 µs released and 3.2 ms unoptimized on the author's machine, both
+        // recorded in the task. Four hundred operations is a whole-library
+        // organize; the bound is loose enough to survive a loaded test runner.
+        assert!(
+            each < Duration::from_millis(10),
+            "{} µs per frame is not smooth scrolling",
+            each.as_micros()
+        );
+    }
+
+    #[test]
+    fn the_help_over_the_pending_view_lists_the_keys_that_view_has() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(100, 30);
+        app.update(scanned(&fx));
+        stage_the_album_move(&mut app);
+
+        app.update(press('?'));
+        draw(&mut app, &mut terminal);
+        let shown = text(&terminal);
+        assert!(shown.contains("help · pending"), "{shown}");
+        assert!(shown.contains("unstage this operation"), "{shown}");
+        assert!(shown.contains("dd"), "the keys it is bound to: {shown}");
+
+        // And closing it leaves the plan and the view exactly where they were.
+        app.update(key(KeyCode::Esc));
+        assert!(matches!(app.views.last(), Some(View::Pending(_))));
+        assert_eq!(app.plan.len(), 1);
     }
 }

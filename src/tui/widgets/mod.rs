@@ -5,6 +5,7 @@
 //! | `filelist` | the listing: a window of rows, marks, flags, duration, bitrate |
 //! | `details` | the narrow third column: tags, audio properties, playlists |
 //! | `input` | one line of text being typed, and the window of it that fits |
+//! | `diff` | what a playlist line says now, and what it will say |
 //!
 //! # Why the width math is here and not inlined
 //!
@@ -26,6 +27,7 @@
 //! that is one cell too long is a row that corrupts the border.
 
 pub mod details;
+pub mod diff;
 pub mod filelist;
 pub mod input;
 
@@ -77,6 +79,40 @@ pub fn fit(text: &str, cells: usize) -> String {
     out.push(ELLIPSIS);
     // A dropped half-cell: the ellipsis went in at `used + 1`, which may be one
     // short of `cells` when a two-cell character was the one that did not fit.
+    out
+}
+
+/// `text`, shortened to at most `cells` cells by dropping the **start**, with a
+/// leading ellipsis if anything was dropped.
+///
+/// [`fit`] for a path rather than a name: the end of a music path is the track
+/// and the start is the genre, so `…ood (2004)/01 Beef Rap.mp3` is still
+/// recognizable where `hiphop/MF DOOM - Mm..Foo…` is not. The same reasoning,
+/// and the same ellipsis, as `ops::render`'s own `tail` — measured in cells
+/// here, because a pane's columns are cells (see the module documentation).
+#[must_use]
+pub fn fit_end(text: &str, cells: usize) -> String {
+    if cells == 0 {
+        return String::new();
+    }
+    if width(text) <= cells {
+        return text.to_owned();
+    }
+
+    // Walked from the right, keeping one cell back for the ellipsis.
+    let budget = cells - 1;
+    let mut kept = String::new();
+    let mut used = 0;
+    for c in text.chars().rev() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        kept.push(c);
+        used += w;
+    }
+    let mut out = String::from(ELLIPSIS);
+    out.extend(kept.chars().rev());
     out
 }
 
@@ -167,6 +203,28 @@ mod tests {
                     width(&pad_left(text, cells)),
                     cells,
                     "pad_left({text:?}, {cells}) is the wrong width"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_path_keeps_its_end_and_is_never_wider_than_it_was_asked_for() {
+        let path = "hiphop/MF DOOM - Mm..Food (2004)/01 Beef Rap.mp3";
+        assert_eq!(fit_end(path, 20), "…04)/01 Beef Rap.mp3");
+        assert_eq!(fit_end(path, 200), path);
+
+        for text in [CJK, LATIN1, path, "", "ス", "ノスタルジア"] {
+            for cells in 0..=24 {
+                let fitted = fit_end(text, cells);
+                assert!(
+                    width(&fitted) <= cells,
+                    "fit_end({text:?}, {cells}) = {fitted:?} is {} cells",
+                    width(&fitted)
+                );
+                assert!(
+                    text.ends_with(fitted.trim_start_matches(ELLIPSIS)),
+                    "fit_end({text:?}, {cells}) = {fitted:?} is not the end of it"
                 );
             }
         }

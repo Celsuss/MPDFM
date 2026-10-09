@@ -105,6 +105,10 @@ pub fn run(cli: &Cli, config: &Config, out: &Out, args: &MoveArgs) -> Result<Exi
         // Must be the values the preview was given, or commit refuses as stale.
         live: link.live(),
         prefs,
+        // Nothing to watch and nobody to ask: `mpdfm move` has already printed
+        // the preview, and a progress line interleaved with it would be noise.
+        // The pending view is where both of those are answered (task 24).
+        ..commit::Options::default()
     };
 
     let previewed = Previewed {
