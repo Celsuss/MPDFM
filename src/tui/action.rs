@@ -177,6 +177,12 @@ actions! {
     SearchPrev => "search_prev", "prev match";
     /// Narrow the listing to what matches.
     Filter => "filter", "filter";
+    /// Search the whole library, reading tags as it goes.
+    ///
+    /// Separate from [`Action::Search`] because the two cost different things: a
+    /// search within a listing is free and happens per keystroke, and this one
+    /// opens up to 2 800 files on a worker.
+    FindLibrary => "find_library", "search the whole library";
 
     // -- text entry --------------------------------------------------------
 

@@ -106,9 +106,20 @@
 
 # -- the search line (task 25) ----------------------------------------------
 #
+# `/` searches the listing, `f` narrows it until `esc`, and `F` walks the whole
+# library and shows the hits as a flat listing you can mark and stage from.
+# All three type into the same line, so this one section configures all three;
+# `ctrl-n` / `ctrl-p` cycle the matches without leaving it, which `n` and `N`
+# cannot do while they are letters being typed.
+#
 # [search]
 # "ctrl-j" = "search_next"
 # "ctrl-k" = "search_prev"
+#
+# The query language is the same one `:find` and a future `mpdfm find` take:
+# bare words match the name, the path and the title / artist / album / genre
+# tags, and `artist:doom`, `genre:"hip hop"`, `ext:flac` and `missing:genre`
+# narrow it. Case is ignored unless the pattern has an uppercase letter in it.
 
 
 # -- the command line -------------------------------------------------------
@@ -161,6 +172,7 @@
 #   search_next          next match
 #   search_prev          prev match
 #   filter               filter
+#   find_library         search the whole library
 #
 # Typing
 #   submit               accept

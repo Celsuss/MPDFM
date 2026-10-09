@@ -76,6 +76,7 @@ use mpdfm_core::ops::commit::Progress;
 use mpdfm_core::ops::{Effects, Live, Operation, Plan};
 use mpdfm_core::paths::RelPath;
 use mpdfm_core::playlist::PlaylistIndex;
+use mpdfm_core::query::{self, FindProgress, Query};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
@@ -88,15 +89,18 @@ use super::command::{self, Command, CommandLine};
 use super::event::Events;
 use super::keys::{KeyChord, KeyMap, KeyWarning, Keys, Mode, Resolution};
 use super::log::Log;
-use super::msg::{MpdSnapshot, Msg, NotCommitted, Reads, ScanOutcome, TaskOutcome};
+use super::msg::{
+    FoundOutcome, MpdSnapshot, Msg, NotCommitted, Reads, ScanOutcome, TaskOutcome, TrackInfo,
+};
 use super::terminal::{MIN_SIZE, fits};
-use super::views::browser::{Browser, Enter, Pane, Sort, TreeRow};
+use super::views::browser::{Browser, Enter, Pane, Results, Sort, TreeRow};
 use super::views::pending::{self, Pending, Report};
+use super::views::search::{Finding, Kind, Prompt};
 use super::views::tagedit::{Begin, FileAction, Hints, Preview, Started, TagEdit};
 use super::widgets::details::DetailsPane;
 use super::widgets::filelist::FileList;
 use super::widgets::input::Input;
-use super::widgets::{fit, pad};
+use super::widgets::{fit, pad, width};
 use super::{PANIC_AT, work};
 
 /// How long an informational toast stays up once it is the one on screen.
@@ -227,6 +231,12 @@ pub enum View {
     /// where a command line belongs and why it is on the stack anyway: it is the
     /// thing `esc` closes, and it decides the mode.
     Command(CommandLine),
+    /// The `/`, `f` or `F` line. Task 25.
+    ///
+    /// On the bottom line for the same reason the command line is, and more so:
+    /// a search whose matches are hidden behind the line that found them is a
+    /// search nobody can follow.
+    Search(Prompt),
     /// A question the app will not go past. The keys that answer it are not in the
     /// keymap; see [`App::on_confirm_key`].
     Confirm(Confirm),
@@ -275,6 +285,7 @@ impl View {
             Self::Pending(_) => "pending",
             Self::Help { .. } => "help",
             Self::Command(_) => "command",
+            Self::Search(_) => "search",
             Self::Confirm(_) => "confirm",
             Self::Notice { .. } => "notice",
             Self::Error(_) => "error",
@@ -458,6 +469,17 @@ pub struct App {
     mpd_in_flight: bool,
     /// The commit or undo on a worker, when there is one, and how far it has got.
     running: Option<Running>,
+    /// The library-wide search on a worker, when there is one.
+    ///
+    /// One at a time, for the same reason there is one `running`: a second walk
+    /// would be reading the same 2 800 files to answer a question the user has
+    /// already replaced.
+    finding: Option<Finding>,
+    /// The last pattern `/` was submitted with, which is what `n` and `N` cycle.
+    ///
+    /// Held by the shell and not by the search line, because the line is gone by
+    /// the time `n` is pressed — that is the whole reason `n` exists.
+    last_search: Option<Query>,
     /// MPD's live queue, as the last poll that asked for it found it.
     ///
     /// Only polled for while something is staged, and held here because the
@@ -496,6 +518,8 @@ impl App {
             mpd: None,
             mpd_in_flight: false,
             running: None,
+            finding: None,
+            last_search: None,
             queue: None,
             tx,
             log,
@@ -577,6 +601,7 @@ impl App {
             Msg::ScanDone(outcome) => self.on_scan_done(*outcome),
             Msg::MpdStatus(snapshot) => self.on_mpd(*snapshot),
             Msg::TaskDone(outcome) => self.on_task_done(*outcome),
+            Msg::Finding(progress) => self.on_finding(progress),
             Msg::Committing(progress) => self.on_committing(progress),
             Msg::Shutdown => {
                 self.log.line("shutdown: asked to stop");
@@ -665,6 +690,7 @@ impl App {
     fn mode(&self) -> Mode {
         match self.views.last() {
             Some(View::Command(_)) => Mode::Command,
+            Some(View::Search(_)) => Mode::Search,
             Some(View::TagEdit(_)) => Mode::TagEdit,
             Some(View::Pending(_)) => Mode::Pending,
             _ => Mode::Browser,
@@ -712,6 +738,13 @@ impl App {
         };
         match self.views.last_mut() {
             Some(View::Command(line)) => line.insert(c),
+            // A character typed into the search line re-runs the search, which
+            // is the whole of "matches as you type".
+            Some(View::Search(prompt)) => {
+                prompt.insert(c);
+                self.reprobe();
+                true
+            }
             _ => false,
         }
     }
@@ -768,6 +801,13 @@ impl App {
         // library. Anything the line does not claim falls through, so a `ctrl-r`
         // bound under `[command]` still rescans.
         if let Some(dirty) = self.command_action(action) {
+            return dirty;
+        }
+
+        // And so does the search line, which claims the editing verbs and the
+        // two that cycle matches and passes everything else through — so a
+        // `ctrl-r` bound under `[search]` still rescans.
+        if let Some(dirty) = self.search_action(action) {
             return dirty;
         }
 
@@ -839,7 +879,7 @@ impl App {
             // `esc` closes an open visual range before it dismisses a message:
             // an abandoned selection is the more recent of the two, and the one
             // the user is looking at.
-            Action::Cancel => self.browser.cancel_visual() || self.pop(),
+            Action::Cancel => self.cancel_in_browser(),
             Action::CommandMode => self.push(View::Command(CommandLine::new())),
             Action::Help => self.toggle_help(),
             Action::Rescan => {
@@ -871,10 +911,14 @@ impl App {
                 true
             }
 
+            // -- finding things ---------------------------------------------
+            Action::Search => self.open_prompt(Kind::Search),
+            Action::Filter => self.open_prompt(Kind::Filter),
+            Action::FindLibrary => self.open_prompt(Kind::Find),
+            Action::SearchNext => self.step_search(true),
+            Action::SearchPrev => self.step_search(false),
+
             // -- the views that are not built yet ---------------------------
-            Action::Search | Action::SearchNext | Action::SearchPrev | Action::Filter => {
-                self.not_yet(action.help(), Some("25-search-and-filter.md"))
-            }
             Action::Organize => self.not_yet(action.help(), Some("28-organize-command.md")),
 
             // -- only meaningful inside the tag editor ----------------------
@@ -1980,6 +2024,16 @@ impl App {
                 format!("organize by {template}"),
                 Some("28-organize-command.md"),
             ),
+            Command::Find { query } => match query::parse(&query) {
+                Ok(parsed) => self.start_find(parsed),
+                // The line is already closed by the time a command runs, so this
+                // is a message and not an error under the text — which is also
+                // why the message quotes what was typed.
+                Err(err) => {
+                    self.notify(Level::Warn, format!("find `{query}`: {err}"));
+                    true
+                }
+            },
             Command::Undo { txid } => self.undo_last(txid),
             Command::Doctor => self.not_yet("doctor", Some("29-doctor.md")),
             Command::Set { key, value } => self.set_setting(&key, &value),
@@ -2027,6 +2081,433 @@ impl App {
         }
         self.quit = true;
         false
+    }
+
+    // -- finding things ----------------------------------------------------
+
+    /// The search line on the stack, if there is one.
+    fn prompt(&self) -> Option<&Prompt> {
+        match self.views.last() {
+            Some(View::Search(prompt)) => Some(prompt),
+            _ => None,
+        }
+    }
+
+    /// The same, to be typed into.
+    fn prompt_mut(&mut self) -> Option<&mut Prompt> {
+        match self.views.last_mut() {
+            Some(View::Search(prompt)) => Some(prompt),
+            _ => None,
+        }
+    }
+
+    /// `/`, `f` or `F`: open the line, remembering what `esc` has to put back.
+    fn open_prompt(&mut self, kind: Kind) -> bool {
+        if self.library.is_none() {
+            self.notify(Level::Warn, "there is no library to search yet");
+            return true;
+        }
+        let origin = self.browser.cursor();
+        let restore = self.browser.filter().cloned();
+        self.push(View::Search(Prompt::new(kind, origin, restore)))
+    }
+
+    /// The editing verbs, while the search line has the keyboard.
+    ///
+    /// `None` for anything the line does not claim, which falls through to the
+    /// rest of the vocabulary exactly as it does in command mode.
+    fn search_action(&mut self, action: Action) -> Option<bool> {
+        self.prompt()?;
+        Some(match action {
+            Action::Submit => self.submit_search(),
+            Action::Cancel => self.cancel_search(),
+            // `ctrl-n` / `ctrl-p`: cycle without leaving the line, which `n` and
+            // `N` cannot do while they are letters being typed into it.
+            Action::SearchNext => self.step_search(true),
+            Action::SearchPrev => self.step_search(false),
+            Action::Left => self.prompt_mut().is_some_and(Prompt::left),
+            Action::Right => self.prompt_mut().is_some_and(Prompt::right),
+            Action::DeleteChar => {
+                if self.prompt_mut().is_some_and(Prompt::backspace) {
+                    self.reprobe();
+                    true
+                } else {
+                    false
+                }
+            }
+            Action::ClearLine => {
+                if self.prompt_mut().is_some_and(Prompt::clear) {
+                    self.reprobe();
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => return None,
+        })
+    }
+
+    /// Re-run the open line against the listing. Called on every keystroke.
+    ///
+    /// What "re-run" means is the [`Kind`]'s business: `/` moves the cursor to
+    /// the first match **from where the line opened** — so the cursor does not
+    /// wander as the pattern grows — `f` narrows the listing, and `F` does
+    /// nothing, because walking 2 800 files per keystroke is not a thing to do to
+    /// somebody's disk.
+    fn reprobe(&mut self) -> bool {
+        let Some(prompt) = self.prompt() else {
+            return false;
+        };
+        let (kind, origin) = (prompt.kind(), prompt.origin());
+        let parsed = prompt.query();
+
+        let query = match parsed {
+            Ok(query) => query,
+            Err(err) => {
+                if let Some(prompt) = self.prompt_mut() {
+                    prompt.fail(err);
+                }
+                return true;
+            }
+        };
+
+        let matches = {
+            let Some(library) = &self.library else {
+                return true;
+            };
+            if query.is_empty() {
+                // Backspaced to nothing: put back what the line opened on rather
+                // than leaving the last pattern's narrowing in force.
+                match kind {
+                    Kind::Search => {
+                        self.browser.set_cursor(Pane::Files, origin, library);
+                    }
+                    Kind::Filter => {
+                        let restore = match self.views.last() {
+                            Some(View::Search(prompt)) => prompt.restore().cloned(),
+                            _ => None,
+                        };
+                        self.browser.set_filter(restore, library);
+                    }
+                    Kind::Find => {}
+                }
+                None
+            } else {
+                match kind {
+                    Kind::Search => {
+                        let row = self
+                            .browser
+                            .find_match(origin, &query, true, library)
+                            .unwrap_or(origin);
+                        self.browser.set_cursor(Pane::Files, row, library);
+                        Some(self.browser.count_matches(&query, library))
+                    }
+                    Kind::Filter => {
+                        self.browser.set_filter(Some(query), library);
+                        // After narrowing, every row left is a match — so the
+                        // count is the listing, and it cannot disagree with it.
+                        Some(self.browser.row_count(Pane::Files, library))
+                    }
+                    Kind::Find => None,
+                }
+            }
+        };
+
+        if let Some(prompt) = self.prompt_mut() {
+            prompt.note(matches);
+        }
+        true
+    }
+
+    /// `enter` on the search line: keep what it did and close it.
+    ///
+    /// The filter stays on — that is what makes it a filter — and `/` remembers
+    /// its pattern so `n` and `N` have something to cycle. `F` is the only one
+    /// that starts anything here.
+    fn submit_search(&mut self) -> bool {
+        let Some(prompt) = self.prompt() else {
+            return false;
+        };
+        let kind = prompt.kind();
+        let query = match prompt.query() {
+            Ok(query) => query,
+            Err(err) => {
+                if let Some(prompt) = self.prompt_mut() {
+                    prompt.fail(err);
+                }
+                return true;
+            }
+        };
+
+        // `F` keeps the line open if there is nothing to look for: closing it
+        // would throw away what was typed to no purpose.
+        if query.is_empty() && kind == Kind::Find {
+            if let Some(prompt) = self.prompt_mut() {
+                prompt.fail("needs something to look for, as in `missing:genre`");
+            }
+            return true;
+        }
+
+        self.log.line(format!("{kind}: `{query}`"));
+        self.views.pop();
+        self.keys.clear();
+
+        match kind {
+            Kind::Search => {
+                if !query.is_empty() {
+                    self.last_search = Some(query);
+                }
+                true
+            }
+            Kind::Filter => {
+                if query.is_empty() {
+                    self.notify(Level::Info, "filter cleared");
+                } else {
+                    let rows = self.browser.row_count(
+                        Pane::Files,
+                        self.library.as_ref().expect("the line needed a library"),
+                    );
+                    let plural = if rows == 1 { "" } else { "s" };
+                    self.notify(
+                        Level::Info,
+                        format!("filter `{query}` \u{b7} {rows} row{plural} \u{b7} esc clears it"),
+                    );
+                }
+                true
+            }
+            Kind::Find => self.start_find(query),
+        }
+    }
+
+    /// `esc` on the search line: put back the cursor and the filter it changed.
+    fn cancel_search(&mut self) -> bool {
+        let Some(prompt) = self.prompt() else {
+            return false;
+        };
+        let kind = prompt.kind();
+        let origin = prompt.origin();
+        let restore = prompt.restore().cloned();
+        self.views.pop();
+
+        if let Some(library) = &self.library {
+            match kind {
+                Kind::Search => {
+                    self.browser.set_cursor(Pane::Files, origin, library);
+                }
+                Kind::Filter => {
+                    self.browser.set_filter(restore, library);
+                    self.browser.set_cursor(Pane::Files, origin, library);
+                }
+                // Nothing was started, so there is nothing to put back.
+                Kind::Find => {}
+            }
+        }
+        true
+    }
+
+    /// `n` / `N`, and `ctrl-n` / `ctrl-p` while the line is open.
+    ///
+    /// The pattern is the open line's when there is one and the last submitted
+    /// `/` otherwise, which is what makes `n` work after the line has closed.
+    fn step_search(&mut self, forward: bool) -> bool {
+        let query = match self.prompt() {
+            Some(prompt) => match prompt.query() {
+                Ok(query) if !query.is_empty() => query,
+                _ => return false,
+            },
+            None => match &self.last_search {
+                Some(query) => query.clone(),
+                None => {
+                    let key = self.keys.map().key_for(Mode::Browser, Action::Search);
+                    let how = key.map_or_else(
+                        || "search for something first".to_owned(),
+                        |key| format!("press {key} to search for something first"),
+                    );
+                    self.notify(Level::Warn, format!("nothing to cycle \u{2014} {how}"));
+                    return true;
+                }
+            },
+        };
+
+        let found = {
+            let Some(library) = &self.library else {
+                return false;
+            };
+            let count = self.browser.row_count(Pane::Files, library);
+            if count == 0 {
+                return false;
+            }
+            // One step on from where the cursor is, so `n` on a match goes to the
+            // next one rather than staying put; `find_match` wraps from there.
+            let cursor = self.browser.cursor();
+            let from = if forward {
+                (cursor + 1) % count
+            } else {
+                (cursor + count - 1) % count
+            };
+            self.browser.find_match(from, &query, forward, library)
+        };
+
+        match found {
+            Some(row) => {
+                let Some(library) = &self.library else {
+                    return false;
+                };
+                self.browser.set_cursor(Pane::Files, row, library);
+                true
+            }
+            // While the line is open it already says `no matches` behind the
+            // pattern, and a toast would be queued behind the line it cannot be
+            // drawn next to — arriving later, out of the context that caused it.
+            None if self.prompt().is_some() => false,
+            None => {
+                self.notify(Level::Warn, format!("no matches for `{query}`"));
+                true
+            }
+        }
+    }
+
+    /// Start the library-wide walk on a worker.
+    ///
+    /// The acceptance criterion this answers is that it does not block: what
+    /// happens here is a thread and a line on the message bar, and `esc` reaches
+    /// the thread through [`Finding::cancel`].
+    fn start_find(&mut self, query: Query) -> bool {
+        if self.finding.is_some() {
+            self.notify(Level::Warn, "a library search is already running");
+            return true;
+        }
+        if query.is_empty() {
+            self.notify(Level::Warn, "find needs something to look for");
+            return true;
+        }
+        let Some(library) = &self.library else {
+            self.notify(Level::Warn, "there is no library to search yet");
+            return true;
+        };
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.finding = Some(Finding::new(query.raw().to_owned(), Arc::clone(&cancel)));
+        work::find(
+            self.tx.clone(),
+            query,
+            library.clone(),
+            cancel,
+            Arc::clone(&self.log),
+        );
+        true
+    }
+
+    /// A library-wide search reported its progress.
+    fn on_finding(&mut self, progress: FindProgress) -> bool {
+        self.finding
+            .as_mut()
+            .is_some_and(|finding| finding.advanced(progress))
+    }
+
+    /// A library-wide search finished, or was called off.
+    ///
+    /// The hits become the listing ([`Browser::show_results`]) and what the walk
+    /// read becomes the tag cache, so the result rows show their durations
+    /// without being opened a second time — which is the task's "cache the
+    /// results for the session".
+    fn on_found(&mut self, outcome: FoundOutcome) -> bool {
+        let cancelled = self.finding.as_ref().is_some_and(Finding::is_cancelling);
+        self.finding = None;
+        let FoundOutcome { query, found } = outcome;
+
+        let reads: Reads = found
+            .hits
+            .iter()
+            .filter_map(|hit| {
+                let (tags, info) = (hit.tags.as_ref()?, hit.info.as_ref()?);
+                Some((
+                    hit.rel.clone(),
+                    Ok(TrackInfo {
+                        tags: tags.clone(),
+                        info: *info,
+                    }),
+                ))
+            })
+            .chain(
+                found
+                    .failed
+                    .iter()
+                    .map(|(rel, message)| (rel.clone(), Err(message.clone()))),
+            )
+            .collect();
+        self.browser.tags_arrived(reads, self.library.as_ref());
+
+        let results = Results {
+            query: query.clone(),
+            hits: found.hits.iter().map(|hit| hit.index).collect(),
+            failed: found.failed.len(),
+        };
+        let hits = results.hits.len();
+        match &self.library {
+            Some(library) => {
+                self.browser.show_results(results, library);
+                // The keyboard goes to the hits. Leaving it in the tree would
+                // mean the first `j` moved the tree cursor — which is a request
+                // for a directory, and so throws the result set away.
+                self.focus = Focus::Files;
+            }
+            // The library was replaced while the walk was out, so its indices
+            // point at nothing. Dropping the result set is the only honest
+            // answer; the message still says what was found.
+            None => {
+                self.notify(Level::Warn, "the library changed while searching");
+                return true;
+            }
+        }
+
+        let plural = if hits == 1 { "" } else { "s" };
+        let read = if found.read > 0 {
+            format!(" \u{b7} {} file(s) read", found.read)
+        } else {
+            String::new()
+        };
+        let stopped = if found.cancelled || cancelled {
+            format!(" \u{b7} stopped after {} files", found.scanned)
+        } else {
+            String::new()
+        };
+        let failed = if found.failed.is_empty() {
+            String::new()
+        } else {
+            format!(" \u{b7} \u{26a0} {} unreadable", found.failed.len())
+        };
+        let level = if hits == 0 { Level::Warn } else { Level::Info };
+        self.notify(
+            level,
+            format!("find `{query}`: {hits} hit{plural}{read}{stopped}{failed}"),
+        );
+        true
+    }
+
+    /// `esc` in the browser, in the order the user means it.
+    ///
+    /// The most recent thing first: a search in flight, then an open visual
+    /// range, then the filter, then a result set, and only then the view stack.
+    /// Each of those is something on screen that `esc` is expected to undo, and
+    /// doing them in any other order means a key that appears not to work.
+    fn cancel_in_browser(&mut self) -> bool {
+        if self.finding.as_mut().is_some_and(Finding::cancel) {
+            return true;
+        }
+        if self.browser.cancel_visual() {
+            return true;
+        }
+        if let Some(library) = &self.library {
+            if self.browser.filter().is_some() {
+                self.browser.set_filter(None, library);
+                return true;
+            }
+            if self.browser.clear_results(library) {
+                return true;
+            }
+        }
+        self.pop()
     }
 
     /// Open the help on the mode that is in force, or close it if it is open.
@@ -2203,9 +2684,16 @@ impl App {
                 // it shows as `?` in the listing and as the reason in the
                 // details pane. A panel for one unreadable track in a directory
                 // of fourteen would be a modal dialogue nobody asked for.
-                self.browser.tags_arrived(reads)
+                // Tags can decide a filter and an open search, so both are
+                // re-run here: a `genre:jazz` filter converges as the answers
+                // land instead of being stuck on what was known when it was
+                // typed (`views::browser::Browser::tags_arrived`).
+                let filled = self.browser.tags_arrived(reads, self.library.as_ref());
+                let moved = self.reprobe();
+                filled || moved
             }
             TaskOutcome::Selection(reads) => self.on_selection(reads),
+            TaskOutcome::Found(outcome) => self.on_found(*outcome),
             TaskOutcome::Committed(result) => self.on_committed(result),
             TaskOutcome::Undone(result) => self.on_undone(result),
             TaskOutcome::Failed { what, message } => {
@@ -2357,11 +2845,14 @@ impl App {
         if self.tags_in_flight {
             return;
         }
+        let rows = self.list_rows();
+        // The pattern being typed counts as a reason to read tags: an
+        // incremental `/genre:jazz` needs the same files a filter would.
+        let more = self.prompt().and_then(|prompt| prompt.query().ok());
         let Some(library) = &self.library else {
             return;
         };
-        let rows = self.list_rows();
-        let wanted = self.browser.wanted(library, rows);
+        let wanted = self.browser.wanted(library, rows, more.as_ref());
         if wanted.is_empty() {
             return;
         }
@@ -2522,6 +3013,7 @@ impl App {
         let message_rows = if self
             .command_line()
             .is_some_and(|line| line.error().is_some())
+            || self.prompt().is_some_and(|prompt| prompt.error().is_some())
         {
             2
         } else {
@@ -2735,7 +3227,7 @@ impl App {
         match view {
             // Drawn on the bottom line, by `render_message`: a command line that
             // covered the listing would hide what the command is about.
-            View::Browser | View::Command(_) => {}
+            View::Browser | View::Command(_) | View::Search(_) => {}
             View::Help { mode, scroll } => self.render_help(*mode, *scroll, body, frame),
             View::TagEdit(form) => self.render_tagedit(form, body, frame),
             View::Pending(view) => self.render_pending(view, body, frame),
@@ -3002,6 +3494,27 @@ impl App {
             format!("sort {}", self.browser.sort()),
             format!("focus {}", self.focus.label()),
         ];
+        // An active filter is never invisible: a listing that is quietly missing
+        // rows is a listing that lies, which is the task's own wording and an
+        // acceptance criterion.
+        if let Some(filter) = self.browser.filter() {
+            parts.push(format!("filter `{filter}`"));
+        }
+        if let Some(results) = self.browser.results() {
+            // The unreadable count stays on the bar and not only in the toast
+            // that announced it: a result set that may be missing nine files is
+            // a result set the user is about to act on.
+            let failed = if results.failed == 0 {
+                String::new()
+            } else {
+                format!(", \u{26a0} {} unreadable", results.failed)
+            };
+            parts.push(format!(
+                "find `{}` ({}{failed})",
+                results.query,
+                results.hits.len()
+            ));
+        }
         if self.browser.in_visual() {
             parts.push("VISUAL".to_owned());
         }
@@ -3030,6 +3543,10 @@ impl App {
     fn render_message(&self, area: Rect, frame: &mut ratatui::Frame) {
         if let Some(line) = self.command_line() {
             self.render_command_line(line, area, frame);
+            return;
+        }
+        if let Some(prompt) = self.prompt() {
+            self.render_search_line(prompt, area, frame);
             return;
         }
 
@@ -3065,6 +3582,18 @@ impl App {
             };
             return Paragraph::new(
                 Line::from(format!("{}{hint}", running.line())).style(Style::new().fg(Color::Cyan)),
+            );
+        }
+        // A library-wide walk is the other thing that is still happening, and it
+        // reports a percentage, so it outranks a toast for the same reason a
+        // commit does.
+        if let Some(finding) = &self.finding {
+            let hint = match self.keys.map().key_for(Mode::Browser, Action::Cancel) {
+                Some(key) if !finding.is_cancelling() => format!(" \u{b7} {key} to stop"),
+                _ => String::new(),
+            };
+            return Paragraph::new(
+                Line::from(format!("{}{hint}", finding.line())).style(Style::new().fg(Color::Cyan)),
             );
         }
         if let Some(toast) = self.toasts.front() {
@@ -3127,6 +3656,44 @@ impl App {
         // bytes so that a path with an `ï` in it does not put the cursor adrift.
         let before = Line::raw(&line.text()[..line.cursor()]).width();
         let column = u16::try_from(before + 1).unwrap_or(u16::MAX);
+        frame.set_cursor_position((input.x.saturating_add(column), input.y));
+    }
+
+    /// `/`, `f ` or `F ` and what has been typed after it, with the match count
+    /// behind it and the reason above when the pattern will not parse.
+    ///
+    /// The same shape as the command line, and deliberately: the two are the
+    /// only things that take text on the bottom line, and a user who has learned
+    /// where the error goes in one has learned the other.
+    fn render_search_line(&self, prompt: &Prompt, area: Rect, frame: &mut ratatui::Frame) {
+        let input = match prompt.error() {
+            Some(error) => {
+                let [above, input] =
+                    Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+                frame.render_widget(
+                    Paragraph::new(error.to_owned()).style(Style::new().fg(Color::Red)),
+                    above,
+                );
+                input
+            }
+            None => area,
+        };
+
+        let prefix = prompt.kind().prefix();
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw(format!("{prefix}{}", prompt.text())),
+                // Dim, because it is a count and not part of the pattern: a user
+                // scanning the line for what they typed should not have to parse
+                // it out of the answer.
+                Span::styled(prompt.note_text(), Style::new().fg(Color::DarkGray)),
+            ])),
+            input,
+        );
+        // In display columns and not bytes, so a pattern with an `ï` in it does
+        // not put the cursor adrift.
+        let before = Line::raw(&prompt.text()[..prompt.cursor()]).width() + width(prefix);
+        let column = u16::try_from(before).unwrap_or(u16::MAX);
         frame.set_cursor_position((input.x.saturating_add(column), input.y));
     }
 
@@ -4262,11 +4829,11 @@ mod tests {
         app.update(scanned(&fx));
         app.toasts.clear();
 
-        assert!(app.update(press('/')), "`/` is bound to search");
+        assert!(app.update(press('o')), "`o` is bound to organize");
         let toast = app.toasts.front().expect("it should say something");
-        assert!(toast.text.contains("search"), "{}", toast.text);
+        assert!(toast.text.contains("organize"), "{}", toast.text);
         assert!(
-            toast.text.contains("25-search-and-filter.md"),
+            toast.text.contains("28-organize-command.md"),
             "{}",
             toast.text
         );
@@ -6612,5 +7179,709 @@ mod tests {
         app.update(key(KeyCode::Esc));
         assert!(matches!(app.views.last(), Some(View::Pending(_))));
         assert_eq!(app.plan.len(), 1);
+    }
+
+    // -- task 25: search and filter ----------------------------------------
+
+    /// A library with something to find in it: two albums whose names differ
+    /// only in case, a FLAC album, and non-ASCII names.
+    ///
+    /// The fixture's audio templates come with tags — every mp3 says
+    /// `genre = Hip-Hop` and every FLAC `genre = Electronic` — which is what the
+    /// `genre:` tests match on; the ones that need a file with *no* genre clear
+    /// it themselves.
+    fn search_fixture() -> Fixture {
+        Fixture::builder()
+            .album(
+                "hiphop/MF DOOM - Mm..Food",
+                &["01 Beef Rap.mp3", "02 Hoe Cakes.mp3", "03 Potholderz.mp3"],
+            )
+            .aux("hiphop/MF DOOM - Mm..Food", &["folder.jpg"])
+            .album("hiphop/mf doom - operation doomsday", &["01 Doomsday.mp3"])
+            .flac_album("jazz/Miles Davis - Kind of Blue")
+            .non_ascii_album("electronic/KREAM - So Hï")
+            .build()
+    }
+
+    /// The names of the listing's rows, as the widget would draw them.
+    fn listing(app: &App) -> Vec<String> {
+        let library = app.library.as_ref().expect("a library has landed");
+        app.browser
+            .rows(library, 200)
+            .rows
+            .into_iter()
+            .map(|row| row.name)
+            .collect()
+    }
+
+    /// Open a search line and type a pattern into it, one keystroke at a time.
+    ///
+    /// Through [`App::update`] rather than a method, because "a letter reaches
+    /// the line instead of the verb it is bound to" is half of what this has to
+    /// get right: `n` is `search_next` in the browser and an `n` in here.
+    fn search(app: &mut App, opener: char, pattern: &str) {
+        app.update(press(opener));
+        assert!(
+            matches!(app.views.last(), Some(View::Search(_))),
+            "`{opener}` should have opened the line"
+        );
+        type_in(app, pattern);
+    }
+
+    /// Run a library-wide search and wait for the worker to answer.
+    fn find_and_settle(app: &mut App, rx: &mpsc::Receiver<Msg>, pattern: &str) {
+        search(app, 'F', pattern);
+        app.update(key(KeyCode::Enter));
+        settle_until(app, rx, |app| {
+            app.finding.is_none() && app.browser.results().is_some()
+        });
+    }
+
+    #[test]
+    fn slash_matches_as_you_type_and_esc_puts_the_cursor_back() {
+        let fx = search_fixture();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        app.size = (100, 30);
+        in_dir(&mut app, "hiphop/MF DOOM - Mm..Food");
+        assert_eq!(cursor(&app), 0);
+
+        // Each keystroke re-runs the search, and the cursor follows it.
+        app.update(press('/'));
+        type_in(&mut app, "hoe");
+        assert_eq!(listing(&app)[cursor(&app)], "02 Hoe Cakes.mp3");
+
+        // `enter` keeps the position and closes the line.
+        app.update(key(KeyCode::Enter));
+        assert!(matches!(app.views.last(), Some(View::Browser)));
+        assert_eq!(listing(&app)[cursor(&app)], "02 Hoe Cakes.mp3");
+
+        // `esc` on a second search restores the position it started from.
+        let was = cursor(&app);
+        search(&mut app, '/', "folder");
+        assert_eq!(listing(&app)[cursor(&app)], "folder.jpg");
+        app.update(key(KeyCode::Esc));
+        assert_eq!(cursor(&app), was, "esc undoes what the line did");
+        assert!(matches!(app.views.last(), Some(View::Browser)));
+    }
+
+    #[test]
+    fn backspacing_the_pattern_walks_the_cursor_back_with_it() {
+        let fx = search_fixture();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/MF DOOM - Mm..Food");
+
+        search(&mut app, '/', "folder");
+        assert_eq!(listing(&app)[cursor(&app)], "folder.jpg");
+
+        // `fo` still matches `folder.jpg` and nothing before it.
+        for _ in 0..4 {
+            app.update(key(KeyCode::Backspace));
+        }
+        assert_eq!(app.prompt().expect("still open").text(), "fo");
+        assert_eq!(listing(&app)[cursor(&app)], "folder.jpg");
+
+        // Emptied, the cursor is back where the line opened.
+        app.update(key(KeyCode::Backspace));
+        app.update(key(KeyCode::Backspace));
+        assert_eq!(app.prompt().expect("still open").text(), "");
+        assert_eq!(cursor(&app), 0);
+    }
+
+    #[test]
+    fn n_and_capital_n_cycle_the_matches_and_wrap() {
+        let fx = search_fixture();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/MF DOOM - Mm..Food");
+
+        // Three rows match `.mp3`; the fourth is the cover art.
+        search(&mut app, '/', "mp3");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(cursor(&app), 0);
+
+        assert!(app.update(press('n')));
+        assert_eq!(cursor(&app), 1);
+        assert!(app.update(press('n')));
+        assert_eq!(cursor(&app), 2);
+        // Wraps, rather than stopping at the last match and looking broken.
+        assert!(app.update(press('n')));
+        assert_eq!(cursor(&app), 0);
+        assert!(app.update(press('N')));
+        assert_eq!(cursor(&app), 2, "`N` wraps the other way");
+    }
+
+    #[test]
+    fn n_with_nothing_searched_for_yet_says_so() {
+        let fx = search_fixture();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        app.toasts.clear();
+
+        assert!(app.update(press('n')));
+        let toast = app.toasts.front().expect("it should say something");
+        assert!(toast.text.contains("nothing to cycle"), "{}", toast.text);
+        // The key it names is the one that is actually bound.
+        assert!(toast.text.contains('/'), "{}", toast.text);
+    }
+
+    #[test]
+    fn smart_case_is_vims_rule_in_the_browser_too() {
+        let fx = search_fixture();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop");
+
+        // Two directories whose names differ only in case.
+        assert_eq!(listing(&app).len(), 2);
+
+        // `doom` matches `MF DOOM`: a lowercase pattern ignores case.
+        search(&mut app, '/', "doom");
+        assert_eq!(app.prompt().expect("open").matches(), Some(2));
+        app.update(key(KeyCode::Esc));
+
+        // `DOOM` does not match `mf doom`: an uppercase letter means case
+        // matters. One of the two rows is left.
+        search(&mut app, '/', "DOOM");
+        assert_eq!(app.prompt().expect("open").matches(), Some(1));
+        assert_eq!(listing(&app)[cursor(&app)], "MF DOOM - Mm..Food");
+        app.update(key(KeyCode::Esc));
+
+        // And a spelling neither of them uses matches nothing at all.
+        search(&mut app, '/', "Doom");
+        assert_eq!(app.prompt().expect("open").matches(), Some(0));
+    }
+
+    #[test]
+    fn f_narrows_the_listing_and_the_status_bar_says_so() {
+        let fx = search_fixture();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(110, 30);
+        app.update(scanned(&fx));
+        draw(&mut app, &mut terminal);
+        in_dir(&mut app, "hiphop/MF DOOM - Mm..Food");
+        assert_eq!(listing(&app).len(), 4);
+
+        search(&mut app, 'f', "mp3");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(
+            listing(&app),
+            vec![
+                "01 Beef Rap.mp3".to_owned(),
+                "02 Hoe Cakes.mp3".to_owned(),
+                "03 Potholderz.mp3".to_owned(),
+            ],
+            "the cover art is gone"
+        );
+
+        // An active filter is never invisible.
+        draw(&mut app, &mut terminal);
+        let shown = text(&terminal);
+        assert!(shown.contains("filter `mp3`"), "{shown}");
+
+        // `esc` clears it and the whole directory comes back.
+        assert!(app.update(key(KeyCode::Esc)));
+        assert_eq!(listing(&app).len(), 4);
+        draw(&mut app, &mut terminal);
+        assert!(!text(&terminal).contains("filter `"), "{}", text(&terminal));
+    }
+
+    #[test]
+    fn esc_on_the_filter_line_puts_the_previous_filter_back() {
+        let fx = search_fixture();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/MF DOOM - Mm..Food");
+
+        search(&mut app, 'f', "mp3");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(listing(&app).len(), 3);
+
+        // A second filter, abandoned: the first one is still what is in force,
+        // which is why `restore` is a query and not a flag.
+        search(&mut app, 'f', "beef");
+        assert_eq!(listing(&app).len(), 1);
+        app.update(key(KeyCode::Esc));
+        assert_eq!(listing(&app).len(), 3);
+        assert_eq!(
+            app.browser.filter().map(ToString::to_string),
+            Some("mp3".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_filter_that_matches_nothing_says_no_matches_rather_than_looking_empty() {
+        let fx = search_fixture();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(110, 30);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop/MF DOOM - Mm..Food");
+
+        search(&mut app, 'f', "nothing at all");
+        assert_eq!(app.prompt().expect("open").matches(), Some(0));
+        assert_eq!(
+            app.prompt().expect("open").note_text(),
+            " \u{b7} no matches"
+        );
+
+        draw(&mut app, &mut terminal);
+        let shown = text(&terminal);
+        assert!(shown.contains("no matches for"), "{shown}");
+        assert!(
+            !shown.contains("empty directory"),
+            "it is not empty, it is filtered: {shown}"
+        );
+    }
+
+    #[test]
+    fn a_query_that_does_not_parse_leaves_the_line_open_with_the_reason_under_it() {
+        let fx = search_fixture();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(110, 30);
+        app.update(scanned(&fx));
+
+        search(&mut app, '/', "artist:");
+        let error = app.prompt().expect("still open").error();
+        assert!(
+            error.is_some_and(|text| text.contains("needs something to look for")),
+            "{error:?}"
+        );
+        draw(&mut app, &mut terminal);
+        assert!(
+            text(&terminal).contains("needs something"),
+            "{}",
+            text(&terminal)
+        );
+
+        // One more keystroke makes it a query, and the complaint goes.
+        app.update(press('d'));
+        assert_eq!(app.prompt().expect("still open").error(), None);
+
+        // A field nothing models says which fields there are. (`esc` first: in
+        // search mode a `/` is a character, not a second search line.)
+        app.update(key(KeyCode::Esc));
+        search(&mut app, '/', "missing:bpm");
+        let error = app.prompt().expect("open").error().unwrap_or_default();
+        assert!(error.contains("no `bpm` field"), "{error}");
+        assert!(error.contains("genre"), "{error}");
+    }
+
+    #[test]
+    fn a_quoted_value_with_a_space_in_it_parses_from_the_line() {
+        let fx = search_fixture();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "hiphop");
+
+        // The space would otherwise split it into two terms, the second of which
+        // matches nothing.
+        search(&mut app, '/', "\"doom - mm\"");
+        assert_eq!(app.prompt().expect("open").error(), None);
+        assert_eq!(app.prompt().expect("open").matches(), Some(1));
+        assert_eq!(listing(&app)[cursor(&app)], "MF DOOM - Mm..Food");
+    }
+
+    #[test]
+    fn a_non_ascii_query_matches_a_non_ascii_name() {
+        let fx = search_fixture();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "electronic/KREAM - So Hï");
+
+        search(&mut app, '/', "so hï");
+        assert_eq!(listing(&app)[cursor(&app)], "01 So Hï.mp3");
+
+        app.update(key(KeyCode::Esc));
+        search(&mut app, '/', "ノスタルジア");
+        assert_eq!(listing(&app)[cursor(&app)], "03 ノスタルジア.mp3");
+        // Backspacing over a multi-byte character is not a panic.
+        app.update(key(KeyCode::Backspace));
+        assert_eq!(app.prompt().expect("open").text(), "ノスタルジ");
+    }
+
+    #[test]
+    fn a_tag_query_filters_once_the_tags_have_been_read() {
+        let fx = search_fixture();
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+        app.size = (100, 30);
+        in_dir(&mut app, "hiphop/MF DOOM - Mm..Food");
+
+        // Nothing here has had its tags read yet, so a `genre:` filter matches
+        // nothing: a row is matched against the tags that *are* loaded.
+        search(&mut app, 'f', "genre:hip-hop");
+        assert!(
+            listing(&app).len() < 4,
+            "an unread row cannot match on a field nobody has read"
+        );
+
+        // It fills in as the answers land — and the whole directory is asked
+        // for, not the visible window, or the rows that were filtered out could
+        // never arrive.
+        settle_until(&mut app, &rx, |app| {
+            app.browser
+                .row_count(Pane::Files, app.library.as_ref().expect("a library"))
+                == 3
+        });
+        assert_eq!(
+            listing(&app),
+            vec![
+                "01 Beef Rap.mp3".to_owned(),
+                "02 Hoe Cakes.mp3".to_owned(),
+                "03 Potholderz.mp3".to_owned(),
+            ],
+            "the three mp3s say `Hip-Hop`; the cover art has no tags at all"
+        );
+        assert_eq!(app.prompt().expect("still open").matches(), Some(3));
+
+        // A genre none of them has stays empty, however long it is given.
+        app.update(key(KeyCode::Esc));
+        search(&mut app, 'f', "genre:electronic");
+        assert!(listing(&app).is_empty());
+    }
+
+    #[test]
+    fn capital_f_searches_the_whole_library_and_the_hits_become_the_listing() {
+        let fx = search_fixture();
+        let (mut app, rx) = app(&fx);
+        let mut terminal = screen(110, 30);
+        app.update(scanned(&fx));
+        app.size = (110, 30);
+
+        // `ext:flac` needs no tags at all, so the walk opens nothing.
+        find_and_settle(&mut app, &rx, "ext:flac");
+        let rows = listing(&app);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(rows.iter().all(|row| row.ends_with(".flac")), "{rows:?}");
+        assert!(
+            rows.iter().all(|row| row.contains('/')),
+            "a flat result set shows the whole path, or forty hits look alike: {rows:?}"
+        );
+
+        // The title and the status bar both say what is being looked at.
+        draw(&mut app, &mut terminal);
+        let shown = text(&terminal);
+        assert!(shown.contains("find: ext:flac"), "{shown}");
+        assert!(shown.contains("find `ext:flac` (3)"), "{shown}");
+
+        // `esc` goes back to the directory that was underneath it.
+        assert!(app.update(key(KeyCode::Esc)));
+        assert!(app.browser.results().is_none());
+        assert_eq!(app.browser.dir_label(), "/");
+    }
+
+    #[test]
+    fn a_library_search_reports_progress_and_never_blocks_the_draw() {
+        let fx = search_fixture();
+        let (mut app, rx) = app(&fx);
+        let mut terminal = screen(110, 30);
+        app.update(scanned(&fx));
+
+        // `missing:genre` is the expensive one: it has to open every audio file.
+        search(&mut app, 'F', "missing:genre");
+        app.update(key(KeyCode::Enter));
+        assert!(app.finding.is_some(), "the walk is out on a worker");
+
+        // The UI keeps drawing while it runs, and says how far it has got.
+        draw(&mut app, &mut terminal);
+        assert!(
+            text(&terminal).contains("find `missing:genre`"),
+            "{}",
+            text(&terminal)
+        );
+
+        let mut progressed = false;
+        for _ in 0..200 {
+            if app.finding.is_none() && app.browser.results().is_some() {
+                break;
+            }
+            let Ok(msg) = rx.recv_timeout(Duration::from_secs(10)) else {
+                break;
+            };
+            progressed |= matches!(msg, Msg::Finding(_));
+            app.update(msg);
+            draw(&mut app, &mut terminal);
+        }
+        assert!(progressed, "the worker should have reported as it went");
+        assert!(app.browser.results().is_some(), "and then answered");
+
+        // Nothing in the fixture is missing a genre — the templates all carry
+        // one — so this is also the empty-result-set case.
+        assert!(listing(&app).is_empty());
+        draw(&mut app, &mut terminal);
+        assert!(
+            text(&terminal).contains("no matches for `missing:genre`"),
+            "{}",
+            text(&terminal)
+        );
+    }
+
+    #[test]
+    fn missing_genre_finds_the_file_whose_genre_was_cleared() {
+        let fx = search_fixture();
+        mpdfm_core::tags::write(
+            &fx.abs("hiphop/MF DOOM - Mm..Food/02 Hoe Cakes.mp3"),
+            &TagDelta::new().clear(Field::Genre),
+            &WriteOpts::new(),
+        )
+        .expect("the fixture is ours to write");
+
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+        find_and_settle(&mut app, &rx, "missing:genre");
+
+        assert_eq!(
+            listing(&app),
+            vec!["hiphop/MF DOOM - Mm..Food/02 Hoe Cakes.mp3".to_owned()],
+        );
+        // What the walk read is now the browser's cache, so the row shows its
+        // duration without being opened a second time.
+        let rows = app
+            .browser
+            .rows(app.library.as_ref().expect("a library"), 10)
+            .rows;
+        assert!(
+            matches!(
+                rows[0].meta,
+                crate::tui::widgets::filelist::Meta::Known { .. }
+            ),
+            "{:?}",
+            rows[0].meta
+        );
+    }
+
+    #[test]
+    fn a_file_the_search_could_not_open_stays_on_the_status_bar() {
+        let fx = search_fixture();
+        // A truncated FLAC: the container is recognizable and the tag is not.
+        mpdfm_core::testing::tags::truncate(
+            &fx.abs("jazz/Miles Davis - Kind of Blue/01 So What.flac"),
+            40,
+        );
+
+        let (mut app, rx) = app(&fx);
+        let mut terminal = screen(120, 20);
+        app.update(scanned(&fx));
+        app.size = (120, 20);
+        find_and_settle(&mut app, &rx, "genre:electronic");
+
+        // The toast says it once; the status bar keeps saying it, because a
+        // result set that may be missing a file is one the user is about to act
+        // on.
+        let toast = app
+            .toasts
+            .iter()
+            .find(|toast| toast.text.contains("find `genre:electronic`"))
+            .expect("it should say what happened");
+        assert!(toast.text.contains("1 unreadable"), "{}", toast.text);
+
+        draw(&mut app, &mut terminal);
+        let shown = text(&terminal);
+        assert!(shown.contains("1 unreadable"), "{shown}");
+        // And it is not counted as a hit.
+        assert!(
+            !listing(&app)
+                .iter()
+                .any(|row| row.ends_with("01 So What.flac")),
+            "{:?}",
+            listing(&app)
+        );
+    }
+
+    #[test]
+    fn a_result_set_can_be_marked_and_staged_like_any_other_listing() {
+        let fx = search_fixture();
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+        app.size = (110, 30);
+        find_and_settle(&mut app, &rx, "ext:flac");
+        assert_eq!(listing(&app).len(), 3);
+        assert_eq!(
+            app.focus,
+            Focus::Files,
+            "the keyboard is on the hits, not on the tree the result set covers"
+        );
+
+        // `a` marks the result set, `d` stages a delete of it — which is the
+        // workflow the task says makes a library-wide search worth building.
+        assert!(app.update(press('a')));
+        assert_eq!(app.browser.marked(), 3);
+        assert!(app.update(press('d')));
+        assert_eq!(app.plan.len(), 3, "one operation per hit");
+        assert!(matches!(app.views.last(), Some(View::Pending(_))));
+
+        // And the paths staged are the hits, not whatever directory was
+        // underneath the result set.
+        let staged: Vec<String> = app
+            .plan
+            .ops()
+            .iter()
+            .map(|op| op.source().as_str().to_owned())
+            .collect();
+        assert!(
+            staged.iter().all(|path| path.ends_with(".flac")),
+            "{staged:?}"
+        );
+    }
+
+    #[test]
+    fn a_library_search_can_be_called_off_with_esc() {
+        // Enough files that the walk reports at least once before it finishes.
+        let mut builder = Fixture::builder();
+        for n in 0..300 {
+            builder = builder.track(&format!("bulk/album {:02}/{n:03} track.mp3", n / 10));
+        }
+        let fx = builder.build();
+
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+        search(&mut app, 'F', "missing:genre");
+        app.update(key(KeyCode::Enter));
+
+        // `esc` reaches the worker through the shared flag, and the worker still
+        // answers — what it found before the stop is a result the user asked for.
+        assert!(app.update(key(KeyCode::Esc)));
+        assert!(
+            app.finding.as_ref().is_some_and(Finding::is_cancelling),
+            "the stop is pending"
+        );
+        settle_until(&mut app, &rx, |app| app.finding.is_none());
+        assert!(app.browser.results().is_some(), "it answered anyway");
+        let toast = app
+            .toasts
+            .iter()
+            .find(|toast| toast.text.contains("find `missing:genre`"))
+            .expect("it should say what happened");
+        assert!(toast.text.contains("stopped after"), "{}", toast.text);
+    }
+
+    #[test]
+    fn colon_find_is_the_same_door_as_capital_f() {
+        let fx = search_fixture();
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+
+        app.update(press(':'));
+        type_in(&mut app, "find ext:flac");
+        app.update(key(KeyCode::Enter));
+        settle_until(&mut app, &rx, |app| app.browser.results().is_some());
+
+        assert_eq!(listing(&app).len(), 3);
+        assert_eq!(
+            app.browser.results().map(|results| results.query.clone()),
+            Some("ext:flac".to_owned())
+        );
+
+        // A query that does not parse is a message and not a silent no-op: the
+        // line has already closed by the time a command runs.
+        app.toasts.clear();
+        app.update(press(':'));
+        type_in(&mut app, "find missing:bpm");
+        app.update(key(KeyCode::Enter));
+        let toast = app.toasts.front().expect("it should say something");
+        assert!(toast.text.contains("no `bpm` field"), "{}", toast.text);
+    }
+
+    #[test]
+    fn a_second_search_while_one_is_running_is_refused_rather_than_stacked() {
+        let mut builder = Fixture::builder();
+        for n in 0..300 {
+            builder = builder.track(&format!("bulk/album {:02}/{n:03} track.mp3", n / 10));
+        }
+        let fx = builder.build();
+
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+        search(&mut app, 'F', "missing:genre");
+        app.update(key(KeyCode::Enter));
+        app.toasts.clear();
+
+        search(&mut app, 'F', "ext:mp3");
+        app.update(key(KeyCode::Enter));
+        let toast = app.toasts.front().expect("it should say something");
+        assert!(toast.text.contains("already running"), "{}", toast.text);
+
+        settle_until(&mut app, &rx, |app| app.finding.is_none());
+    }
+
+    #[test]
+    fn a_rescan_drops_a_result_set_because_its_indices_are_of_the_old_model() {
+        let fx = search_fixture();
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+        find_and_settle(&mut app, &rx, "ext:flac");
+        assert!(app.browser.results().is_some());
+
+        // A filter survives — it is a pattern, and the user did not stop meaning
+        // it — but the hits cannot: they are indices into a model that has gone.
+        app.browser.set_filter(
+            Some(query::parse("flac").expect("parses")),
+            app.library.as_ref().expect("a library"),
+        );
+        app.update(scanned(&fx));
+        assert!(app.browser.results().is_none());
+        assert_eq!(
+            app.browser.filter().map(ToString::to_string),
+            Some("flac".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_library_wide_search_over_three_thousand_files_keeps_the_ui_drawing() {
+        // The size the task names: ~2 800 files, which is the real library.
+        let mut builder = Fixture::builder();
+        for n in 0..2_800 {
+            builder = builder.track(&format!("bulk/album {:03}/{n:04} track.mp3", n / 20));
+        }
+        let fx = builder.build();
+
+        let (mut app, rx) = app(&fx);
+        let mut terminal = screen(110, 30);
+        app.update(scanned(&fx));
+        app.size = (110, 30);
+
+        // `missing:genre` is the worst case: every audio file has to be opened.
+        search(&mut app, 'F', "missing:genre");
+        let started = Instant::now();
+        app.update(key(KeyCode::Enter));
+
+        let mut frames = 0_u32;
+        let mut reports = 0_u32;
+        let mut slowest = Duration::ZERO;
+        while app.finding.is_some() {
+            let Ok(msg) = rx.recv_timeout(Duration::from_secs(60)) else {
+                break;
+            };
+            reports += u32::from(matches!(msg, Msg::Finding(_)));
+            app.update(msg);
+            let frame = Instant::now();
+            draw(&mut app, &mut terminal);
+            slowest = slowest.max(frame.elapsed());
+            frames += 1;
+        }
+        let elapsed = started.elapsed();
+
+        eprintln!(
+            "find over {} files: {} ms, {reports} reports, {frames} frames, slowest {} µs ({} build)",
+            app.library.as_ref().expect("a library").len(),
+            elapsed.as_millis(),
+            slowest.as_micros(),
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }
+        );
+
+        assert!(app.browser.results().is_some(), "it finished");
+        assert!(reports > 1, "a 2 800-file walk should report as it goes");
+        // The point is not how fast the walk is — it is I/O — but that no single
+        // frame waited on it. The walk is on a worker, so a frame is a frame.
+        assert!(
+            slowest < Duration::from_millis(50),
+            "{} µs for one frame means the draw waited on the walk",
+            slowest.as_micros()
+        );
     }
 }

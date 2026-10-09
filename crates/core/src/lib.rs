@@ -13,6 +13,7 @@ pub mod mpdconf;
 pub mod ops;
 pub mod paths;
 pub mod playlist;
+pub mod query;
 pub mod tags;
 
 // The fixture library (task 03). Behind a feature so a release build carries

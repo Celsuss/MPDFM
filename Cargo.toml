@@ -25,6 +25,12 @@ signal-hook = "=0.3.18"
 tempfile = "=3.27.0"
 thiserror = "=2.0.21"
 toml = "=1.1.6"
+# Query matching has to work on the real library's names, and 1 023 of them are
+# not ASCII — including one stored as `Hi` + a combining diaeresis where a
+# keyboard produces the single `ï`. A substring match over bytes cannot see
+# through that, so `crates/core/src/query.rs` folds both sides to NFC, and only
+# when the pattern is non-ASCII (task 25).
+unicode-normalization = "=0.1.25"
 unicode-width = "=0.2.2"
 walkdir = "=2.5.0"
 
