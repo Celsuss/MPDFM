@@ -51,6 +51,13 @@ pub enum Command {
         /// Which transaction, or `None` for the most recent undoable one.
         txid: Option<String>,
     },
+    /// `:find <query>` — search the whole library and list the hits.
+    Find {
+        /// The query, in the grammar [`mpdfm_core::query`] parses. Kept as typed:
+        /// parsing it is the business of the code that runs it, which is where
+        /// the complaint about a bad one belongs.
+        query: String,
+    },
     /// `:doctor` — the library and playlist health report.
     Doctor,
     /// `:set <k>=<v>` — change a setting for this session.
@@ -114,6 +121,7 @@ pub enum CommandError {
 pub const USAGE: &[(&str, &str)] = &[
     ("move <dst>", "stage a move of the marks"),
     ("organize <template>", "re-file by a template"),
+    ("find <query>", "search the whole library"),
     ("undo [txid]", "reverse a committed transaction"),
     ("doctor", "library and playlist health"),
     ("set <k>=<v>", "change a setting for this session"),
@@ -180,6 +188,12 @@ pub fn parse(line: &str) -> Result<Command, CommandError> {
         "organize" => Ok(Command::Organize {
             template: argument("a template")?,
         }),
+        // The rest of the line, spaces and all: a query is `artist:doom
+        // ext:flac`, and splitting it into words here would mean joining them
+        // back up in the parser that already knows how.
+        "find" | "f" => Ok(Command::Find {
+            query: argument("something to look for")?,
+        }),
         "undo" => {
             // One word or none: a txid is `20260924T224500Z-a3f1`.
             if rest.split_whitespace().count() > 1 {
@@ -227,6 +241,7 @@ fn name_of(typed: &str) -> &'static str {
     match typed {
         "move" | "mv" => "move",
         "organize" => "organize",
+        "find" | "f" => "find",
         "undo" => "undo",
         "doctor" => "doctor",
         "set" => "set",

@@ -52,11 +52,13 @@ use mpdfm_core::ops::commit::{self, Previewed};
 use mpdfm_core::ops::{Effects, Live, Plan};
 use mpdfm_core::paths::RelPath;
 use mpdfm_core::playlist::PlaylistIndex;
+use mpdfm_core::query::{self, Flow, Query};
 use mpdfm_core::tags;
 
 use super::log::Log;
 use super::msg::{
-    MpdSnapshot, MpdState, Msg, NotCommitted, Reads, ScanOutcome, TaskOutcome, TrackInfo,
+    FoundOutcome, MpdSnapshot, MpdState, Msg, NotCommitted, Reads, ScanOutcome, TaskOutcome,
+    TrackInfo,
 };
 
 /// How long MPD gets to answer the status poll.
@@ -224,6 +226,70 @@ pub fn read_window(paths: &[RelPath], root: &Utf8Path) -> Reads {
             (rel.clone(), read)
         })
         .collect()
+}
+
+/// Walk the whole library for what a query matches.
+///
+/// The third worker whose cost is the library rather than the screen, and the
+/// one the task makes an acceptance criterion of: `missing:genre` over 2 800
+/// files opens every one of them, which is seconds of I/O, and the UI has to
+/// keep drawing throughout.
+///
+/// Sends [`Msg::Finding`] as it goes and exactly one [`TaskOutcome::Found`] at
+/// the end — including when it was called off, because what was found before
+/// the stop is still a result the user asked for, and because the app holds a
+/// "a search is running" state that a missing answer would strand.
+///
+/// `cancel` is shared and not sent, exactly as a commit's is: by the time a
+/// message had been received the walk would be in the middle of a synchronous
+/// pass over the library.
+pub fn find(
+    tx: Sender<Msg>,
+    query: Query,
+    library: Library,
+    cancel: Arc<AtomicBool>,
+    log: Arc<Log>,
+) {
+    let fallback = tx.clone();
+    let spawned = thread::Builder::new()
+        .name("mpdfm-find".to_owned())
+        .spawn(move || {
+            let started = Instant::now();
+            log.line(format!("find: `{query}` over {} entries", library.len()));
+
+            let progress_tx = tx.clone();
+            let found = query::find(&query, &library, &mut |progress| {
+                if cancel.load(Ordering::Relaxed) {
+                    return Flow::Stop;
+                }
+                // A closed channel means the UI has gone; the next send fails
+                // too and the thread ends either way.
+                let _ = progress_tx.send(Msg::Finding(*progress));
+                Flow::Go
+            });
+
+            log.line(format!(
+                "find: `{query}` {} hit(s), {} read, {} failed, {} µs{}",
+                found.hits.len(),
+                found.read,
+                found.failed.len(),
+                started.elapsed().as_micros(),
+                if found.cancelled { ", cancelled" } else { "" }
+            ));
+            let _ = tx.send(Msg::TaskDone(Box::new(TaskOutcome::Found(Box::new(
+                FoundOutcome {
+                    query: query.raw().to_owned(),
+                    found,
+                },
+            )))));
+        });
+
+    if let Err(err) = spawned {
+        let _ = fallback.send(Msg::TaskDone(Box::new(TaskOutcome::Failed {
+            what: "find".to_owned(),
+            message: format!("cannot start the search thread: {err}"),
+        })));
+    }
 }
 
 /// Ask MPD what it is doing, once.

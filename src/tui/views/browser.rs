@@ -45,6 +45,30 @@
 //! [`library::audio_reads`][mpdfm_core::library::audio_reads] is what keeps that
 //! honest in the tests.
 //!
+//! # Narrowing: a filter, and a flat result set
+//!
+//! Two things can replace what the listing shows, and both go through the one
+//! place that builds it ([`Browser::refresh`]) rather than through a second code
+//! path of their own:
+//!
+//! - **a filter** ([`Browser::set_filter`]) drops the rows a [`Query`] does not
+//!   match. It stays until it is cleared, and it is the only state here that the status bar must show, because
+//!   a listing that is quietly missing rows is a listing that lies;
+//! - **a result set** ([`Browser::show_results`]) replaces the directory's
+//!   contents with the hits of a library-wide search — a flat virtual directory,
+//!   in path order. Marking, the details pane, staging and the tag editor all read
+//!   [`Browser::listing`] and [`Browser::marks`], so every one of them works in
+//!   there without knowing it is not a directory. That is the whole reason the
+//!   results live here and not in a view of their own.
+//!
+//! A filter that needs tags is the awkward case, and the answer is in two
+//! halves. A row is matched against the tags that have actually been read — the
+//! task's own "filename, and when tags are loaded, artist, album, title,
+//! genre" — so a `genre:jazz` filter starts by matching nothing and *fills in*;
+//! and [`Browser::wanted`] asks for the whole **unfiltered** directory, so the
+//! rows that are not on screen are read too and the listing converges instead of
+//! being stuck on what was known when the pattern was typed.
+//!
 //! # Sorting
 //!
 //! Four orders, remembered for the session (`:set sort=track`). Directories
@@ -72,6 +96,7 @@ use std::ops::Range;
 use mpdfm_core::library::{DirPath, Kind, Library, ScanWarning};
 use mpdfm_core::paths::RelPath;
 use mpdfm_core::playlist::PlaylistIndex;
+use mpdfm_core::query::{Query, Subject};
 use mpdfm_core::tags::Field;
 
 use crate::tui::msg::TrackInfo;
@@ -212,6 +237,31 @@ pub struct Browser {
     /// risk a cache carries is answered by there being a single place that
     /// fills it.
     listing: Vec<Target>,
+    /// The filter in force, which narrows the listing until it is cleared.
+    filter: Option<Query>,
+    /// A library-wide search's hits, shown instead of a directory's contents.
+    results: Option<Results>,
+}
+
+/// What a library-wide search found, in the shape a listing needs it.
+///
+/// Indices into [`Library::entries`] and not paths, because that is what a
+/// [`Target::File`] is — so a result set is a listing like any other, and
+/// everything that already works on one works on it. They are dropped on a
+/// rescan ([`Browser::library_changed`]), since an index into a model that has
+/// been replaced is not a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Results {
+    /// What was searched for, as the user typed it.
+    pub query: String,
+    /// The hits, in [`Library::entries`] order — which is path order, so the
+    /// flat listing stays grouped by directory.
+    pub hits: Vec<usize>,
+    /// How many files the search could not open.
+    ///
+    /// Shown rather than swallowed: a search that could not read nine files
+    /// found a result set that may be missing nine.
+    pub failed: usize,
 }
 
 impl Default for Browser {
@@ -237,6 +287,8 @@ impl Browser {
             asked: HashSet::new(),
             flagged: HashSet::new(),
             listing: Vec::new(),
+            filter: None,
+            results: None,
         }
     }
 
@@ -250,8 +302,15 @@ impl Browser {
 
     /// The current directory, spelled for a title: the root is `/` and not the
     /// empty string a [`DirPath`] displays as.
+    ///
+    /// A result set borrows the same line, because the title is where the user
+    /// looks to find out what they are looking at — and "the hits for
+    /// `missing:genre`" is that, in a way the directory underneath is not.
     #[must_use]
     pub fn dir_label(&self) -> String {
+        if let Some(results) = &self.results {
+            return format!("find: {}", results.query);
+        }
         if self.dir.is_root() {
             "/".to_owned()
         } else {
@@ -297,6 +356,115 @@ impl Browser {
             self.refresh(library);
         }
         changed
+    }
+
+    // -- narrowing ----------------------------------------------------------
+
+    /// The filter in force, if there is one.
+    #[must_use]
+    pub fn filter(&self) -> Option<&Query> {
+        self.filter.as_ref()
+    }
+
+    /// Narrow the listing to what `query` matches, or stop narrowing it.
+    ///
+    /// Returns whether anything changed. An empty query is the same as no
+    /// filter, so backspacing the last character of one puts the whole listing
+    /// back rather than narrowing it to everything and claiming to be active.
+    pub fn set_filter(&mut self, query: Option<Query>, library: &Library) -> bool {
+        let query = query.filter(|query| !query.is_empty());
+        if self.filter == query {
+            return false;
+        }
+        self.filter = query;
+        self.visual = None;
+        self.refresh(library);
+        true
+    }
+
+    /// The result set being shown, if the listing is one.
+    #[must_use]
+    pub fn results(&self) -> Option<&Results> {
+        self.results.as_ref()
+    }
+
+    /// Show a library-wide search's hits as the listing.
+    ///
+    /// The cursor goes to the top: a result set is a new thing to read, and
+    /// keeping a position from the directory it replaced would put it on an
+    /// unrelated row.
+    pub fn show_results(&mut self, results: Results, library: &Library) {
+        self.results = Some(results);
+        self.cursor = 0;
+        self.files_offset = 0;
+        self.visual = None;
+        self.refresh(library);
+    }
+
+    /// Go back to showing a directory. Returns whether there was a result set.
+    ///
+    /// Marks are left alone — they are the user's own work, and the whole point
+    /// of being able to mark a result set is to act on it somewhere else.
+    pub fn clear_results(&mut self, library: &Library) -> bool {
+        if self.results.take().is_none() {
+            return false;
+        }
+        self.cursor = 0;
+        self.files_offset = 0;
+        self.visual = None;
+        self.refresh(library);
+        true
+    }
+
+    /// The next row matching `query`, starting from `from` and wrapping.
+    ///
+    /// `from` is where to start looking and is itself a candidate, so a search
+    /// re-run from the position it opened at converges on the same row as the
+    /// pattern grows — which is what makes `/` feel incremental rather than
+    /// jumpy. Wrapping is vim's behaviour and the reason `n` on the last match
+    /// goes back to the first rather than doing nothing.
+    ///
+    /// `None` when nothing in the listing matches, which the caller shows as
+    /// "no matches" rather than moving the cursor somewhere arbitrary.
+    #[must_use]
+    pub fn find_match(
+        &self,
+        from: usize,
+        query: &Query,
+        forward: bool,
+        library: &Library,
+    ) -> Option<usize> {
+        let count = self.listing.len();
+        if count == 0 || query.is_empty() {
+            return None;
+        }
+        let from = from.min(count - 1);
+        (0..count)
+            .map(|step| {
+                if forward {
+                    (from + step) % count
+                } else {
+                    (from + count - step) % count
+                }
+            })
+            .find(|&row| {
+                self.listing
+                    .get(row)
+                    .is_some_and(|target| self.hit(target, query, library))
+            })
+    }
+
+    /// How many rows of the listing match `query`.
+    ///
+    /// For the `3 matches` the search line shows, and for the "no matches" state
+    /// an empty answer renders. Over a listing and not over the library, so it
+    /// costs a pass over what is on screen's worth of rows.
+    #[must_use]
+    pub fn count_matches(&self, query: &Query, library: &Library) -> usize {
+        self.listing
+            .iter()
+            .filter(|target| self.hit(target, query, library))
+            .count()
     }
 
     /// Whether a visual selection is in progress, for the status bar.
@@ -345,6 +513,10 @@ impl Browser {
         self.tags.clear();
         self.asked.clear();
         self.visual = None;
+        // A result set is indices into the model that has just been replaced, so
+        // it cannot survive. The filter can and does: it is a pattern, and the
+        // user did not stop meaning it because the library was walked again.
+        self.results = None;
 
         self.flagged = index.map(flagged_dirs).unwrap_or_default();
         self.marks.retain(|rel| {
@@ -452,6 +624,11 @@ impl Browser {
 
     /// `-` / `backspace`: the parent directory, wherever the keyboard is.
     pub fn go_up(&mut self, library: &Library) -> bool {
+        // Leaving a result set is going back to where the search was started
+        // from, which is the directory that is still underneath it.
+        if self.clear_results(library) {
+            return true;
+        }
         let Some(parent) = self.dir.parent() else {
             return false;
         };
@@ -467,6 +644,7 @@ impl Browser {
 
     /// Make `dir` the current directory and show it in the tree.
     pub fn open(&mut self, dir: DirPath, library: &Library) {
+        self.results = None;
         let mut ancestor = dir.parent();
         while let Some(parent) = ancestor {
             ancestor = parent.parent();
@@ -488,9 +666,12 @@ impl Browser {
 
     /// Select a directory without touching what is expanded.
     fn select(&mut self, dir: DirPath) {
-        if self.dir == dir {
+        if self.dir == dir && self.results.is_none() {
             return;
         }
+        // Moving the tree cursor is asking for a directory, so the result set
+        // that was covering one stops covering it.
+        self.results = None;
         self.dir = dir;
         self.cursor = 0;
         self.files_offset = 0;
@@ -574,24 +755,93 @@ impl Browser {
     }
 
     /// Rebuild the listing. Every mutator that can change it ends here.
+    ///
+    /// Three things in order: what is in scope, the sort, and the filter. A
+    /// result set is already in path order and is deliberately **not** re-sorted
+    /// — a flat list of two hundred hits from forty directories is readable
+    /// because it is grouped by path, and `sort name` would shuffle the
+    /// directories together.
     fn refresh(&mut self, library: &Library) {
-        let mut dirs: Vec<&DirPath> = library.subdirs_in(&self.dir).iter().collect();
-        dirs.sort_by(|a, b| {
-            natural_cmp(
-                a.file_name().unwrap_or_default(),
-                b.file_name().unwrap_or_default(),
-            )
-        });
+        let mut listing = match &self.results {
+            Some(results) => results.hits.iter().copied().map(Target::File).collect(),
+            None => {
+                let mut dirs: Vec<&DirPath> = library.subdirs_in(&self.dir).iter().collect();
+                dirs.sort_by(|a, b| {
+                    natural_cmp(
+                        a.file_name().unwrap_or_default(),
+                        b.file_name().unwrap_or_default(),
+                    )
+                });
 
-        let mut files: Vec<usize> = library.indices_in(&self.dir).to_vec();
-        files.sort_by(|&a, &b| self.file_cmp(a, b, library));
+                let mut files: Vec<usize> = library.indices_in(&self.dir).to_vec();
+                files.sort_by(|&a, &b| self.file_cmp(a, b, library));
 
-        self.listing = dirs
-            .into_iter()
-            .map(|dir| Target::Dir(dir.clone()))
-            .chain(files.into_iter().map(Target::File))
-            .collect();
+                dirs.into_iter()
+                    .map(|dir| Target::Dir(dir.clone()))
+                    .chain(files.into_iter().map(Target::File))
+                    .collect::<Vec<Target>>()
+            }
+        };
+
+        if let Some(filter) = &self.filter {
+            listing.retain(|target| self.hit(target, filter, library));
+        }
+
+        self.listing = listing;
         self.cursor = self.cursor.min(self.listing.len().saturating_sub(1));
+    }
+
+    /// Whether one listing row matches a query.
+    ///
+    /// The one definition of "matches" this view has: the filter uses it to drop
+    /// rows, `/` uses it to find the next one, and the status bar uses it to
+    /// count them, so the three cannot disagree about what the pattern means.
+    ///
+    /// A row is matched against **the tags that have been read**, which is the
+    /// task's own wording: the name always, and `artist` / `album` / `title` /
+    /// `genre` when somebody has loaded them. A row nobody has read therefore
+    /// matches on its name alone and is dropped by a `genre:` filter — and
+    /// reappears when its answer lands, because [`Browser::tags_arrived`]
+    /// re-applies the filter and [`Browser::wanted`] asks for the whole
+    /// directory rather than the window.
+    ///
+    /// Converging upwards and not downwards is the deliberate half. A filter
+    /// that showed every row until the reads finished would be a filter that
+    /// looked broken on the keystroke that mattered; one that fills in is a
+    /// filter whose count is always true of what is on screen.
+    fn hit(&self, target: &Target, query: &Query, library: &Library) -> bool {
+        match target {
+            // A directory has no tags, so its name is the whole of it. Filtered
+            // like anything else: a listing that kept every directory while
+            // dropping files would look broken.
+            Target::Dir(dir) => query.matches(&Subject::row(dir.file_name().unwrap_or("/"))),
+            Target::File(index) => {
+                let Some(entry) = library.entry(*index) else {
+                    return false;
+                };
+                let subject = self.subject_of(&entry.rel);
+                match self.tags.get(&entry.rel) {
+                    Some(Cached::Read(info)) => query.matches(&subject.with_tags(&info.tags)),
+                    // Unread, or unreadable: the name is all there is to go on.
+                    _ => query.matches(&subject),
+                }
+            }
+        }
+    }
+
+    /// How a file is matched: by name in a directory, by whole path in a result
+    /// set.
+    ///
+    /// The distinction is [`Subject`]'s and the reason it exists. A filter typed
+    /// inside `hiphop/MF DOOM` must not match every row because the directory is
+    /// called `MF DOOM`; a flat result set, where the path is what is on screen,
+    /// must match what is on screen.
+    fn subject_of<'a>(&self, rel: &'a RelPath) -> Subject<'a> {
+        if self.results.is_some() {
+            Subject::file(rel)
+        } else {
+            Subject::row(rel.file_name())
+        }
     }
 
     /// Two files, in the order the current sort puts them.
@@ -686,23 +936,46 @@ impl Browser {
     /// an answer in between returns nothing the second time and a held-down `j`
     /// does not start a thread per row.
     ///
-    /// The window is the visible rows — except under [`Sort::Track`], where it is
-    /// the whole directory, because the sort cannot be computed from a window of
-    /// itself.
-    pub fn wanted(&mut self, library: &Library, rows: usize) -> Vec<RelPath> {
-        let targets = std::mem::take(&mut self.listing);
-        let visible = if self.sort == Sort::Track {
-            0..targets.len()
+    /// The window is the visible rows, with two exceptions where it is
+    /// everything in scope:
+    ///
+    /// - under [`Sort::Track`], because the sort cannot be computed from a
+    ///   window of itself;
+    /// - when the filter or `more` needs tags, because a row that has been
+    ///   filtered out is not in the listing — so windowing the listing would
+    ///   mean never asking about the rows whose answer decides whether they
+    ///   belong in it. This reads from the **unfiltered** directory for the same
+    ///   reason.
+    ///
+    /// `more` is the query being typed, which the shell holds rather than this
+    /// view: an incremental `/genre:jazz` has to read the same files a
+    /// `f genre:jazz` would, and it has not been committed to a filter yet.
+    pub fn wanted(&mut self, library: &Library, rows: usize, more: Option<&Query>) -> Vec<RelPath> {
+        let needs_tags = |query: Option<&Query>| query.is_some_and(Query::needs_tags);
+        let everything =
+            self.sort == Sort::Track || needs_tags(self.filter.as_ref()) || needs_tags(more);
+
+        let indices: Vec<usize> = if everything {
+            match &self.results {
+                Some(results) => results.hits.clone(),
+                None => library.indices_in(&self.dir).to_vec(),
+            }
         } else {
-            window(self.files_offset, self.cursor, rows, targets.len())
+            let visible = window(self.files_offset, self.cursor, rows, self.listing.len());
+            self.listing
+                .get(visible)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|target| match target {
+                    Target::File(index) => Some(*index),
+                    Target::Dir(_) => None,
+                })
+                .collect()
         };
 
         let mut wanted = Vec::new();
-        for target in targets.get(visible).unwrap_or_default() {
-            let Target::File(index) = target else {
-                continue;
-            };
-            let Some(entry) = library.entry(*index) else {
+        for index in indices {
+            let Some(entry) = library.entry(index) else {
                 continue;
             };
             if !entry.is_audio() || self.tags.contains_key(&entry.rel) {
@@ -712,12 +985,20 @@ impl Browser {
                 wanted.push(entry.rel.clone());
             }
         }
-        self.listing = targets;
         wanted
     }
 
     /// A worker answered. Returns whether anything on screen would change.
-    pub fn tags_arrived(&mut self, reads: Vec<(RelPath, Result<TrackInfo, String>)>) -> bool {
+    ///
+    /// A filter that needs tags is re-applied here, which is what makes it
+    /// converge: rows kept because nothing was known about them drop out as the
+    /// answers land. Nothing else re-reads, so a filter on names alone costs no
+    /// extra work.
+    pub fn tags_arrived(
+        &mut self,
+        reads: Vec<(RelPath, Result<TrackInfo, String>)>,
+        library: Option<&Library>,
+    ) -> bool {
         let mut changed = false;
         for (rel, result) in reads {
             self.asked.remove(&rel);
@@ -727,6 +1008,13 @@ impl Browser {
             };
             self.tags.insert(rel, cached);
             changed = true;
+        }
+
+        if changed
+            && self.filter.as_ref().is_some_and(Query::needs_tags)
+            && let Some(library) = library
+        {
+            self.refresh(library);
         }
         changed
     }
@@ -783,7 +1071,14 @@ impl Browser {
                     };
                 };
                 Row {
-                    name: entry.file_name().to_owned(),
+                    // In a result set the path *is* the row: forty hits called
+                    // `01 Beef Rap.mp3` from forty directories would otherwise
+                    // be forty identical lines.
+                    name: if self.results.is_some() {
+                        entry.rel.as_str().to_owned()
+                    } else {
+                        entry.file_name().to_owned()
+                    },
                     kind: if entry.is_audio() {
                         RowKind::Audio
                     } else {
@@ -937,6 +1232,14 @@ impl Browser {
     /// the whole of "a permission-denied directory renders sensibly".
     #[must_use]
     pub fn empty_reason(&self, library: &Library) -> String {
+        // An empty result set and an empty filter are not empty directories, and
+        // "empty directory" in front of either would be a lie about the library.
+        if let Some(results) = &self.results {
+            return format!("no matches for `{}`", results.query);
+        }
+        if let Some(filter) = &self.filter {
+            return format!("no matches for `{filter}` in this directory");
+        }
         let abs = self.dir.to_abs(library.root());
         let unreadable = library.warnings().iter().find_map(|warning| match warning {
             ScanWarning::Unreadable { path, message } if path == abs.as_str() => Some(message),
@@ -1523,7 +1826,7 @@ mod tests {
         browser.open(dir(names::MF_DOOM_ALBUM), &library);
 
         // Two rows of pane for eight rows of directory.
-        let wanted = browser.wanted(&library, 2);
+        let wanted = browser.wanted(&library, 2, None);
         assert_eq!(wanted.len(), 2, "{wanted:?}");
         assert!(
             wanted.iter().all(|rel| rel.as_str().ends_with(".mp3")),
@@ -1532,7 +1835,7 @@ mod tests {
 
         // Asking again with nothing having come back asks for nothing: a held
         // `j` must not start a thread per row.
-        assert!(browser.wanted(&library, 2).is_empty());
+        assert!(browser.wanted(&library, 2, None).is_empty());
     }
 
     #[test]
@@ -1542,7 +1845,7 @@ mod tests {
         browser.open(dir(names::MF_DOOM_ALBUM), &library);
 
         // The whole directory: three tracks and five aux files.
-        let wanted = browser.wanted(&library, 40);
+        let wanted = browser.wanted(&library, 40, None);
         assert_eq!(wanted.len(), 3, "{wanted:?}");
     }
 
@@ -1553,7 +1856,7 @@ mod tests {
         browser.open(dir(names::MF_DOOM_ALBUM), &library);
         browser.set_sort(Sort::Track, Some(&library));
 
-        let wanted = browser.wanted(&library, 1);
+        let wanted = browser.wanted(&library, 1, None);
         assert_eq!(wanted.len(), 3, "one row of pane, three tracks: {wanted:?}");
     }
 
@@ -1563,7 +1866,7 @@ mod tests {
         let (mut browser, library, _) = browser(&fx);
         browser.open(dir(names::MF_DOOM_ALBUM), &library);
 
-        let wanted = browser.wanted(&library, 40);
+        let wanted = browser.wanted(&library, 40, None);
         let reads = wanted
             .iter()
             .map(|rel| {
@@ -1572,10 +1875,10 @@ mod tests {
                 (rel.clone(), Ok(TrackInfo { tags, info }))
             })
             .collect();
-        assert!(browser.tags_arrived(reads));
+        assert!(browser.tags_arrived(reads, None));
         assert_eq!(browser.cached(), 3);
         assert!(
-            browser.wanted(&library, 40).is_empty(),
+            browser.wanted(&library, 40, None).is_empty(),
             "a cached row is never read twice"
         );
     }
@@ -1586,10 +1889,10 @@ mod tests {
         let (mut browser, library, _) = browser(&fx);
         browser.open(dir(names::MF_DOOM_ALBUM), &library);
 
-        let wanted = browser.wanted(&library, 1);
+        let wanted = browser.wanted(&library, 1, None);
         let rel = wanted[0].clone();
-        browser.tags_arrived(vec![(rel.clone(), Err("not an mp3".to_owned()))]);
-        assert!(browser.wanted(&library, 1).is_empty());
+        browser.tags_arrived(vec![(rel.clone(), Err("not an mp3".to_owned()))], None);
+        assert!(browser.wanted(&library, 1, None).is_empty());
 
         let rows = browser.rows(&library, 1);
         assert_eq!(rows.rows[0].meta, Meta::Failed);
@@ -1600,12 +1903,13 @@ mod tests {
         let fx = Fixture::realistic();
         let (mut browser, library, index) = browser(&fx);
         browser.open(dir(names::MF_DOOM_ALBUM), &library);
-        let wanted = browser.wanted(&library, 40);
+        let wanted = browser.wanted(&library, 40, None);
         browser.tags_arrived(
             wanted
                 .iter()
                 .map(|rel| (rel.clone(), Err("whatever".to_owned())))
                 .collect(),
+            None,
         );
         assert_eq!(browser.cached(), 3);
 

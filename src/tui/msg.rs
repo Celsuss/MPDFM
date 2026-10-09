@@ -27,6 +27,7 @@ use mpdfm_core::library::{Library, ScanProgress};
 use mpdfm_core::ops::commit::{self, Committed};
 use mpdfm_core::paths::RelPath;
 use mpdfm_core::playlist::{IndexWarning, PlaylistIndex};
+use mpdfm_core::query::{FindProgress, Found};
 use mpdfm_core::tags::{AudioInfo, TagSet};
 
 /// One thing that happened.
@@ -61,6 +62,13 @@ pub enum Msg {
     /// the tag editor's selection and the transactions it commits (task 23) all
     /// arrive here.
     TaskDone(Box<TaskOutcome>),
+
+    /// A library-wide search that is still running has got this far (task 25).
+    ///
+    /// Its own variant and not a [`TaskOutcome`] for the same reason
+    /// [`Msg::Committing`] is: it says a worker is *not* finished, and the loop
+    /// treats it as a line on screen and no change to anything a key acts on.
+    Finding(FindProgress),
 
     /// A commit that is still running has got this far (task 24).
     ///
@@ -167,6 +175,13 @@ pub enum TaskOutcome {
     /// A transaction was reversed, or could not be.
     Undone(Result<Box<Reversed>, String>),
 
+    /// A library-wide search finished, or was called off part way (task 25).
+    ///
+    /// Boxed because it carries a [`TagSet`] per hit it had to open a file for:
+    /// a `missing:genre` over the real library is 2 800 reads and some hundreds
+    /// of hits, and that is not a thing to move through a `match` by value.
+    Found(Box<FoundOutcome>),
+
     /// Something went wrong on a worker thread, with the full message.
     ///
     /// Not for a single file that would not read — that is an `Err` inside
@@ -196,6 +211,19 @@ pub enum NotCommitted {
     /// which says which step stopped it and — when there is something on disk
     /// to put back — the `mpdfm recover <txid>` that does it.
     Failed(String),
+}
+
+/// What a library-wide search produced, and what it was looking for.
+///
+/// The query travels with the answer rather than being read back off the view
+/// that asked: by the time this lands the user may have typed another one, and a
+/// result set labelled with the wrong pattern is worse than one with no label.
+#[derive(Debug)]
+pub struct FoundOutcome {
+    /// The query, as the user typed it.
+    pub query: String,
+    /// The hits, the failures, and whether it was called off.
+    pub found: Found,
 }
 
 /// What a batch of tag reads produced: one entry per path asked for, in the
@@ -233,6 +261,7 @@ impl Msg {
             Self::ScanDone(_) => "scan-done",
             Self::MpdStatus(_) => "mpd-status",
             Self::TaskDone(_) => "task-done",
+            Self::Finding(_) => "finding",
             Self::Committing(_) => "committing",
             Self::Shutdown => "shutdown",
         }

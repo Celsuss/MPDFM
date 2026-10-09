@@ -60,7 +60,7 @@ losing one malformed frame `lofty` will not re-emit. Numbers in task 17.
 | 22 | [Library browser view](tasks/22-browser-view.md) | 05, 16, 20, 21 | done |
 | 23 | [Tag editor view](tasks/23-tagedit-view.md) | 16–18, 21, 22 | done |
 | 24 | [Pending ops view](tasks/24-pending-view.md) | 10–12, 20, 21 | done |
-| 25 | [Search and filter](tasks/25-search-and-filter.md) | 05, 16, 22 | not started |
+| 25 | [Search and filter](tasks/25-search-and-filter.md) | 05, 16, 22 | done |
 | 26 | [Status bar, help, errors](tasks/26-tui-chrome.md) | 13, 20, 21 | not started |
 
 **M3 is done when:** the whole M1+M2 feature set is usable from the TUI, the
@@ -77,7 +77,15 @@ putting every byte back in 100 ms. Task 24 adds the pending view, which is where
 "the same preview the CLI does" stops being a promise: it draws
 `Effects::lines`, `mpdfm move --dry-run` prints `Effects::render`, and the two are
 one function — asserted as a string comparison at four widths. A 400-operation
-plan with its 800-line playlist diff unfolded scrolls at 530 µs a frame.
+plan with its 800-line playlist diff unfolded scrolls at 530 µs a frame. Task 25
+adds `/`, `f`, `F` and `:find` over one query grammar in core
+(`crates/core/src/query.rs`), so the TUI and a future `mpdfm find` cannot drift:
+`ext:flac` over the real 3 132-file library opens no files at all, and
+`missing:genre` — which has to open all 2 809 audio files — finds its 629 answers
+in 334 ms on a worker, with the slowest frame drawn during the walk at 192 µs. Its
+hits are a flat listing the existing mark, stage and tag-edit keys work on
+unchanged, which is what makes "select every file with no genre, set genre" two
+keypresses.
 
 ## M4 — Organize by template
 

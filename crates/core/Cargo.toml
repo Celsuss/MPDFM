@@ -29,6 +29,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 toml.workspace = true
+# One normalization form for a search pattern and the name it is matched
+# against; see the comment on the workspace dependency. Only reached for a
+# non-ASCII pattern, so the common case costs nothing.
+unicode-normalization.workspace = true
 walkdir.workspace = true
 
 tempfile = { workspace = true, optional = true }
