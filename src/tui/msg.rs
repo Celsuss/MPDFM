@@ -24,7 +24,7 @@ use std::time::Duration;
 use crossterm::event::Event;
 use mpdfm_core::journal::Reversed;
 use mpdfm_core::library::{Library, ScanProgress};
-use mpdfm_core::ops::commit::Committed;
+use mpdfm_core::ops::commit::{self, Committed};
 use mpdfm_core::paths::RelPath;
 use mpdfm_core::playlist::{IndexWarning, PlaylistIndex};
 use mpdfm_core::tags::{AudioInfo, TagSet};
@@ -61,6 +61,14 @@ pub enum Msg {
     /// the tag editor's selection and the transactions it commits (task 23) all
     /// arrive here.
     TaskDone(Box<TaskOutcome>),
+
+    /// A commit that is still running has got this far (task 24).
+    ///
+    /// Its own variant rather than something on [`TaskOutcome`], which is for
+    /// answers: this is the one message that says a worker is *not* finished,
+    /// and the loop treats it the way it treats [`Msg::Progress`] — a line on
+    /// screen and no change to any state a key can act on.
+    Committing(commit::Progress),
 
     /// The process was asked to stop — `SIGTERM`, `SIGHUP`, or a `SIGINT` from
     /// outside. The loop leaves through the same path `q` takes, so the terminal
@@ -105,6 +113,18 @@ pub struct MpdSnapshot {
     /// The message to show when there is no state, already flattened to a string
     /// because the UI does nothing with the variant.
     pub problem: Option<String>,
+    /// MPD's **live** queue, in queue order, when the daemon answered and
+    /// somebody asked for it.
+    ///
+    /// Only asked for while something is staged (see
+    /// [`work::poll_mpd`][crate::tui::work::poll_mpd]), because it is the one
+    /// thing in a poll whose cost is the user's queue rather than a constant,
+    /// and nothing but a preview has any use for it.
+    ///
+    /// It decides whether a plan *rewrites* MPD's saved queue or merely warns
+    /// about it ([`Live`][mpdfm_core::ops::Live]), so the preview and the commit
+    /// must be given the same answer or the commit refuses as drift.
+    pub queue: Option<Vec<RelPath>>,
 }
 
 /// The part of MPD's status the chrome shows.
@@ -138,13 +158,11 @@ pub enum TaskOutcome {
     /// go — on a worker, with the form on screen saying what it is waiting for.
     Selection(Reads),
 
-    /// A transaction was committed, or refused before anything was written.
+    /// A transaction was committed, or it was not.
     ///
-    /// Task 24 owns the pending view's version of this, with the progress
-    /// indicator and the cancellation. What task 23 needs is the answer: `W` in
-    /// the tag editor rewrites up to a few hundred files, and the thread that
-    /// draws must never be the thread that waits for them.
-    Committed(Result<Box<Committed>, String>),
+    /// The thread that draws is never the thread that waits for a few hundred
+    /// files to be rewritten; `Msg::Committing` is what arrives in the meantime.
+    Committed(Result<Box<Committed>, NotCommitted>),
 
     /// A transaction was reversed, or could not be.
     Undone(Result<Box<Reversed>, String>),
@@ -160,6 +178,24 @@ pub enum TaskOutcome {
         /// The whole error chain. Never truncated here; the UI decides.
         message: String,
     },
+}
+
+/// Why a commit produced no transaction.
+///
+/// Two outcomes and not one string, because they are different things to put in
+/// front of somebody: one of them is their own decision and has nothing in it to
+/// read, and the other is a failure whose message names the command that puts
+/// the library back.
+#[derive(Debug)]
+pub enum NotCommitted {
+    /// It was called off before the first mutation, so nothing was written: no
+    /// backup, no record, nothing to recover.
+    Cancelled,
+
+    /// It was refused, or it stopped partway through. Core's whole message,
+    /// which says which step stopped it and — when there is something on disk
+    /// to put back — the `mpdfm recover <txid>` that does it.
+    Failed(String),
 }
 
 /// What a batch of tag reads produced: one entry per path asked for, in the
@@ -197,6 +233,7 @@ impl Msg {
             Self::ScanDone(_) => "scan-done",
             Self::MpdStatus(_) => "mpd-status",
             Self::TaskDone(_) => "task-done",
+            Self::Committing(_) => "committing",
             Self::Shutdown => "shutdown",
         }
     }

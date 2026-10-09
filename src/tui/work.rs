@@ -36,24 +36,28 @@
 
 use std::cell::RefCell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use mpdfm_core::config::Config;
+use mpdfm_core::journal::record::TxId;
 use mpdfm_core::journal::store::Store;
 use mpdfm_core::journal::undo;
 use mpdfm_core::library::{DirPath, Library};
 use mpdfm_core::mpd::{self, Mpd};
 use mpdfm_core::ops::commit::{self, Previewed};
-use mpdfm_core::ops::{Effects, Plan};
+use mpdfm_core::ops::{Effects, Live, Plan};
 use mpdfm_core::paths::RelPath;
 use mpdfm_core::playlist::PlaylistIndex;
 use mpdfm_core::tags;
 
 use super::log::Log;
-use super::msg::{MpdSnapshot, MpdState, Msg, Reads, ScanOutcome, TaskOutcome, TrackInfo};
+use super::msg::{
+    MpdSnapshot, MpdState, Msg, NotCommitted, Reads, ScanOutcome, TaskOutcome, TrackInfo,
+};
 
 /// How long MPD gets to answer the status poll.
 ///
@@ -224,13 +228,20 @@ pub fn read_window(paths: &[RelPath], root: &Utf8Path) -> Reads {
 
 /// Ask MPD what it is doing, once.
 ///
+/// `want_queue` also asks for the live queue, which the preview of a staged plan
+/// needs and nothing else does: it decides whether a move *rewrites* MPD's saved
+/// queue or warns that the daemon will have to be requeued
+/// ([`Live`]). It is a parameter rather than always-on because it is the one part
+/// of a poll whose cost is the length of the user's queue, and this runs every
+/// second.
+///
 /// One connect, one `status`, one `currentsong`, then the socket is dropped. A
 /// persistent connection would be fewer syscalls and one more thing to get wrong:
 /// a daemon that is restarted under us needs no special case if the connection
 /// never outlives the question. The filesystem is the source of truth
 /// (`docs/PLAN.md` D6), so nothing about this is load-bearing — an MPD that never
 /// answers costs one character in the status bar and nothing else.
-pub fn poll_mpd(tx: Sender<Msg>, config: Config, log: Arc<Log>) {
+pub fn poll_mpd(tx: Sender<Msg>, config: Config, want_queue: bool, log: Arc<Log>) {
     let fallback = tx.clone();
     let spawned = thread::Builder::new()
         .name("mpdfm-mpd".to_owned())
@@ -240,17 +251,23 @@ pub fn poll_mpd(tx: Sender<Msg>, config: Config, log: Arc<Log>) {
                     state: None,
                     enabled: false,
                     problem: Some("MPD is switched off for this run".to_owned()),
+                    queue: None,
                 },
                 Ok(Some(mut mpd)) => match read_state(&mut mpd) {
                     Ok(state) => MpdSnapshot {
                         state: Some(state),
                         enabled: true,
                         problem: None,
+                        // A queue that cannot be read is no queue: the plan is
+                        // then previewed as though MPD were not running, which
+                        // rewrites the saved queue on disk — the cautious half.
+                        queue: want_queue.then(|| mpd.queue_paths().ok()).flatten(),
                     },
                     Err(err) => MpdSnapshot {
                         state: None,
                         enabled: true,
                         problem: Some(err.to_string()),
+                        queue: None,
                     },
                 },
                 Err(err) => {
@@ -263,6 +280,7 @@ pub fn poll_mpd(tx: Sender<Msg>, config: Config, log: Arc<Log>) {
                         state: None,
                         enabled: true,
                         problem: Some(err.to_string()),
+                        queue: None,
                     }
                 }
             };
@@ -277,6 +295,7 @@ pub fn poll_mpd(tx: Sender<Msg>, config: Config, log: Arc<Log>) {
             state: None,
             enabled: true,
             problem: Some(format!("cannot start the MPD poll thread: {err}")),
+            queue: None,
         })));
     }
 }
@@ -297,28 +316,57 @@ fn read_state(mpd: &mut mpd::Mpd) -> Result<MpdState, mpd::MpdError> {
     })
 }
 
+/// Everything a commit needs, cloned out of the app.
+///
+/// A struct because there are seven of them and a call with seven positional
+/// arguments is a call whose arguments can be swapped without anybody noticing.
+/// All of it is **owned**: the worker borrows nothing from
+/// [`App`][super::app::App], so the UI keeps drawing from a model nobody else
+/// holds while the files are rewritten.
+pub struct CommitJob {
+    /// What the user staged.
+    pub plan: Plan,
+    /// The library the preview was made against.
+    pub library: Library,
+    /// The preview the user agreed to.
+    pub effects: Effects,
+    /// The resolved configuration.
+    pub config: Config,
+    /// MPD's live queue as the preview was given it, or `None` if the daemon
+    /// did not answer. **The same value**, or commit refuses as drift — see
+    /// [`MpdSnapshot::queue`][super::msg::MpdSnapshot::queue].
+    pub queue: Option<Vec<RelPath>>,
+    /// Set from the UI thread to call the commit off. Read once, at the one
+    /// boundary where there is still nothing to put back; see
+    /// [`commit::Options::cancel`].
+    pub cancel: Arc<AtomicBool>,
+    /// Where diagnostics go.
+    pub log: Arc<Log>,
+}
+
 /// Commit a staged plan: write the files, rewrite the playlists, journal it all.
 ///
-/// One [`TaskOutcome::Committed`] comes back whatever happened. Nothing is
-/// written when the plan is refused — commit's own step 0 checks the conflicts it
-/// was handed before it opens the journal — so a failure here is either "nothing
-/// happened and this is why" or a partial transaction the record can be recovered
-/// from, and the message says which.
-///
-/// Task 24 owns the progress indicator and the cancellation this grows into; what
-/// is here is the path `W` in the tag editor needs.
-pub fn commit(
-    tx: Sender<Msg>,
-    plan: Plan,
-    library: Library,
-    effects: Effects,
-    config: Config,
-    log: Arc<Log>,
-) {
+/// One [`TaskOutcome::Committed`] comes back whatever happened, and a
+/// [`Msg::Committing`] every time the transaction advances — which is what the
+/// pending view's progress indicator draws. Nothing is written when the plan is
+/// refused: commit's own step 0 checks the conflicts it was handed before it
+/// opens the journal, so a failure here is either "nothing happened and this is
+/// why" or a partial transaction the record can be recovered from, and the
+/// message says which.
+pub fn commit(tx: Sender<Msg>, job: CommitJob) {
     let fallback = tx.clone();
     let spawned = thread::Builder::new()
         .name("mpdfm-commit".to_owned())
         .spawn(move || {
+            let CommitJob {
+                plan,
+                library,
+                effects,
+                config,
+                queue,
+                cancel,
+                log,
+            } = job;
             let started = Instant::now();
             log.line(format!(
                 "commit: {} operation(s), {} step(s)",
@@ -331,8 +379,22 @@ pub fn commit(
             // its next update of its own.
             let mpd = MpdLink::open(&config, &log);
             let update = |dirs: &[DirPath]| mpd.update(dirs);
+            // Forwarded and not acted on: this runs on the committing thread,
+            // and a progress callback that did anything slower than a `send`
+            // would be a progress indicator that slowed the commit down.
+            let watcher = tx.clone();
+            let watch = |progress| {
+                let _ = watcher.send(Msg::Committing(progress));
+            };
+            let stop = || cancel.load(Ordering::Relaxed);
             let options = commit::Options {
                 update: mpd.connected().then_some(&update as commit::Updater<'_>),
+                // The queue the preview was given, or the commit is drift.
+                live: Live {
+                    queue: queue.as_deref(),
+                },
+                progress: Some(&watch as commit::Watcher<'_>),
+                cancel: Some(&stop as commit::Canceller<'_>),
                 ..commit::Options::default()
             };
             let previewed = Previewed {
@@ -350,9 +412,13 @@ pub fn commit(
                     ));
                     Ok(Box::new(committed))
                 }
+                Err(mpdfm_core::Error::Commit(commit::CommitError::Cancelled)) => {
+                    log.line("commit: cancelled before anything was changed");
+                    Err(NotCommitted::Cancelled)
+                }
                 Err(err) => {
                     log.line(format!("commit: failed: {err}"));
-                    Err(err.to_string())
+                    Err(NotCommitted::Failed(err.to_string()))
                 }
             };
             let _ = tx.send(Msg::TaskDone(Box::new(TaskOutcome::Committed(outcome))));
@@ -360,7 +426,7 @@ pub fn commit(
 
     if let Err(err) = spawned {
         let _ = fallback.send(Msg::TaskDone(Box::new(TaskOutcome::Committed(Err(
-            format!("cannot start the commit thread: {err}"),
+            NotCommitted::Failed(format!("cannot start the commit thread: {err}")),
         )))));
     }
 }
@@ -372,12 +438,16 @@ pub fn commit(
 /// is merely *blocked* because something has changed since comes back as an
 /// error naming what changed; nothing is forced from here, because `--force`
 /// skips steps and skipping a step is not a thing to do to somebody by accident.
-pub fn undo(tx: Sender<Msg>, config: Config, log: Arc<Log>) {
+///
+/// `txid` names a transaction — `:undo <txid>`, and the `u` the pending view
+/// offers with the id it has just committed — or `None` for the most recent
+/// undoable one.
+pub fn undo(tx: Sender<Msg>, config: Config, txid: Option<String>, log: Arc<Log>) {
     let fallback = tx.clone();
     let spawned = thread::Builder::new()
         .name("mpdfm-undo".to_owned())
         .spawn(move || {
-            let outcome = reverse_latest(&config, &log);
+            let outcome = reverse(&config, txid.as_deref(), &log);
             if let Err(err) = &outcome {
                 log.line(format!("undo: {err}"));
             }
@@ -392,12 +462,23 @@ pub fn undo(tx: Sender<Msg>, config: Config, log: Arc<Log>) {
 }
 
 /// The body of [`undo`], synchronously, with every error already rendered.
-fn reverse_latest(
+fn reverse(
     config: &Config,
+    txid: Option<&str>,
     log: &Log,
 ) -> Result<Box<mpdfm_core::journal::Reversed>, String> {
     let store = Store::at(&config.data_dir);
-    let record = undo::latest(&store).map_err(|err| err.to_string())?;
+    let record = match txid {
+        // The same two doors `mpdfm undo [txid]` has, and the same errors: an id
+        // that does not parse, a transaction that is not there, and one that
+        // cannot be undone are all things to read rather than things to guess
+        // past.
+        Some(txid) => {
+            let txid = TxId::parse(txid).map_err(|err| err.to_string())?;
+            store.load(&txid).map_err(|err| err.to_string())?
+        }
+        None => undo::latest(&store).map_err(|err| err.to_string())?,
+    };
     log.line(format!("undo: reversing {}", record.txid));
 
     let mpd = MpdLink::open(config, log);

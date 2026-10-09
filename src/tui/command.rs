@@ -259,6 +259,20 @@ impl CommandLine {
         Self::default()
     }
 
+    /// A line that already says something, with the cursor at the end of it.
+    ///
+    /// For the keys that are a command with the boring part filled in: `r` in
+    /// the browser is `:move <this path>` waiting to be edited (task 24). The
+    /// alternative was a prompt of its own, which would be a second line editor
+    /// to get the Unicode arithmetic right in.
+    #[must_use]
+    pub fn of(text: impl Into<String>) -> Self {
+        Self {
+            line: Input::of(text),
+            error: None,
+        }
+    }
+
     /// What has been typed, without the leading `:`.
     #[must_use]
     pub fn text(&self) -> &str {

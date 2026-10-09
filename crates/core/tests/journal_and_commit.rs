@@ -1323,3 +1323,108 @@ fn asking_for_a_transaction_that_is_not_there_says_so() {
     let err = store.load(&txid).expect_err("there is no such transaction");
     assert!(err.to_string().contains("there is no transaction"), "{err}");
 }
+
+// ---------------------------------------------------------------------------
+// Watching, and stopping before anything has happened (task 24).
+
+/// Every [`commit::Progress`] a commit reported, in order.
+fn watched(world: &World, plan: &Plan) -> (mpdfm_core::Result<Committed>, Vec<commit::Progress>) {
+    let seen = std::sync::Mutex::new(Vec::new());
+    let watch = |progress| seen.lock().expect("not poisoned").push(progress);
+    let result = world.commit_with(
+        plan,
+        &Options {
+            progress: Some(&watch),
+            ..Options::default()
+        },
+    );
+    let seen = seen.into_inner().expect("not poisoned");
+    (result, seen)
+}
+
+#[test]
+fn a_commit_reports_its_progress_step_by_step() {
+    let world = World::realistic();
+    let (committed, seen) = watched(&world, &album_move());
+    let committed = committed.expect("the album move commits");
+
+    assert_eq!(
+        seen.first(),
+        Some(&commit::Progress::Validating),
+        "the first thing a commit does is re-validate: {seen:?}"
+    );
+    assert_eq!(
+        seen.last(),
+        Some(&commit::Progress::Finishing),
+        "the last thing it does is finish: {seen:?}"
+    );
+
+    // One `Steps` per filesystem step, counting up to the total the record has,
+    // so a progress indicator cannot be a fraction of the wrong number.
+    let steps: Vec<(usize, usize)> = seen
+        .iter()
+        .filter_map(|progress| match progress {
+            commit::Progress::Steps { done, steps } => Some((*done, *steps)),
+            _ => None,
+        })
+        .collect();
+    let total = committed.record.steps.len();
+    assert_eq!(
+        steps,
+        (1..=total).map(|done| (done, total)).collect::<Vec<_>>(),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|progress| matches!(progress, commit::Progress::Playlists { playlists: 2 })),
+        "the album is in two playlists: {seen:?}"
+    );
+}
+
+#[test]
+fn a_cancelled_commit_changes_nothing_at_all() {
+    let world = World::realistic();
+    let before = world.state();
+    let asked = std::cell::Cell::new(0_usize);
+
+    let err = world
+        .commit_with(
+            &album_move(),
+            &Options {
+                cancel: Some(&|| {
+                    asked.set(asked.get() + 1);
+                    true
+                }),
+                ..Options::default()
+            },
+        )
+        .expect_err("cancelling refuses the commit");
+
+    assert!(
+        matches!(err, mpdfm_core::Error::Commit(CommitError::Cancelled)),
+        "{err}"
+    );
+    assert_eq!(asked.get(), 1, "asked exactly once");
+    // The whole point: nothing was moved, and nothing was left to recover.
+    world.state().assert_same(&before);
+    assert!(
+        world.store().unfinished().expect("lists").is_empty(),
+        "a cancelled commit leaves no record to recover from"
+    );
+}
+
+#[test]
+fn a_commit_nobody_cancels_runs_to_the_end() {
+    let world = World::realistic();
+    let committed = world
+        .commit_with(
+            &album_move(),
+            &Options {
+                cancel: Some(&|| false),
+                ..Options::default()
+            },
+        )
+        .expect("the album move commits");
+
+    assert_eq!(committed.record.status, Status::Complete);
+}

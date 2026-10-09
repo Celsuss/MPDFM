@@ -130,6 +130,54 @@ pub struct Previewed<'a> {
 /// something that fails on purpose, and this module needs to know neither.
 pub type Updater<'a> = &'a dyn Fn(&[DirPath]) -> std::result::Result<(), String>;
 
+/// Told how far a commit has got, as it gets there.
+///
+/// For a progress indicator, and nothing else: it cannot stop the transaction
+/// and it is called from the committing thread, so an implementation that blocks
+/// blocks the commit. The TUI's forwards one message down a channel
+/// (`docs/tasks/24-pending-view.md`); the CLI passes `None`, because a commit
+/// that prints as it goes would interleave with the preview above it.
+pub type Watcher<'a> = &'a dyn Fn(Progress);
+
+/// Asked, once, whether to go ahead — see [`Options::cancel`].
+pub type Canceller<'a> = &'a dyn Fn() -> bool;
+
+/// How far a commit has got.
+///
+/// The counts are what a progress indicator needs and not a second summary:
+/// everything else about the transaction is in [`Committed`] at the end of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress {
+    /// Re-scanning the library to re-validate the plan (step 1). The slow part
+    /// of a commit that has not touched anything yet, and the window
+    /// [`Options::cancel`] is asked in.
+    Validating,
+
+    /// Copying the originals into the transaction's backup directory (step 2).
+    BackingUp {
+        /// How many filesystem steps are about to run.
+        steps: usize,
+    },
+
+    /// `done` of `steps` filesystem steps have run and been journaled (step 4).
+    Steps {
+        /// How many have finished.
+        done: usize,
+        /// How many there are.
+        steps: usize,
+    },
+
+    /// Rewriting the playlists and MPD's saved queue (step 5).
+    Playlists {
+        /// How many playlists are rewritten.
+        playlists: usize,
+    },
+
+    /// The library and the playlists are consistent; the record, MPD and
+    /// retention are what is left (steps 6–8).
+    Finishing,
+}
+
 /// What a commit is allowed to do beyond the plan itself.
 ///
 /// [`Default`] is the production answer with no MPD: no verification hashing, no
@@ -167,6 +215,23 @@ pub struct Options<'a> {
     /// a plan the user previewed with `--merge` expands into a different number
     /// of steps, which is [`Drift::Steps`].
     pub prefs: Prefs,
+
+    /// Told how far the transaction has got. `None` means nobody is watching.
+    pub progress: Option<Watcher<'a>>,
+
+    /// Asked **once**, after the plan has been re-validated and before the
+    /// first backup is taken, whether to go ahead. `true` stops the commit with
+    /// [`CommitError::Cancelled`].
+    ///
+    /// One question and not a flag polled throughout, because "cancellable" has
+    /// to mean something exact: a commit is abandoned *before the first
+    /// mutation* or it is seen through. Half a transaction that was stopped on
+    /// purpose would be indistinguishable from half a transaction that failed,
+    /// and recovering it would be the user's problem either way — so the one
+    /// place cancellation is offered is the one place where there is nothing to
+    /// recover. It sits after step 1 because step 1 is the slow part (a fresh
+    /// scan of the library) and therefore the only window a person can react in.
+    pub cancel: Option<Canceller<'a>>,
 }
 
 impl std::fmt::Debug for Options<'_> {
@@ -178,6 +243,8 @@ impl std::fmt::Debug for Options<'_> {
             .field("update", &self.update.map(|_| "<fn>"))
             .field("live", &self.live)
             .field("prefs", &self.prefs)
+            .field("progress", &self.progress.map(|_| "<fn>"))
+            .field("cancel", &self.cancel.map(|_| "<fn>"))
             .finish()
     }
 }
@@ -284,6 +351,11 @@ pub enum CommitError {
     /// having changed nothing.
     #[error("there is nothing to commit")]
     Nothing,
+
+    /// [`Options::cancel`] said no. Nothing was written: no backup, no record,
+    /// no mutation, so there is nothing to recover and nothing to undo.
+    #[error("the commit was cancelled before anything was changed")]
+    Cancelled,
 
     /// The disk no longer matches the preview the user agreed to.
     #[error(
@@ -435,6 +507,12 @@ pub fn commit_with(
         return Err(CommitError::Nothing.into());
     }
     // Step 1 — re-validate against a fresh scan.
+    let watching = |progress| {
+        if let Some(watcher) = options.progress {
+            watcher(progress);
+        }
+    };
+    watching(Progress::Validating);
     let root = config.require_music_dir()?.to_owned();
     let fresh_library = Library::scan(&root)?;
     let (fresh_index, _warnings) = PlaylistIndex::load(&config.playlist_dir);
@@ -450,12 +528,22 @@ pub fn commit_with(
         return Err(CommitError::Stale { drift }.into());
     }
 
+    // The last moment at which there is nothing to put back: the plan is known
+    // to be committable and the disk still matches it, and the next statement
+    // creates a directory. See `Options::cancel`.
+    if options.cancel.is_some_and(|cancel| cancel()) {
+        return Err(CommitError::Cancelled.into());
+    }
+
     let store = Store::at(&config.data_dir);
     let txid = TxId::now();
     let started = SystemTime::now();
     let mut warnings = Vec::new();
 
     // Step 2 — the backups, before the record and long before the first mutation.
+    watching(Progress::BackingUp {
+        steps: fresh.fs_steps.len(),
+    });
     // A backup directory with no record is an orphan in MPDFM's own data
     // directory; a record naming backups that are not there would be a promise it
     // cannot keep, and `undo` believes the record.
@@ -509,6 +597,10 @@ pub fn commit_with(
                 // which is what keeps a three-thousand-step transaction's journal
                 // linear instead of quadratic — see `journal::store`.
                 store.append_step(&txid, position, &record.steps[position])?;
+                watching(Progress::Steps {
+                    done: position + 1,
+                    steps: steps.len(),
+                });
             }
             Err(err) => {
                 record.steps[position].failed(&err);
@@ -533,6 +625,9 @@ pub fn commit_with(
     }
 
     // Step 5 — the playlists, and MPD's saved queue.
+    watching(Progress::Playlists {
+        playlists: fresh.playlist_edits.len(),
+    });
     let inject = match options.inject {
         Inject::BeforePlaylistWrite(at) => rewrite::Inject::FailBeforeWriting(at),
         _ => rewrite::Inject::Nothing,
@@ -568,6 +663,7 @@ pub fn commit_with(
 
     // Step 6 — and it is done. The record now lists every step as the log did,
     // so the log has nothing left to say.
+    watching(Progress::Finishing);
     record.finish(Status::Complete, SystemTime::now());
     store.write(&record)?;
     store.forget_steps(&txid);

@@ -688,8 +688,11 @@ const DEFAULTS: &[(Mode, &[(&str, Action)])] = &[
         ],
     ),
     (
-        // Task 24. `d` unstages here rather than staging a delete, which is the
-        // one verb that means something different in this view than in the browser.
+        // Task 24. `dd` unstages here rather than `d` staging a delete, which is
+        // the one verb that means something different in this view than in the
+        // browser — and it is the doubled key for the same reason vim's is:
+        // taking a line out of a list is worth two deliberate keystrokes when
+        // the list is what is about to happen to somebody's library.
         Mode::Pending,
         &[
             ("j", Action::Down),
@@ -700,7 +703,14 @@ const DEFAULTS: &[(Mode, &[(&str, Action)])] = &[
             ("G", Action::Bottom),
             ("ctrl-d", Action::HalfPageDown),
             ("ctrl-u", Action::HalfPageUp),
-            ("d", Action::Unstage),
+            // Unfolding a playlist's diff, or a refused operation's reasons.
+            ("enter", Action::Open),
+            ("space", Action::Open),
+            ("l", Action::Right),
+            ("right", Action::Right),
+            ("h", Action::Left),
+            ("left", Action::Left),
+            ("dd", Action::Unstage),
             ("c", Action::Commit),
             ("x", Action::DiscardPending),
             ("u", Action::Undo),
@@ -1416,7 +1426,15 @@ mod tests {
         let d = KeySeq::single(KeyChord::plain('d'));
         assert_eq!(map.action(Mode::Browser, d), Some(Action::StageDelete));
         assert_eq!(map.action(Mode::Command, d), None);
-        assert_eq!(map.action(Mode::Pending, d), Some(Action::Unstage));
+        // In the pending view it is the first half of `dd`, which is what takes
+        // an operation off the plan: one `d` there is a sequence waiting for its
+        // second key and not a delete (`docs/tasks/24-pending-view.md`).
+        assert_eq!(map.action(Mode::Pending, d), None);
+        assert!(map.is_prefix(Mode::Pending, KeyChord::plain('d')));
+        assert_eq!(
+            map.action(Mode::Pending, KeySeq::parse("dd").expect("a sequence")),
+            Some(Action::Unstage)
+        );
     }
 
     #[test]

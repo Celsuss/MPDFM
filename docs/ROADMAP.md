@@ -59,7 +59,7 @@ losing one malformed frame `lofty` will not re-emit. Numbers in task 17.
 | 21 | [Configurable vim keymap](tasks/21-keymap.md) | 20 | done |
 | 22 | [Library browser view](tasks/22-browser-view.md) | 05, 16, 20, 21 | done |
 | 23 | [Tag editor view](tasks/23-tagedit-view.md) | 16–18, 21, 22 | done |
-| 24 | [Pending ops view](tasks/24-pending-view.md) | 10–12, 20, 21 | not started |
+| 24 | [Pending ops view](tasks/24-pending-view.md) | 10–12, 20, 21 | done |
 | 25 | [Search and filter](tasks/25-search-and-filter.md) | 05, 16, 22 | not started |
 | 26 | [Status bar, help, errors](tasks/26-tui-chrome.md) | 13, 20, 21 | not started |
 
@@ -73,7 +73,11 @@ the browser, which walks those 318 directories at 130 µs a frame and reads tags
 for the rows on screen and no others — 35 files for a 170-track directory. Task 23
 adds the tag editor, measured on a copy of a real 70-track album: the selection is
 read in 13 ms warm, and `W` stages and commits all 70 files in 210 ms, with `u`
-putting every byte back in 100 ms.
+putting every byte back in 100 ms. Task 24 adds the pending view, which is where
+"the same preview the CLI does" stops being a promise: it draws
+`Effects::lines`, `mpdfm move --dry-run` prints `Effects::render`, and the two are
+one function — asserted as a string comparison at four widths. A 400-operation
+plan with its 800-line playlist diff unfolded scrolls at 530 µs a frame.
 
 ## M4 — Organize by template
 

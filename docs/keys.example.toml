@@ -64,11 +64,26 @@
 # "g e" = "edit_tags"
 
 
-# -- the staged-operations view (task 24) -----------------------------------
+# -- the staged-operations view ---------------------------------------------
+#
+# The screen that shows what is about to happen: one row per staged operation,
+# the playlists they rewrite, and the conflicts that refuse them. `enter`, `l`
+# and `h` unfold and fold a row — a playlist into every line that changes, a
+# refused operation into the reason — and the cursor walks into a diff, so a long
+# one scrolls rather than being cut short.
+#
+# `dd` takes the operation under the cursor off the plan, `c` commits, `x`
+# discards the lot after a confirmation, and `u` undoes the transaction that was
+# just committed. While a commit is running, `esc` calls it off if it is still
+# before the first change to the library, and says so plainly if it is not.
+#
+# `d` is the first half of `dd` in here and stages a delete in the browser, which
+# is the one key that means different things in the two. Binding it to something
+# on its own makes `dd` unreachable, and MPDFM says so at start-up.
 #
 # [pending]
 # "D" = "discard_pending"
-# "enter" = "commit"
+# "ctrl-y" = "commit"
 
 
 # -- the tag editor (task 23) -----------------------------------------------
