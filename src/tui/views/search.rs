@@ -310,6 +310,12 @@ impl Finding {
         self.cancelling
     }
 
+    /// The last thing the walk reported, for the progress bar (task 26).
+    #[must_use]
+    pub fn progress(&self) -> Option<FindProgress> {
+        self.progress
+    }
+
     /// The line the message bar shows while the walk is running.
     ///
     /// A percentage is honest here, unlike a scan's: the library is already in

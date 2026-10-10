@@ -6,6 +6,10 @@
 //! | `details` | the narrow third column: tags, audio properties, playlists |
 //! | `input` | one line of text being typed, and the window of it that fits |
 //! | `diff` | what a playlist line says now, and what it will say |
+//! | `statusbar` | the bottom bar, and the order it gives things up in when narrow |
+//! | `help` | the key help, read off the live keymap |
+//! | `toast` | the message line, its queue, and the history `:messages` shows |
+//! | `progress` | a scan, a commit or a search that is still going |
 //!
 //! # Why the width math is here and not inlined
 //!
@@ -29,7 +33,11 @@
 pub mod details;
 pub mod diff;
 pub mod filelist;
+pub mod help;
 pub mod input;
+pub mod progress;
+pub mod statusbar;
+pub mod toast;
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -141,9 +149,140 @@ pub fn pad_left(text: &str, cells: usize) -> String {
     out
 }
 
+/// `text`, word-wrapped into lines of at most `cells` cells.
+///
+/// The one wrapper every message goes through — a toast, an error panel,
+/// `:messages` — and the reason none of them uses `Paragraph`'s own: the number
+/// of rows a message takes decides the layout (how tall the message line is, how
+/// far a panel scrolls), and a count made by one wrapper and a rendering made by
+/// another are two answers that drift. Here the lines that are counted are the
+/// lines that are drawn.
+///
+/// - a `\n` is a line break, and an empty line stays empty;
+/// - a line's leading spaces are its indent, and its continuation lines get the
+///   same indent, so a `  - path` list wraps as a list. An indent wider than half
+///   the width is not repeated, or a narrow panel would be all indent;
+/// - a word wider than the line is broken wherever the line ends, rather than
+///   overflowing it — a path has no spaces to break at, and it is the thing an
+///   error is most often about;
+/// - runs of spaces between words become one.
+///
+/// Never wider than asked for, measured in cells, for the same reason as [`fit`].
+#[must_use]
+pub fn wrap(text: &str, cells: usize) -> Vec<String> {
+    if cells == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for paragraph in text.split('\n') {
+        let body = paragraph.trim_start_matches(' ');
+        let indent_cells = paragraph.len() - body.len();
+        let indent = if indent_cells * 2 <= cells {
+            " ".repeat(indent_cells)
+        } else {
+            String::new()
+        };
+
+        let mut line = indent.clone();
+        let mut used = indent.len();
+        // Whether `line` holds a word yet, which is whether the next one needs a
+        // space in front of it.
+        let mut started = false;
+        for word in body.split_whitespace() {
+            let w = width(word);
+            let gap = usize::from(started);
+            if used + gap + w <= cells {
+                if started {
+                    line.push(' ');
+                }
+                line.push_str(word);
+                used += gap + w;
+                started = true;
+                continue;
+            }
+            if started {
+                out.push(std::mem::replace(&mut line, indent.clone()));
+                used = indent.len();
+            }
+            if used + w <= cells {
+                line.push_str(word);
+                used += w;
+                started = true;
+                continue;
+            }
+            // Wider than a whole line: broken at the edge, a character at a time.
+            for c in word.chars() {
+                let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+                if cw > cells - indent.len() {
+                    // A two-cell glyph in a one-cell column has nowhere to go.
+                    continue;
+                }
+                if used + cw > cells {
+                    out.push(std::mem::replace(&mut line, indent.clone()));
+                    used = indent.len();
+                }
+                line.push(c);
+                used += cw;
+            }
+            started = true;
+        }
+        out.push(line);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrap_breaks_at_spaces_and_never_overflows() {
+        let text = "committed 20260924T224500Z-a3f1 — 14 files, 2 playlists · u to undo";
+        let lines = wrap(text, 24);
+        assert_eq!(
+            lines,
+            vec![
+                "committed",
+                "20260924T224500Z-a3f1 —",
+                "14 files, 2 playlists ·",
+                "u to undo",
+            ]
+        );
+        for cells in 1..=40 {
+            for text in [text, CJK, LATIN1, "a\n\n  - indented item that wraps"] {
+                for line in wrap(text, cells) {
+                    assert!(width(&line) <= cells, "{line:?} is wider than {cells}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_keeps_every_word_and_every_line_break() {
+        let text = "the first line\n\n  - hiphop/MF DOOM - Mm..Food/01 Beef Rap.mp3";
+        let lines = wrap(text, 20);
+        assert_eq!(lines[1], "", "the empty line is still there");
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let joined = lines.join(" ");
+        let rejoined: Vec<&str> = joined.split_whitespace().collect();
+        // A word broken at the edge is the one exception, and it is the path.
+        assert_eq!(rejoined[..4], words[..4]);
+        assert!(
+            lines.iter().skip(2).all(|line| line.starts_with("  ")),
+            "a list item keeps its indent when it wraps: {lines:?}"
+        );
+        assert!(lines.concat().contains("Beef"));
+    }
+
+    #[test]
+    fn wrap_breaks_a_word_with_no_spaces_rather_than_cutting_it_off() {
+        let path = "/home/user/Music/hiphop/MF_DOOM_-_Mm..Food/01_Beef_Rap.mp3";
+        let lines = wrap(path, 16);
+        assert!(lines.len() > 1);
+        assert_eq!(lines.concat(), path, "every character is still there");
+        assert!(wrap(CJK, 5).concat().contains("ノスタルジア"));
+        assert!(wrap("anything", 0).is_empty());
+    }
 
     /// The real names the task names, so the assertions are about this library
     /// and not about an invented worst case.

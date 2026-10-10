@@ -53,6 +53,13 @@ pub enum Msg {
     /// A scan finished, for better or worse.
     ScanDone(Box<ScanOutcome>),
 
+    /// A scan was called off and produced nothing (task 26).
+    ///
+    /// Its own message and not an `Err` in [`ScanOutcome`]: being asked to stop
+    /// and stopping is not a failure, and must not open the panel a failure
+    /// opens.
+    ScanCancelled,
+
     /// What MPD said when it was last asked. Task 26 draws it; task 20 carries
     /// it, so that the thing which must never block the UI is on the channel from
     /// the start rather than retrofitted onto it.
@@ -259,6 +266,7 @@ impl Msg {
             Self::Tick => "tick",
             Self::Progress(_) => "progress",
             Self::ScanDone(_) => "scan-done",
+            Self::ScanCancelled => "scan-cancelled",
             Self::MpdStatus(_) => "mpd-status",
             Self::TaskDone(_) => "task-done",
             Self::Finding(_) => "finding",

@@ -26,7 +26,13 @@
 //! file.
 //!
 //! **Stop.** Everything except a missing or unreadable root is a warning. A
-//! library with one unreadable album in it is still a library.
+//! library with one unreadable album in it is still a library. The one thing
+//! that does stop a walk is the caller asking it to (`cancel`), and then it
+//! returns nothing at all rather than the part of the tree it had reached: a
+//! model of half a library is a model that would let a move miss half its
+//! playlists.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use camino::Utf8Path;
 use walkdir::WalkDir;
@@ -51,13 +57,21 @@ const PROGRESS_EVERY: usize = 256;
 /// progress to report — and it is never called from another thread: the walk is
 /// synchronous, and whoever wants it off the UI thread puts the whole call there.
 ///
+/// `cancel` is read once per directory entry, with a relaxed load — one
+/// uncontended atomic read per `lstat`, which is nothing next to the `lstat`.
+/// When it is set the walk returns `Ok(None)` at the next entry.
+///
 /// # Errors
 ///
 /// [`Error::Io`] if `root` is missing, is not a directory, or cannot be `stat`ed
 /// — the one failure that is not worth continuing past, since every later
 /// question is about the tree underneath it. Everything else is a
 /// [`ScanWarning`] on the returned library.
-pub(super) fn scan(root: &Utf8Path, progress: &mut dyn FnMut(&ScanProgress)) -> Result<Library> {
+pub(super) fn scan(
+    root: &Utf8Path,
+    progress: &mut dyn FnMut(&ScanProgress),
+    cancel: &AtomicBool,
+) -> Result<Option<Library>> {
     // Checked before the walk so that "there is no library there" is an error
     // with the root's name in it, rather than an empty model and a warning that
     // reads like one file went missing. `metadata` follows a symlinked root, as
@@ -90,6 +104,9 @@ pub(super) fn scan(root: &Utf8Path, progress: &mut dyn FnMut(&ScanProgress)) -> 
         .follow_links(false)
         .into_iter();
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         let Some(result) = walk.next() else {
             break;
         };
@@ -172,7 +189,7 @@ pub(super) fn scan(root: &Utf8Path, progress: &mut dyn FnMut(&ScanProgress)) -> 
         report(progress, &entries, &dirs);
     }
 
-    Ok(Library::assemble(root, entries, dirs, warnings))
+    Ok(Some(Library::assemble(root, entries, dirs, warnings)))
 }
 
 /// Hand the caller the counts so far, named by the directory the walk is in.
@@ -238,7 +255,8 @@ mod tests {
         let root = camino::Utf8Path::from_path(temp.path()).expect("temp dir path is UTF-8");
 
         let missing = root.join("gone");
-        let err = scan(&missing, &mut |_| {}).expect_err("a missing root should not scan");
+        let err = scan(&missing, &mut |_| {}, &AtomicBool::new(false))
+            .expect_err("a missing root should not scan");
         assert!(
             err.to_string().contains(missing.as_str()),
             "the error should name the root: {err}"
@@ -246,7 +264,8 @@ mod tests {
 
         let file = root.join("not-a-dir");
         std::fs::write(&file, b"x").expect("write");
-        let err = scan(&file, &mut |_| {}).expect_err("a file is not a library");
+        let err =
+            scan(&file, &mut |_| {}, &AtomicBool::new(false)).expect_err("a file is not a library");
         assert!(err.to_string().contains("not a directory"), "{err}");
     }
 
@@ -255,7 +274,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = camino::Utf8Path::from_path(temp.path()).expect("temp dir path is UTF-8");
 
-        let library = scan(root, &mut |_| {}).expect("an empty directory is a valid library");
+        let library = scan(root, &mut |_| {}, &AtomicBool::new(false))
+            .expect("an empty directory is a valid library")
+            .expect("nothing called it off");
         assert!(library.is_empty());
         assert!(library.warnings().is_empty());
         // The root itself is always a directory of the library, so a browser has

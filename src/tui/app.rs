@@ -36,8 +36,9 @@
 //! nothing in a view knows what a frame is.
 //!
 //! The status bar is the one deliberate exception: it reads a little from
-//! everything, because that is what a status bar is. Task 26 owns what goes on
-//! it and in which order it elides.
+//! everything, because that is what a status bar is. What goes on it and the
+//! order it gives things up in are `widgets::statusbar`'s (task 26); this file
+//! only gathers the values.
 //!
 //! # Keys, and what answers them
 //!
@@ -62,15 +63,15 @@
 //! Nothing in this module writes to stdout or stderr. Diagnostics go to
 //! [`Log`], which is a file or nothing. See `log.rs` for why.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use camino::Utf8PathBuf;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use mpdfm_core::config::Config;
+use mpdfm_core::config::{Config, RootProblem};
 use mpdfm_core::library::{DirPath, Library, ScanProgress};
 use mpdfm_core::ops::commit::Progress;
 use mpdfm_core::ops::{Effects, Live, Operation, Plan};
@@ -94,13 +95,17 @@ use super::msg::{
 };
 use super::terminal::{MIN_SIZE, fits};
 use super::views::browser::{Browser, Enter, Pane, Results, Sort, TreeRow};
+use super::views::error::ErrorReport;
 use super::views::pending::{self, Pending, Report};
 use super::views::search::{Finding, Kind, Prompt};
 use super::views::tagedit::{Begin, FileAction, Hints, Preview, Started, TagEdit};
 use super::widgets::details::DetailsPane;
 use super::widgets::filelist::FileList;
 use super::widgets::input::Input;
-use super::widgets::{fit, pad, width};
+use super::widgets::progress::Progress as Busy;
+use super::widgets::statusbar::{Light, Status};
+use super::widgets::toast::{self, Level, Toasts};
+use super::widgets::{fit, help, pad, width};
 use super::{PANIC_AT, work};
 
 /// How long an informational toast stays up once it is the one on screen.
@@ -145,12 +150,18 @@ const IN_FIELD: &[Action] = &[
 /// the estimate of how far one keypress scrolls it.
 const PREVIEW_PERCENT: usize = 80;
 
-/// How many messages may be waiting for the bottom line.
+/// How long an MPD poll may be out before the indicator stops believing the
+/// last answer.
 ///
-/// Generous: the point of the cap is that nothing grows without bound, not that
-/// anything is ever expected to reach it. Task 26's `:messages` is what makes a
-/// backlog readable rather than only survivable.
-const TOAST_QUEUE: usize = 16;
+/// The poll's own timeouts are 250 ms per connect, read and write, so an answer
+/// normally lands well inside a tick. But a timeout per *read* is not a timeout
+/// per *poll* — a daemon trickling one byte every 200 ms never trips it — and
+/// a name lookup has no timeout at all. So the shell keeps its own clock: two
+/// seconds without an answer is offline, which is the acceptance criterion's
+/// "within ~2 s", whatever the thread is stuck on. The thread is not killed
+/// (nothing can kill a thread) and not doubled up on; when it does answer, its
+/// answer is believed again.
+const MPD_STALE: Duration = Duration::from_secs(2);
 
 /// Which pane has the keyboard.
 ///
@@ -218,10 +229,10 @@ pub enum View {
     /// what makes staged operations survive `esc` and a resize — popping this
     /// view throws away a cursor and some folds, and nothing else.
     Pending(Box<Pending>),
-    /// The key help, generated from the live keymap for the mode it was opened
-    /// from. Task 26 adds the other modes' sections and the grouping.
+    /// The key help, generated from the live keymap (`widgets::help`): every
+    /// mode's bindings, the one it was opened from first.
     Help {
-        /// The mode whose bindings are listed.
+        /// The mode it was opened from, whose section comes first.
         mode: Mode,
         /// How far down the list has been scrolled. There are more bindings than
         /// rows on an 80×24 terminal, so this is not optional.
@@ -248,9 +259,15 @@ pub enum View {
         /// The whole text. Wrapped, never truncated.
         body: String,
     },
-    /// Something went wrong, and it is not going away on a timer. Task 26 turns
-    /// this into the full panel with the path and the suggested next step.
-    Error(String),
+    /// Something went wrong, and it is not going away on a timer: the whole
+    /// message, the path it is about, and the next step (`views::error`).
+    Error(Box<ErrorReport>),
+    /// `:messages`: everything the message line has said this session, and
+    /// every error, newest first. Scrolls like the help.
+    Messages {
+        /// How far down it has been scrolled.
+        scroll: u16,
+    },
 }
 
 impl View {
@@ -269,6 +286,7 @@ impl View {
         matches!(
             self,
             Self::Help { .. }
+                | Self::Messages { .. }
                 | Self::Confirm(_)
                 | Self::Notice { .. }
                 | Self::Error(_)
@@ -289,6 +307,7 @@ impl View {
             Self::Confirm(_) => "confirm",
             Self::Notice { .. } => "notice",
             Self::Error(_) => "error",
+            Self::Messages { .. } => "messages",
         }
     }
 }
@@ -324,31 +343,6 @@ enum Answer {
     /// it is the thing that *asks*. A second action that discarded without
     /// asking would be a key a user could bind and lose a plan to.
     DiscardPlan,
-}
-
-/// How serious a message is, and therefore whether it expires.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Level {
-    /// Something worked.
-    Info,
-    /// Something is worth a look.
-    Warn,
-}
-
-/// A transient message on the bottom line.
-///
-/// Errors are *not* toasts: an error that scrolls away unread is an error that
-/// was swallowed, which the task forbids. They become [`View::Error`] instead.
-#[derive(Debug, Clone)]
-pub struct Toast {
-    text: String,
-    level: Level,
-    /// How long it gets once it is the one on screen.
-    lifetime: Duration,
-    /// When it will have had its turn. `None` until it reaches the front of the
-    /// queue, because a message that waited behind two others has not been read
-    /// yet and its clock should not have been running.
-    expires: Option<Instant>,
 }
 
 /// A transaction on a worker, and what it has said so far.
@@ -410,6 +404,44 @@ impl Running {
     }
 }
 
+/// Why there is no library on screen, when that is the state of things.
+///
+/// The first-run screen's two cases (task 26). Both replace the browser's panes
+/// rather than opening an error panel over them: there is nothing under the
+/// panel worth seeing, and the explanation — where `music_dir` came from and
+/// where else it could come from — is the whole of what the user needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NoLibrary {
+    /// `music_dir` is not a directory that exists.
+    Missing(RootProblem),
+    /// It is, and there are no files in it — which, on a first run, almost
+    /// always means it is the wrong directory.
+    Empty(Utf8PathBuf),
+}
+
+/// Where the configuration could have come from, for the first-run screen.
+///
+/// Discovered by [`super::run`], which knows the environment and the command
+/// line; a test's app has none, and says so.
+#[derive(Debug, Clone, Default)]
+pub struct Setup {
+    /// MPDFM's own `config.toml`: `--config`, or the default path.
+    pub config_file: Option<Utf8PathBuf>,
+    /// MPD's search path for `mpd.conf`, in order.
+    pub mpd_confs: Vec<Utf8PathBuf>,
+}
+
+/// [`Setup`], with the one question about the disk it raises already asked.
+#[derive(Debug, Clone, Default)]
+struct Located {
+    /// What the caller said.
+    setup: Setup,
+    /// Which of `setup.mpd_confs` is the first that exists — the one MPD itself
+    /// would read. Found once, in [`App::locate_config`], because the screen
+    /// that shows it is drawn every frame and a draw does no I/O.
+    in_use: Option<usize>,
+}
+
 /// What the status line says about a scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ScanState {
@@ -454,19 +486,24 @@ pub struct App {
     keys: Keys,
     /// The view stack. Never empty; `views[0]` is the base.
     views: Vec<View>,
-    /// Messages waiting for the bottom line, oldest first.
-    ///
-    /// A queue and not a slot: two things worth saying in the same second — a
-    /// scan's counts and a warning about what it found — would otherwise mean the
-    /// second silently overwriting the first, and a message nobody saw is the same
-    /// as one that was never posted. Each gets its own turn and its own clock.
-    toasts: VecDeque<Toast>,
+    /// Messages waiting for the bottom line, and everything said this session
+    /// (`widgets::toast`).
+    toasts: Toasts,
     /// What the status line says about scanning.
     scan: ScanState,
+    /// Set to call the running scan off. A fresh one per scan, so a stale `esc`
+    /// cannot stop the next.
+    scan_cancel: Arc<AtomicBool>,
+    /// Why there is no library to browse, when there is none.
+    no_library: Option<NoLibrary>,
+    /// Where the configuration could have come from.
+    setup: Located,
     /// What MPD last said. `None` until the first poll answers.
     mpd: Option<MpdSnapshot>,
     /// Whether an MPD poll is already out, so the tick does not stack them up.
     mpd_in_flight: bool,
+    /// When the poll that is out was asked for — the clock [`MPD_STALE`] runs on.
+    mpd_asked: Option<Instant>,
     /// The commit or undo on a worker, when there is one, and how far it has got.
     running: Option<Running>,
     /// The library-wide search on a worker, when there is one.
@@ -513,10 +550,14 @@ impl App {
             warnings: 0,
             keys: Keys::new(keys),
             views: vec![View::Browser],
-            toasts: VecDeque::new(),
+            toasts: Toasts::new(),
             scan: ScanState::Idle,
+            scan_cancel: Arc::new(AtomicBool::new(false)),
+            no_library: None,
+            setup: Located::default(),
             mpd: None,
             mpd_in_flight: false,
+            mpd_asked: None,
             running: None,
             finding: None,
             last_search: None,
@@ -526,6 +567,12 @@ impl App {
             quit: false,
             size: (0, 0),
         }
+    }
+
+    /// Tell the first-run screen where the configuration could have come from.
+    pub fn locate_config(&mut self, setup: Setup) {
+        let in_use = setup.mpd_confs.iter().position(|path| path.is_file());
+        self.setup = Located { setup, in_use };
     }
 
     /// Draw, wait, update, repeat, until something says stop.
@@ -599,6 +646,7 @@ impl App {
                 true
             }
             Msg::ScanDone(outcome) => self.on_scan_done(*outcome),
+            Msg::ScanCancelled => self.on_scan_cancelled(),
             Msg::MpdStatus(snapshot) => self.on_mpd(*snapshot),
             Msg::TaskDone(outcome) => self.on_task_done(*outcome),
             Msg::Finding(progress) => self.on_finding(progress),
@@ -825,9 +873,9 @@ impl App {
         }
 
         // A panel has the keyboard: only the things that get rid of it work — and,
-        // for the help, the ones that move around inside it.
+        // for the ones that scroll, the ones that move around inside it.
         if self.views.last().is_some_and(View::is_modal) {
-            if let Some(dirty) = self.help_action(action) {
+            if let Some(dirty) = self.scroll_action(action) {
                 return dirty;
             }
             return match action {
@@ -2036,6 +2084,7 @@ impl App {
             },
             Command::Undo { txid } => self.undo_last(txid),
             Command::Doctor => self.not_yet("doctor", Some("29-doctor.md")),
+            Command::Messages => self.push(View::Messages { scroll: 0 }),
             Command::Set { key, value } => self.set_setting(&key, &value),
         }
     }
@@ -2487,12 +2536,19 @@ impl App {
 
     /// `esc` in the browser, in the order the user means it.
     ///
-    /// The most recent thing first: a search in flight, then an open visual
-    /// range, then the filter, then a result set, and only then the view stack.
-    /// Each of those is something on screen that `esc` is expected to undo, and
-    /// doing them in any other order means a key that appears not to work.
+    /// The most recent thing first: a search in flight, then a scan in flight,
+    /// then an open visual range, then the filter, then a result set, and only
+    /// then the view stack. Each of those is something on screen that `esc` is
+    /// expected to undo, and doing them in any other order means a key that
+    /// appears not to work.
     fn cancel_in_browser(&mut self) -> bool {
         if self.finding.as_mut().is_some_and(Finding::cancel) {
+            return true;
+        }
+        if matches!(self.scan, ScanState::Running(_))
+            && !self.scan_cancel.swap(true, Ordering::Relaxed)
+        {
+            self.log.line("scan: asked to stop");
             return true;
         }
         if self.browser.cancel_visual() {
@@ -2547,14 +2603,29 @@ impl App {
     /// keeps an idle `mpdfm` off the CPU. The poll it starts is a thread; the answer
     /// arrives later as [`Msg::MpdStatus`] and redraws then if it differs.
     fn on_tick(&mut self) -> bool {
-        let retired = self.retire_toast();
+        self.tick_at(Instant::now())
+    }
+
+    /// [`App::on_tick`], at a given moment, so a test can be two seconds into
+    /// a hung poll without waiting two seconds.
+    fn tick_at(&mut self, now: Instant) -> bool {
+        let retired = self.toasts.retire(now);
         // A `g` nobody finished stops being pending, and stops saying so on the
         // bottom line. `Keys::press` enforces the same deadline, and has to: the
         // next keypress may well arrive before the next tick.
-        let expired = self.keys.expire(Instant::now());
+        let expired = self.keys.expire(now);
+
+        // A poll that has been out too long is an MPD that is not answering,
+        // whatever the poll thread is stuck on. See `MPD_STALE`.
+        let stale = self.mpd_in_flight
+            && self
+                .mpd_asked
+                .is_some_and(|asked| now.saturating_duration_since(asked) >= MPD_STALE)
+            && self.mpd_stalled();
 
         if !self.mpd_in_flight {
             self.mpd_in_flight = true;
+            self.mpd_asked = Some(now);
             // The queue is only worth a round trip when something is staged:
             // it is the one part of a poll whose cost is the length of the
             // user's queue, and nothing but a preview reads it.
@@ -2566,7 +2637,54 @@ impl App {
             );
         }
 
-        retired || expired
+        retired || expired || stale
+    }
+
+    /// The poll that is out has not answered in [`MPD_STALE`]: say offline.
+    /// Returns whether that changed the indicator.
+    ///
+    /// The flag stays set, so a hung thread is not joined by another one every
+    /// second; its answer, when it comes, clears it and is believed.
+    fn mpd_stalled(&mut self) -> bool {
+        let was = Light::of(self.mpd.as_ref());
+        let problem = format!("no answer within {} s", MPD_STALE.as_secs());
+        let snapshot = MpdSnapshot {
+            state: None,
+            enabled: true,
+            problem: Some(problem.clone()),
+            queue: self.mpd.as_ref().and_then(|mpd| mpd.queue.clone()),
+        };
+        self.mpd = Some(snapshot);
+        let changed = was != Light::of(self.mpd.as_ref());
+        if changed {
+            self.log
+                .line(format!("mpd: {} ({problem})", Light::Offline));
+        }
+        changed
+    }
+
+    /// The scan was called off. Whatever library was on screen stays there —
+    /// it is the last one that was walked whole.
+    fn on_scan_cancelled(&mut self) -> bool {
+        self.scan = match &self.library {
+            Some(library) => ScanState::Done {
+                files: library.len(),
+                dirs: library.dir_count(),
+            },
+            None => ScanState::Idle,
+        };
+        let again = self
+            .keys
+            .map()
+            .key_for(Mode::Browser, Action::Rescan)
+            .map_or_else(String::new, |key| format!(" \u{b7} {key} to scan again"));
+        let what = if self.library.is_some() {
+            "scan called off; the listing is from the last one"
+        } else {
+            "scan called off; there is no library yet"
+        };
+        self.notify(Level::Warn, format!("{what}{again}"));
+        true
     }
 
     /// A scan came back.
@@ -2592,6 +2710,11 @@ impl App {
                     library.dir_count(),
                     elapsed.as_millis()
                 );
+                // An empty library is a first run pointed at the wrong place far
+                // more often than it is a library, and the screen says so.
+                self.no_library = library
+                    .is_empty()
+                    .then(|| NoLibrary::Empty(library.root().to_path_buf()));
                 self.library = Some(library);
                 self.index = index;
                 // Where the browser was may not exist any more, and whatever it
@@ -2615,13 +2738,41 @@ impl App {
             }
             Err(message) => {
                 self.scan = ScanState::Idle;
+                // A `music_dir` that is not there is the first-run screen, not
+                // an error: the user has not done anything wrong yet, and what
+                // they need is where the setting came from, which the screen
+                // says at more length than a panel could.
+                if let Err(problem) = self.config.require_music_dir() {
+                    self.log.line(format!("scan: no library: {problem}"));
+                    self.toasts.remember(Level::Error, problem.to_string());
+                    self.library = None;
+                    self.index = None;
+                    self.no_library = Some(NoLibrary::Missing(problem));
+                    return true;
+                }
                 // Not a toast. A library that did not scan is the whole of what
                 // the user came for, and a message that vanishes after four
                 // seconds is a message that was swallowed.
-                self.fail(message);
+                let again = self.rescan_hint();
+                self.fail(
+                    ErrorReport::new(message)
+                        .path(self.config.music_dir.as_str())
+                        .next(format!(
+                            "check that the directory is readable by you{again}"
+                        )),
+                );
             }
         }
         true
+    }
+
+    /// `, then R to scan again`, with whatever key rescans — or nothing, if no
+    /// key does.
+    fn rescan_hint(&self) -> String {
+        self.keys
+            .map()
+            .key_for(Mode::Browser, Action::Rescan)
+            .map_or_else(String::new, |key| format!(", then {key} to scan again"))
     }
 
     /// MPD answered. Redraws only when the answer is different from the last one,
@@ -2632,9 +2783,10 @@ impl App {
     /// redraw, and a song that changed is.
     fn on_mpd(&mut self, snapshot: MpdSnapshot) -> bool {
         self.mpd_in_flight = false;
-        let was = self.mpd.as_ref().map(mpd_summary);
-        let now = mpd_summary(&snapshot);
-        let changed = was.as_deref() != Some(now.as_str());
+        self.mpd_asked = None;
+        let was = Light::of(self.mpd.as_ref());
+        let now = Light::of(Some(&snapshot));
+        let changed = was != now;
 
         // The reason there is no state is worth a line in the log and nothing on
         // screen: an MPD that is not running is a normal state of the world, and
@@ -2698,7 +2850,10 @@ impl App {
             TaskOutcome::Undone(result) => self.on_undone(result),
             TaskOutcome::Failed { what, message } => {
                 self.tags_in_flight = false;
-                self.fail(format!("{what}: {message}"));
+                self.fail(
+                    ErrorReport::new(format!("{what}: {message}"))
+                        .next("this is a worker that would not start; quitting and restarting MPDFM is the reliable fix"),
+                );
                 true
             }
         }
@@ -2724,10 +2879,14 @@ impl App {
                     .iter()
                     .map(|message| format!("  - {message}"))
                     .collect();
-                self.fail(format!(
-                    "these file(s) could not be read, so the editor was not opened:\n\n{}",
-                    list.join("\n")
-                ));
+                self.fail(
+                    ErrorReport::new(format!(
+                        "these file(s) could not be read, so the editor was not opened:\n\n{}",
+                        list.join("\n")
+                    ))
+                    .path(self.browser.dir().to_string())
+                    .next("unmark the file(s) named above and open the editor again"),
+                );
                 true
             }
         }
@@ -2758,21 +2917,30 @@ impl App {
                 // The view that was watching keeps the txid, the warnings and
                 // the offer to undo, because every one of those is something to
                 // act on rather than to notice. Without one — `W` from the tag
-                // editor — they go on the message line instead.
+                // editor — the warnings go on the message line instead.
                 match self.pending_mut() {
                     Some(view) => view.finished(report),
                     None => {
                         for warning in warnings {
                             self.notify(Level::Warn, warning);
                         }
-                        let undo = self
-                            .keys
-                            .map()
-                            .key_for(Mode::Browser, Action::Undo)
-                            .map_or_else(String::new, |key| format!(" \u{b7} {key} to undo"));
-                        self.notify(Level::Info, format!("{}{undo}", committed.headline()));
                     }
                 }
+                // The toast either way: it is what `:messages` remembers a
+                // commit by, and the txid in it is what `mpdfm undo` takes.
+                let undo = self
+                    .keys
+                    .map()
+                    .key_for(Mode::Browser, Action::Undo)
+                    .map_or_else(String::new, |key| format!(" \u{b7} {key} to undo"));
+                self.notify(
+                    Level::Info,
+                    format!(
+                        "committed {} \u{2014} {}{undo}",
+                        committed.txid,
+                        committed.record.summary_phrase()
+                    ),
+                );
                 // The library on screen is a version behind: the files moved, or
                 // their tags changed, and the browser drops its tag cache on a
                 // rescan. This is what makes the change visible immediately
@@ -2795,7 +2963,9 @@ impl App {
             Err(NotCommitted::Failed(message)) => {
                 match self.pending_mut() {
                     Some(view) => view.finished(Report::Failed { message }),
-                    None => self.fail(message),
+                    None => self.fail(ErrorReport::new(message).path(self.config.data_dir.join("journal").as_str()).next(
+                        "run the `mpdfm recover` the message names, from a shell, before anything else",
+                    )),
                 }
                 // Whatever did happen, happened: the browser is a version behind
                 // either way.
@@ -2827,7 +2997,10 @@ impl App {
             // rather than a thing to notice: it means the journal is not what the
             // user thought it was.
             Err(message) => {
-                self.fail(message);
+                self.fail(
+                    ErrorReport::new(message)
+                        .next("`mpdfm undo --list`, from a shell, shows what the journal holds"),
+                );
                 true
             }
         }
@@ -2885,10 +3058,12 @@ impl App {
             return;
         }
         self.scan = ScanState::Running(None);
+        self.scan_cancel = Arc::new(AtomicBool::new(false));
         work::scan(
             self.tx.clone(),
             self.config.music_dir.clone(),
             self.config.playlist_dir.clone(),
+            Arc::clone(&self.scan_cancel),
             Arc::clone(&self.log),
         );
     }
@@ -2907,9 +3082,7 @@ impl App {
             // Still worth something: `esc` also dismisses the message on the
             // bottom line, which is the closest thing to "clear it" the shell has.
             // One press, one message, so a queue is read rather than skipped.
-            let dismissed = self.toasts.pop_front().is_some();
-            self.start_toast_clock();
-            return dismissed;
+            return self.toasts.dismiss(Instant::now());
         }
         let popped = self.views.pop();
         if let Some(view) = &popped {
@@ -2928,64 +3101,25 @@ impl App {
     fn notify_for(&mut self, level: Level, text: impl Into<String>, lifetime: Duration) {
         let text = text.into();
         self.log.line(format!("toast: {text}"));
-        if self.toasts.len() >= TOAST_QUEUE {
-            // A flood is a bug somewhere, and dropping the oldest keeps the most
-            // recent news — which is the half a user wants — without growing a
-            // queue forever.
-            self.toasts.pop_front();
-        }
-        self.toasts.push_back(Toast {
-            text,
-            level,
-            lifetime,
-            expires: None,
-        });
-        self.start_toast_clock();
-    }
-
-    /// Give whatever is at the front of the queue its clock, if it has not got one.
-    ///
-    /// Called when a message is queued and when one is retired, so the lifetime a
-    /// toast gets is time spent *on screen* and not time spent waiting behind
-    /// another one.
-    fn start_toast_clock(&mut self) {
-        if let Some(front) = self.toasts.front_mut()
-            && front.expires.is_none()
-        {
-            front.expires = Some(Instant::now() + front.lifetime);
-        }
-    }
-
-    /// Drop the front message if it has had its turn. Returns whether the bottom
-    /// line now says something different.
-    fn retire_toast(&mut self) -> bool {
-        let done = self
-            .toasts
-            .front()
-            .and_then(|front| front.expires)
-            .is_some_and(|expires| Instant::now() >= expires);
-        if !done {
-            return false;
-        }
-        self.toasts.pop_front();
-        self.start_toast_clock();
-        true
+        self.toasts.push(level, text, lifetime, Instant::now());
     }
 
     /// Report something that must be read rather than noticed.
     ///
     /// Opens [`View::Error`] on the stack: it has to be dismissed, it shows the
-    /// whole message, and whatever was underneath is still there afterwards. Task
-    /// 26 gives it the path and the suggested next step.
-    fn fail(&mut self, message: impl Into<String>) {
-        let message = message.into();
-        self.log.line(format!("error: {message}"));
+    /// whole message with the path and the next step, and whatever was
+    /// underneath is still there afterwards. `:messages` keeps a copy.
+    fn fail(&mut self, report: impl Into<ErrorReport>) {
+        let report = report.into();
+        let summary = report.summary();
+        self.log.line(format!("error: {summary}"));
+        self.toasts.remember(Level::Error, summary);
         // One panel at a time: a second failure replaces the top one rather than
         // burying it, so `esc` means "I have read it" and not "one of several".
         if matches!(self.views.last(), Some(View::Error(_))) {
             self.views.pop();
         }
-        self.views.push(View::Error(message));
+        self.views.push(View::Error(Box::new(report)));
     }
 
     // -- drawing -----------------------------------------------------------
@@ -3008,17 +3142,7 @@ impl App {
             return;
         }
 
-        // A command that would not parse gets a second row, so the reason and the
-        // text it is about are both readable. Nothing else ever needs one.
-        let message_rows = if self
-            .command_line()
-            .is_some_and(|line| line.error().is_some())
-            || self.prompt().is_some_and(|prompt| prompt.error().is_some())
-        {
-            2
-        } else {
-            1
-        };
+        let message_rows = self.message_rows(area.width);
         let [header, body, status, message] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
@@ -3032,12 +3156,44 @@ impl App {
         // which is what makes "popping does not lose state" visible as well as
         // true.
         self.render_browser(body, frame);
-        frame.render_widget(self.status_bar(), status);
+        frame.render_widget(self.status_bar(usize::from(status.width)), status);
         self.render_message(message, frame);
 
         for view in self.views.iter().filter(|view| view.is_overlay()) {
             self.render_overlay(view, body, frame);
         }
+    }
+
+    /// How many rows the bottom line needs at `cells` wide.
+    ///
+    /// A command that would not parse gets a second row, so the reason and the
+    /// text it is about are both readable. A toast gets as many as it wraps to,
+    /// up to `toast::MAX_ROWS`, because a message that is cut off is a message
+    /// that was swallowed. Everything else is one row.
+    ///
+    /// One function, because the frame and [`App::body`] both need the answer
+    /// and a body that disagreed with the frame by a row would scroll the
+    /// listing to the wrong place.
+    fn message_rows(&self, cells: u16) -> u16 {
+        if self
+            .command_line()
+            .is_some_and(|line| line.error().is_some())
+            || self.prompt().is_some_and(|prompt| prompt.error().is_some())
+        {
+            return 2;
+        }
+        if self.command_line().is_some()
+            || self.prompt().is_some()
+            || self.running.is_some()
+            || self.finding.is_some()
+        {
+            return 1;
+        }
+        let rows = self
+            .toasts
+            .front()
+            .map_or(1, |toast| toast.rows(usize::from(cells)).len());
+        u16::try_from(rows.clamp(1, toast::MAX_ROWS)).unwrap_or(1)
     }
 
     /// The command line on the stack, if there is one.
@@ -3071,10 +3227,17 @@ impl App {
     /// Nothing is mutated: the scroll offsets the next frame starts from are
     /// recorded by [`App::remember_scroll`], which the loop calls after the draw.
     fn render_browser(&self, area: Rect, frame: &mut ratatui::Frame) {
+        if let Some(why) = &self.no_library {
+            self.render_first_run(why, area, frame);
+            return;
+        }
         let Some(library) = &self.library else {
             let text = match &self.scan {
-                ScanState::Running(_) => "scanning…",
-                _ => "no library yet",
+                ScanState::Running(_) => "scanning…".to_owned(),
+                _ => format!(
+                    "no library yet{}",
+                    self.rescan_hint().replacen(", then", " —", 1)
+                ),
             };
             frame.render_widget(
                 Paragraph::new(text).block(Block::new().borders(Borders::ALL).title(" / ")),
@@ -3098,6 +3261,24 @@ impl App {
                 details_area,
             );
         }
+    }
+
+    /// The first-run screen: there is no library, here is why, and here is
+    /// every place `music_dir` could have come from.
+    ///
+    /// In the body's place and not over it, because there is nothing under it,
+    /// and wrapped because it is mostly paths.
+    fn render_first_run(&self, why: &NoLibrary, area: Rect, frame: &mut ratatui::Frame) {
+        let text = first_run_text(why, &self.config, &self.setup, &self.rescan_hint());
+        frame.render_widget(
+            Paragraph::new(text).wrap(Wrap { trim: false }).block(
+                Block::new()
+                    .borders(Borders::ALL)
+                    .border_style(Style::new().fg(Color::Yellow))
+                    .title(" no library "),
+            ),
+            area,
+        );
     }
 
     /// The directory tree, indented, with the current directory on the cursor.
@@ -3219,7 +3400,13 @@ impl App {
 
     /// The area the body occupies, from the last size the terminal reported.
     fn body(&self) -> Rect {
-        Rect::new(0, 1, self.size.0, self.size.1.saturating_sub(CHROME_ROWS))
+        let extra = self.message_rows(self.size.0).saturating_sub(1);
+        Rect::new(
+            0,
+            1,
+            self.size.0,
+            self.size.1.saturating_sub(CHROME_ROWS + extra),
+        )
     }
 
     /// An overlay over the body.
@@ -3245,13 +3432,31 @@ impl App {
                 body,
                 frame,
             ),
-            View::Error(message) => panel(
-                " error ",
-                &format!("{message}\n\nesc to dismiss"),
-                Color::Red,
-                body,
-                frame,
-            ),
+            View::Error(report) => {
+                let area = panel_area(body);
+                let lines = report.lines(inner_width(area));
+                scrolled(
+                    " error ",
+                    "dismiss",
+                    lines,
+                    report.scroll(),
+                    Color::Red,
+                    area,
+                    frame,
+                );
+            }
+            View::Messages { scroll } => {
+                let lines = self.toasts.history_lines(inner_width(body));
+                scrolled(
+                    " messages ",
+                    "close",
+                    lines,
+                    *scroll,
+                    Color::Cyan,
+                    body,
+                    frame,
+                );
+            }
         }
     }
 
@@ -3386,75 +3591,46 @@ impl App {
             .render(inner, frame.buffer_mut());
     }
 
-    /// The help overlay, generated from the live keymap.
+    /// The help overlay, generated from the live keymap (`widgets::help`).
     ///
-    /// Generated and never written down, which is the acceptance criterion: a
-    /// binding the user has remapped away cannot be documented here, because this
-    /// reads the same table the keypress did.
-    ///
-    /// It takes the whole body rather than a centred box, because there is more to
-    /// say than a box holds — and it scrolls, because there is more to say than the
-    /// body holds too. Task 26 owns the grouping and the sections for the modes
-    /// other than the one in force.
+    /// It takes the whole body rather than a centred box, because there is more
+    /// to say than a box holds — and it scrolls, because there is more to say
+    /// than the body holds too.
     fn render_help(&self, mode: Mode, scroll: u16, body: Rect, frame: &mut ratatui::Frame) {
-        let rows = self.help_rows(mode);
-        let shown = usize::from(body.height.saturating_sub(2));
-        let hidden = rows.len().saturating_sub(shown + usize::from(scroll));
-        let footer = if hidden > 0 {
-            format!(" {hidden} more — j / k to scroll · esc to close ")
-        } else {
-            " esc to close ".to_owned()
-        };
-
-        frame.render_widget(Clear, body);
-        frame.render_widget(
-            Paragraph::new(rows.join("\n")).scroll((scroll, 0)).block(
-                Block::new()
-                    .borders(Borders::ALL)
-                    .border_style(Style::new().fg(Color::Cyan))
-                    .title(format!(" help · {mode} "))
-                    .title_bottom(footer),
-            ),
+        let lines = help::lines(self.keys.map(), mode);
+        scrolled(
+            &format!(" help · {mode} "),
+            "close",
+            lines,
+            scroll,
+            Color::Cyan,
             body,
+            frame,
         );
     }
 
-    /// One line per binding, then the commands `:` takes.
-    fn help_rows(&self, mode: Mode) -> Vec<String> {
-        let mut rows: Vec<String> = self
-            .keys
-            .map()
-            .help()
-            .into_iter()
-            .filter(|section| section.mode == mode)
-            .flat_map(|section| section.rows)
-            .map(|row| format!("{:<13} {}", row.keys, row.action.help()))
-            .collect();
-
-        rows.push(String::new());
-        rows.push("commands".to_owned());
-        rows.extend(
-            command::USAGE
-                .iter()
-                .map(|(usage, help)| format!("{:<13} {help}", format!(":{usage}"))),
-        );
-        // Not generated, because it is not in the table: see `App::on_key`.
-        rows.push(String::new());
-        rows.push(format!(
-            "{:<13} {}",
-            "ctrl-c", "quit (asks once, then leaves)"
-        ));
-        rows
-    }
-
-    /// Scrolling, while the help overlay has the keyboard.
-    ///
-    /// Returns `None` for an action the help does not use, so that `q` and `esc`
-    /// still mean what they mean.
-    fn help_action(&mut self, action: Action) -> Option<bool> {
-        let &View::Help { mode, scroll } = self.views.last()? else {
-            return None;
+    /// How many lines the scrolling overlay on top has, and how many of them
+    /// fit — the two numbers its scroll is clamped between.
+    fn scroll_extent(&self) -> Option<(usize, usize)> {
+        let body = self.body();
+        let (lines, area) = match self.views.last()? {
+            View::Help { mode, .. } => (help::lines(self.keys.map(), *mode).len(), body),
+            View::Messages { .. } => (self.toasts.history_lines(inner_width(body)).len(), body),
+            View::Error(report) => {
+                let area = panel_area(body);
+                (report.lines(inner_width(area)).len(), area)
+            }
+            _ => return None,
         };
+        Some((lines, usize::from(area.height.saturating_sub(2))))
+    }
+
+    /// Scrolling, while the help, `:messages` or an error has the keyboard.
+    ///
+    /// Returns `None` for an action that is not scrolling, so that `q` and
+    /// `esc` still mean what they mean.
+    fn scroll_action(&mut self, action: Action) -> Option<bool> {
+        let (lines, shown) = self.scroll_extent()?;
         let step = self.page_step();
         let delta = match action {
             Action::Down => 1,
@@ -3467,40 +3643,30 @@ impl App {
         };
 
         // Not past the end: scrolling into blank space looks like a broken overlay.
-        // The body is the terminal less the chrome and the overlay's own border.
-        let shown = usize::from(self.size.1.saturating_sub(5));
-        let last = self.help_rows(mode).len().saturating_sub(shown);
-        let target = u16::try_from(usize::from(scroll).saturating_add_signed(delta).min(last))
+        let last = lines.saturating_sub(shown);
+        let current = match self.views.last()? {
+            View::Help { scroll, .. } | View::Messages { scroll } => *scroll,
+            View::Error(report) => report.scroll(),
+            _ => return None,
+        };
+        let target = u16::try_from(usize::from(current).saturating_add_signed(delta).min(last))
             .unwrap_or(u16::MAX);
 
-        if let Some(View::Help { scroll, .. }) = self.views.last_mut() {
-            let moved = *scroll != target;
-            *scroll = target;
-            return Some(moved);
-        }
-        None
+        Some(match self.views.last_mut()? {
+            View::Help { scroll, .. } | View::Messages { scroll } => {
+                let moved = *scroll != target;
+                *scroll = target;
+                moved
+            }
+            View::Error(report) => report.scroll_to(target),
+            _ => false,
+        })
     }
 
-    /// The status bar. Task 26 owns what goes on it and in which order it elides;
-    /// this is the subset the shell and the browser can answer for.
-    fn status_bar(&self) -> Paragraph<'_> {
-        // No path here: the listing's own title carries it, and a 46-character
-        // scene-release directory would push everything that changes off the
-        // right-hand end of an 80-column bar. Task 26 owns the elision order;
-        // not repeating a thing that is already on screen is free.
-        let mut parts = vec![
-            format!("{} marked", self.browser.marked()),
-            format!("{} pending", self.plan.len()),
-            format!("sort {}", self.browser.sort()),
-            format!("focus {}", self.focus.label()),
-        ];
-        // An active filter is never invisible: a listing that is quietly missing
-        // rows is a listing that lies, which is the task's own wording and an
-        // acceptance criterion.
-        if let Some(filter) = self.browser.filter() {
-            parts.push(format!("filter `{filter}`"));
-        }
-        if let Some(results) = self.browser.results() {
+    /// The status bar, `cells` wide. What is on it and what it gives up first
+    /// are `widgets::statusbar`'s; this gathers the values.
+    fn status_bar(&self, cells: usize) -> Paragraph<'static> {
+        let find = self.browser.results().map(|results| {
             // The unreadable count stays on the bar and not only in the toast
             // that announced it: a result set that may be missing nine files is
             // a result set the user is about to act on.
@@ -3509,34 +3675,27 @@ impl App {
             } else {
                 format!(", \u{26a0} {} unreadable", results.failed)
             };
-            parts.push(format!(
-                "find `{}` ({}{failed})",
-                results.query,
-                results.hits.len()
-            ));
-        }
-        if self.browser.in_visual() {
-            parts.push("VISUAL".to_owned());
-        }
-        if self.running.is_some() {
+            format!("find `{}` ({}{failed})", results.query, results.hits.len())
+        });
+        let status = Status {
+            path: self.browser.dir_label(),
+            marked: self.browser.marked(),
+            pending: self.plan.len(),
+            // An active filter is never invisible: a listing that is quietly
+            // missing rows is a listing that lies.
+            filter: self.browser.filter().map(ToString::to_string),
+            find,
+            visual: self.browser.in_visual(),
             // Shown here as well as on the message line, because the message
             // line is also where a toast goes and this one must not be possible
             // to miss.
-            parts.push("WRITING".to_owned());
-        }
-        if self.warnings > 0 {
-            // A badge, because a scan that skipped a file and said nothing is a
-            // browser that is lying about the library. The count is the whole
-            // message; `:messages` (task 26) is where the list will live.
-            let plural = if self.warnings == 1 { "" } else { "s" };
-            parts.push(format!("⚠ {} warning{plural}", self.warnings));
-        }
-        parts.push(
-            self.mpd
-                .as_ref()
-                .map_or_else(|| "○ mpd ?".to_owned(), mpd_summary),
-        );
-        Paragraph::new(Line::from(parts.join(" · ")).style(Style::new().fg(Color::DarkGray)))
+            writing: self.running.is_some(),
+            warnings: self.warnings,
+            sort: self.browser.sort().to_string(),
+            focus: self.focus.label(),
+            mpd: Light::of(self.mpd.as_ref()),
+        };
+        Paragraph::new(status.line(cells))
     }
 
     /// The bottom line, which is also where the command line lives.
@@ -3559,7 +3718,7 @@ impl App {
         ])
         .areas(area);
 
-        frame.render_widget(self.message_text(), text_area);
+        frame.render_widget(self.message_text(usize::from(text_area.width)), text_area);
         if !partial.is_empty() {
             frame.render_widget(
                 Paragraph::new(partial).style(Style::new().add_modifier(Modifier::BOLD)),
@@ -3568,51 +3727,68 @@ impl App {
         }
     }
 
-    /// The toast, or the scan's progress, or what the keys are.
-    fn message_text(&self) -> Paragraph<'_> {
+    /// The toast, or what is still running, or what the keys are.
+    fn message_text(&self, cells: usize) -> Paragraph<'static> {
+        let cancel_key = |mode: Mode| self.keys.map().key_for(mode, Action::Cancel);
+
         // A transaction in flight outranks a toast: it is the only thing on this
         // line that is still happening, and the one the user is waiting for.
+        // Cancellable only before its first change (`Running::is_cancellable`).
         if let Some(running) = &self.running {
-            let hint = match (
-                running.is_cancellable(),
-                self.keys.map().key_for(Mode::Pending, Action::Cancel),
-            ) {
-                (true, Some(key)) => format!(" \u{b7} {key} to stop"),
-                _ => String::new(),
-            };
-            return Paragraph::new(
-                Line::from(format!("{}{hint}", running.line())).style(Style::new().fg(Color::Cyan)),
-            );
+            let mut busy = Busy::new(running.line());
+            if let Some(Progress::Steps { done, steps }) = running.progress {
+                busy = busy.fraction(done, steps);
+            }
+            let stop = running
+                .is_cancellable()
+                .then(|| cancel_key(Mode::Pending))
+                .flatten();
+            return Paragraph::new(busy.stop(stop).line(cells));
         }
         // A library-wide walk is the other thing that is still happening, and it
-        // reports a percentage, so it outranks a toast for the same reason a
-        // commit does.
+        // knows its total, so it gets a bar for the same reason a commit does.
         if let Some(finding) = &self.finding {
-            let hint = match self.keys.map().key_for(Mode::Browser, Action::Cancel) {
-                Some(key) if !finding.is_cancelling() => format!(" \u{b7} {key} to stop"),
-                _ => String::new(),
-            };
-            return Paragraph::new(
-                Line::from(format!("{}{hint}", finding.line())).style(Style::new().fg(Color::Cyan)),
-            );
+            let mut busy = Busy::new(finding.line());
+            if let Some(progress) = finding.progress() {
+                busy = busy.fraction(progress.scanned, progress.total);
+            }
+            let stop = (!finding.is_cancelling())
+                .then(|| cancel_key(Mode::Browser))
+                .flatten();
+            return Paragraph::new(busy.stop(stop).line(cells));
         }
         if let Some(toast) = self.toasts.front() {
-            let color = match toast.level {
-                Level::Info => Color::Green,
-                Level::Warn => Color::Yellow,
-            };
-            return Paragraph::new(Line::from(toast.text.clone()).style(Style::new().fg(color)));
+            let style = Style::new().fg(toast.level.color());
+            let lines: Vec<Line<'static>> = toast
+                .rows(cells)
+                .into_iter()
+                .map(|row| Line::styled(row, style))
+                .collect();
+            return Paragraph::new(lines);
         }
 
-        let text = match &self.scan {
-            ScanState::Running(None) => "scanning…".to_owned(),
-            ScanState::Running(Some(progress)) => format!(
-                "scanning… {} files, {} dirs — {}",
-                progress.files, progress.dirs, progress.dir
-            ),
-            ScanState::Idle | ScanState::Done { .. } => self.hints(),
-        };
-        Paragraph::new(Line::from(text).style(Style::new().fg(Color::DarkGray)))
+        match &self.scan {
+            // A scan does not know its total, so it is a count and not a bar.
+            ScanState::Running(progress) => {
+                let stopping = self.scan_cancel.load(Ordering::Relaxed);
+                let label = if stopping {
+                    "scanning: stopping…"
+                } else {
+                    "scanning…"
+                };
+                let detail = progress.as_ref().map_or_else(String::new, |progress| {
+                    format!(
+                        "{} files \u{b7} {} dirs \u{b7} {}",
+                        progress.files, progress.dirs, progress.dir
+                    )
+                });
+                let stop = (!stopping).then(|| cancel_key(Mode::Browser)).flatten();
+                Paragraph::new(Busy::new(label).detail(detail).stop(stop).line(cells))
+            }
+            ScanState::Idle | ScanState::Done { .. } => {
+                Paragraph::new(Line::from(self.hints()).style(Style::new().fg(Color::DarkGray)))
+            }
+        }
     }
 
     /// The idle hint, read off the keymap rather than written down.
@@ -3860,12 +4036,7 @@ fn tree_label(row: &TreeRow) -> String {
 /// browser visible around the edges so that it is obvious the overlay is on top of
 /// something rather than instead of it.
 fn panel(title: &str, text: &str, color: Color, body: Rect, frame: &mut ratatui::Frame) {
-    let [area] = Layout::horizontal([Constraint::Percentage(75)])
-        .flex(Flex::Center)
-        .areas(body);
-    let [area] = Layout::vertical([Constraint::Percentage(75)])
-        .flex(Flex::Center)
-        .areas(area);
+    let area = panel_area(body);
 
     // Without this the browser's rows show through the gaps in the text.
     frame.render_widget(Clear, area);
@@ -3895,39 +4066,94 @@ fn too_small(area: Rect) -> Paragraph<'static> {
     .style(Style::new().fg(Color::Yellow))
 }
 
-/// What the status bar says about MPD, and therefore also what decides whether a
-/// poll's answer is worth a frame.
-///
-/// Task 26 owns the final shape of this, including the order the parts are elided
-/// in on a narrow terminal. What is here is the indicator the task asks for plus
-/// the current song's file name — the whole path is too long for a status bar and
-/// the directory is usually the album that is already on screen.
-fn mpd_summary(snapshot: &MpdSnapshot) -> String {
-    let Some(state) = &snapshot.state else {
-        // "I was told not to ask" and "it did not answer" are different things to
-        // put in front of somebody who is wondering why there is no indicator.
-        return if snapshot.enabled {
-            "○ offline".to_owned()
-        } else {
-            "· mpd off".to_owned()
-        };
-    };
-    if state.updating {
-        return "◐ updating".to_owned();
-    }
+/// The box a [`panel`] occupies: three quarters of the body, centred.
+fn panel_area(body: Rect) -> Rect {
+    let [area] = Layout::horizontal([Constraint::Percentage(75)])
+        .flex(Flex::Center)
+        .areas(body);
+    let [area] = Layout::vertical([Constraint::Percentage(75)])
+        .flex(Flex::Center)
+        .areas(area);
+    area
+}
 
-    let indicator = match state.play_state {
-        mpdfm_core::mpd::PlayState::Play => "● playing",
-        mpdfm_core::mpd::PlayState::Pause => "● paused",
-        mpdfm_core::mpd::PlayState::Stop => "● connected",
+/// A bordered box of already-laid-out lines, scrolled to `scroll`, saying in
+/// its footer how much more there is below.
+///
+/// The help, `:messages` and an error panel all draw through this, so all
+/// three scroll with the same keys and say so in the same words.
+fn scrolled(
+    title: &str,
+    close: &str,
+    lines: Vec<Line<'static>>,
+    scroll: u16,
+    color: Color,
+    area: Rect,
+    frame: &mut ratatui::Frame,
+) {
+    let shown = usize::from(area.height.saturating_sub(2));
+    let hidden = lines.len().saturating_sub(shown + usize::from(scroll));
+    let footer = if hidden > 0 {
+        format!(" {hidden} more — j / k to scroll · esc to {close} ")
+    } else {
+        format!(" esc to {close} ")
     };
-    match &state.song {
-        Some(song) => {
-            let name = song.rsplit('/').next().unwrap_or(song);
-            format!("{indicator} {name}")
-        }
-        None => indicator.to_owned(),
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).scroll((scroll, 0)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(color))
+                .title(fit(title, inner_width(area)))
+                .title_bottom(fit(&footer, inner_width(area))),
+        ),
+        area,
+    );
+}
+
+/// What the first-run screen says.
+///
+/// Every path is the one actually in use or actually searched — the config file
+/// `--config` named, the mpd.conf search path for this `$HOME` — so the user can
+/// copy one and open it, rather than translate a generic instruction into their
+/// own machine.
+fn first_run_text(why: &NoLibrary, config: &Config, located: &Located, again: &str) -> String {
+    let setup = &located.setup;
+    let source = &config.sources.music_dir;
+    let mut out = match why {
+        NoLibrary::Missing(problem) => format!(
+            "There is no library to show: music_dir {}.\n\n  music_dir  {}\n  set by     {source}\n",
+            problem.defect, problem.path
+        ),
+        NoLibrary::Empty(root) => format!(
+            "There is no music in music_dir — it is a directory with no files \
+             in it, which usually means it is the wrong one.\n\n  music_dir  {root}\n  set by     {source}\n"
+        ),
+    };
+
+    let config_file = setup.config_file.as_ref().map_or_else(
+        || "config.toml (no $XDG_CONFIG_HOME or $HOME to find it by)".to_owned(),
+        ToString::to_string,
+    );
+    out.push_str("\nMPDFM takes music_dir from the first of these that sets it:\n\n");
+    out.push_str("  1. --music-dir on the command line\n");
+    out.push_str(&format!("  2. music_dir = \"...\" in {config_file}\n"));
+    out.push_str("  3. music_directory in the first mpd.conf on MPD's own search path:\n");
+    if setup.mpd_confs.is_empty() {
+        out.push_str("       (none to search: there is no $HOME)\n");
     }
+    for (index, path) in setup.mpd_confs.iter().enumerate() {
+        let found = if located.in_use == Some(index) {
+            "  ← the one MPD reads"
+        } else {
+            ""
+        };
+        out.push_str(&format!("       {path}{found}\n"));
+    }
+    out.push_str(&format!(
+        "\nFix whichever applies{again}.\n`mpdfm config show` prints every setting and where it came from."
+    ));
+    out
 }
 
 #[cfg(test)]
@@ -4259,7 +4485,7 @@ mod tests {
         assert_eq!(app.views.len(), 2, "one panel at a time: {:?}", app.views);
         assert_eq!(
             app.views.last(),
-            Some(&View::Error("the second thing".to_owned()))
+            Some(&View::Error(Box::new(ErrorReport::new("the second thing"))))
         );
         app.update(key(KeyCode::Esc));
         assert_eq!(app.views, vec![View::Browser]);
@@ -4332,9 +4558,10 @@ mod tests {
         })));
 
         assert!(app.toasts.is_empty(), "an error is not a toast");
-        let Some(View::Error(message)) = app.views.last() else {
+        let Some(View::Error(report)) = app.views.last() else {
             panic!("a failed scan should open the error panel: {:?}", app.views);
         };
+        let message = report.summary();
         assert!(message.contains("/no/such/dir"), "{message}");
 
         terminal
@@ -4566,9 +4793,9 @@ mod tests {
         app.notify(Level::Info, "shown later");
 
         let front = app.toasts.front().expect("something is queued");
-        assert!(front.expires.is_some(), "the visible one has a clock");
+        assert!(front.expires().is_some(), "the visible one has a clock");
         let back = app.toasts.back().expect("two are queued");
-        assert!(back.expires.is_none(), "the waiting one does not");
+        assert!(back.expires().is_none(), "the waiting one does not");
     }
 
     #[test]
@@ -4596,15 +4823,15 @@ mod tests {
     fn the_message_queue_is_bounded() {
         let fx = Fixture::builder().build();
         let (mut app, _rx) = app(&fx);
-        for n in 0..TOAST_QUEUE * 3 {
+        for n in 0..toast::QUEUE * 3 {
             app.notify(Level::Info, format!("message {n}"));
         }
-        assert_eq!(app.toasts.len(), TOAST_QUEUE);
+        assert_eq!(app.toasts.len(), toast::QUEUE);
         // The newest survive, because they are the ones a user wants.
         assert!(
             app.toasts
                 .back()
-                .is_some_and(|toast| toast.text.ends_with(&(TOAST_QUEUE * 3 - 1).to_string()))
+                .is_some_and(|toast| toast.text.ends_with(&(toast::QUEUE * 3 - 1).to_string()))
         );
     }
 
@@ -6322,9 +6549,10 @@ mod tests {
             "something was staged: {:?}",
             app.plan.ops()
         );
-        let Some(View::Error(message)) = app.views.last() else {
+        let Some(View::Error(report)) = app.views.last() else {
             panic!("a refusal has to be read, not noticed: {:?}", app.views);
         };
+        let message = report.summary();
         assert!(message.contains("nothing was staged"), "{message}");
         assert!(
             message.contains("02 Hoe Cakes.mp3"),
@@ -7883,5 +8111,633 @@ mod tests {
             "{} µs for one frame means the draw waited on the walk",
             slowest.as_micros()
         );
+    }
+
+    // -- task 26: the chrome ------------------------------------------------
+
+    /// The row the status bar is on: the one above the message line, which is
+    /// as tall as `message_rows` says.
+    fn status_row(app: &App, terminal: &Terminal<TestBackend>) -> String {
+        let rows = lines(terminal);
+        let message = usize::from(app.message_rows(app.size.0));
+        rows[rows.len() - 1 - message].clone()
+    }
+
+    /// A pretend MPD on a real port, which answers `status` and `currentsong`
+    /// as a playing daemon would — until it is stopped, after which the port
+    /// refuses connections like a daemon that has gone away.
+    struct FakeMpd {
+        addr: mpdfm_core::config::MpdAddress,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeMpd {
+        fn start() -> Self {
+            use std::io::{BufRead, BufReader, Write};
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("an ephemeral port");
+            listener
+                .set_nonblocking(true)
+                .expect("a non-blocking listener");
+            let addr = mpdfm_core::config::MpdAddress::parse(
+                &listener.local_addr().expect("its address").to_string(),
+                6600,
+            )
+            .expect("an address");
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopping = Arc::clone(&stop);
+            let thread = std::thread::spawn(move || {
+                while !stopping.load(Ordering::Relaxed) {
+                    let Ok((socket, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    socket.set_nonblocking(false).expect("a blocking socket");
+                    let mut writer = socket.try_clone().expect("a second handle");
+                    let _ = writer.write_all(b"OK MPD 0.24.0\n");
+                    for line in BufReader::new(socket).lines() {
+                        let Ok(line) = line else { break };
+                        let answer: &[u8] = match line.as_str() {
+                            "status" => b"volume: 50\nstate: play\nsong: 0\nOK\n",
+                            "currentsong" => b"file: hiphop/MF DOOM/01 Doomsday.mp3\nOK\n",
+                            _ => b"OK\n",
+                        };
+                        if writer.write_all(answer).is_err() {
+                            break;
+                        }
+                    }
+                }
+                // The listener drops here, and the port refuses from now on.
+            });
+            Self {
+                addr,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn stop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("the fake daemon stops");
+            }
+        }
+    }
+
+    impl Drop for FakeMpd {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    /// Tick, and wait for the poll that tick started to answer.
+    ///
+    /// Returns how long `update(Tick)` itself took — which is the UI thread's
+    /// share of a poll, and has to be nothing — and how long the answer took.
+    fn poll_once(app: &mut App, rx: &mpsc::Receiver<Msg>) -> (Duration, Duration) {
+        let started = Instant::now();
+        app.update(Msg::Tick);
+        let on_the_ui_thread = started.elapsed();
+        loop {
+            let msg = rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("a poll always answers");
+            let is_mpd = matches!(msg, Msg::MpdStatus(_));
+            app.update(msg);
+            if is_mpd {
+                return (on_the_ui_thread, started.elapsed());
+            }
+        }
+    }
+
+    #[test]
+    fn the_mpd_indicator_goes_offline_when_the_daemon_stops_without_stalling_the_ui() {
+        let fx = Fixture::realistic();
+        let mut mpd = FakeMpd::start();
+        let config = Config {
+            mpd_address: mpd.addr.clone(),
+            mpd_enabled: true,
+            ..fx.config()
+        };
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(config, KeyMap::defaults(), tx, Arc::new(Log::off()));
+        let mut terminal = screen(100, 24);
+        app.update(scanned(&fx));
+
+        poll_once(&mut app, &rx);
+        draw(&mut app, &mut terminal);
+        let bar = status_row(&app, &terminal);
+        assert!(bar.ends_with("● playing 01 Doomsday.mp3"), "{bar}");
+
+        mpd.stop();
+        let (on_the_ui_thread, answered) = poll_once(&mut app, &rx);
+        assert_eq!(Light::of(app.mpd.as_ref()), Light::Offline);
+        draw(&mut app, &mut terminal);
+        let bar = status_row(&app, &terminal);
+        assert!(bar.ends_with("○ offline"), "{bar}");
+
+        // The criterion is "within ~2 s": the next tick is at most `TICK`
+        // away, and the answer has to land inside the rest of the budget.
+        assert!(
+            crate::tui::event::TICK + answered < Duration::from_secs(2),
+            "the poll took {answered:?}"
+        );
+        // And none of that was on the thread that draws.
+        assert!(
+            on_the_ui_thread < Duration::from_millis(20),
+            "a tick took {on_the_ui_thread:?} on the UI thread"
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_accepts_and_never_answers_is_offline_and_never_blocks_a_tick() {
+        let fx = Fixture::realistic();
+        // Bound and never accepted from: the kernel completes the handshake, and
+        // then nothing is ever said — the hung daemon of the task's pitfall.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("an ephemeral port");
+        let config = Config {
+            mpd_address: mpdfm_core::config::MpdAddress::parse(
+                &listener.local_addr().expect("its address").to_string(),
+                6600,
+            )
+            .expect("an address"),
+            mpd_enabled: true,
+            ..fx.config()
+        };
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(config, KeyMap::defaults(), tx, Arc::new(Log::off()));
+
+        let (on_the_ui_thread, answered) = poll_once(&mut app, &rx);
+        assert_eq!(Light::of(app.mpd.as_ref()), Light::Offline);
+        assert!(
+            on_the_ui_thread < Duration::from_millis(20),
+            "{on_the_ui_thread:?}"
+        );
+        assert!(answered < Duration::from_secs(1), "{answered:?}");
+        drop(listener);
+    }
+
+    #[test]
+    fn a_poll_that_never_comes_back_turns_the_light_off_after_two_seconds() {
+        let fx = Fixture::realistic();
+        let (mut app, rx) = app(&fx);
+        app.update(Msg::MpdStatus(Box::new(MpdSnapshot {
+            state: Some(MpdState {
+                play_state: mpdfm_core::mpd::PlayState::Stop,
+                song: None,
+                updating: false,
+            }),
+            enabled: true,
+            problem: None,
+            queue: None,
+        })));
+        assert_eq!(Light::of(app.mpd.as_ref()).label(), "● connected");
+
+        // A poll is out, and stuck — a name lookup, a daemon trickling bytes.
+        let asked = Instant::now();
+        app.mpd_in_flight = true;
+        app.mpd_asked = Some(asked);
+
+        assert!(
+            !app.tick_at(asked + Duration::from_secs(1)),
+            "one second is not long enough to give up"
+        );
+        assert!(
+            app.tick_at(asked + MPD_STALE),
+            "two seconds is, and the bar changes"
+        );
+        assert_eq!(Light::of(app.mpd.as_ref()), Light::Offline);
+        assert!(
+            app.mpd_in_flight,
+            "the stuck poll is not joined by a second one"
+        );
+        assert!(rx.try_recv().is_err(), "and no second poll was started");
+        assert!(
+            !app.tick_at(asked + MPD_STALE * 2),
+            "said once, not every tick"
+        );
+
+        // When it does answer, it is believed again.
+        app.update(Msg::MpdStatus(Box::new(MpdSnapshot {
+            state: Some(MpdState {
+                play_state: mpdfm_core::mpd::PlayState::Stop,
+                song: None,
+                updating: false,
+            }),
+            enabled: true,
+            problem: None,
+            queue: None,
+        })));
+        assert!(!app.mpd_in_flight);
+        assert_eq!(Light::of(app.mpd.as_ref()).label(), "● connected");
+    }
+
+    #[test]
+    fn the_status_bar_shows_path_marks_pending_and_mpd_and_follows_them() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(120, 24);
+        app.update(scanned(&fx));
+        draw(&mut app, &mut terminal);
+        let bar = status_row(&app, &terminal);
+        assert!(bar.starts_with("/ · 0 marked · 0 pending"), "{bar}");
+        assert!(bar.ends_with("○ mpd ?"), "nothing has answered yet: {bar}");
+
+        mark_the_album(&mut app);
+        draw(&mut app, &mut terminal);
+        let bar = status_row(&app, &terminal);
+        assert!(bar.starts_with("hiphop · 1 marked · 0 pending"), "{bar}");
+
+        in_dir(&mut app, "electronic");
+        assert!(app.dispatch(Action::StageMove));
+        app.update(key(KeyCode::Esc));
+        draw(&mut app, &mut terminal);
+        let bar = status_row(&app, &terminal);
+        assert!(
+            bar.starts_with("electronic · 1 marked · 1 pending"),
+            "{bar}"
+        );
+
+        app.update(Msg::MpdStatus(Box::new(MpdSnapshot {
+            state: Some(MpdState {
+                play_state: mpdfm_core::mpd::PlayState::Stop,
+                song: None,
+                updating: true,
+            }),
+            enabled: true,
+            problem: None,
+            queue: None,
+        })));
+        draw(&mut app, &mut terminal);
+        assert!(status_row(&app, &terminal).ends_with("◐ updating"));
+    }
+
+    #[test]
+    fn at_sixty_columns_the_status_bar_keeps_what_matters_and_stays_on_its_row() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(60, 15);
+        app.update(scanned(&fx));
+        stage_the_album_move(&mut app);
+        app.update(key(KeyCode::Esc));
+        app.browser.set_filter(
+            Some(query::parse("mp3").expect("a pattern")),
+            app.library.as_ref().expect("a library"),
+        );
+        app.update(Msg::MpdStatus(Box::new(MpdSnapshot {
+            state: Some(MpdState {
+                play_state: mpdfm_core::mpd::PlayState::Play,
+                song: Some("electronic/KREAM - So Hï/03 ノスタルジア.mp3".to_owned()),
+                updating: false,
+            }),
+            enabled: true,
+            problem: None,
+            queue: None,
+        })));
+        draw(&mut app, &mut terminal);
+        let bar = status_row(&app, &terminal);
+        assert!(width(&bar) <= 60, "{bar}");
+        assert!(bar.contains("1 marked") || bar.contains("1m"), "{bar}");
+        assert!(bar.contains("1 pending") || bar.contains("1p"), "{bar}");
+        assert!(
+            bar.contains("filter `mp3`"),
+            "the filter is never invisible: {bar}"
+        );
+        assert!(bar.contains('●'), "{bar}");
+        assert!(
+            !bar.contains("sort"),
+            "the least important part went first: {bar}"
+        );
+    }
+
+    #[test]
+    fn the_help_has_every_modes_keys_with_the_current_mode_first() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app_with_keys(&fx, "[pending]\n\"ctrl-x\" = \"unstage\"\n");
+        let mut terminal = screen(80, 24);
+        app.update(scanned(&fx));
+        app.update(press('?'));
+        draw(&mut app, &mut terminal);
+        let top = text(&terminal);
+        assert!(top.contains("browser — the library"), "{top}");
+
+        // Every other mode is further down, and the remap in one of them shows
+        // in that mode's section — generated, not written down.
+        app.update(press('G'));
+        draw(&mut app, &mut terminal);
+        let all: Vec<String> = help::lines(app.keys.map(), Mode::Browser)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        let pending = all
+            .iter()
+            .position(|row| row.starts_with("pending — "))
+            .expect("a pending section");
+        let unstage = all
+            .iter()
+            .position(|row| row.contains("ctrl-x") && row.contains("unstage"))
+            .expect("the remapped key is listed");
+        assert!(unstage > pending, "and listed under pending");
+        assert!(
+            text(&terminal).contains("ctrl-c"),
+            "the bottom is reachable"
+        );
+
+        // Opened from the pending view, the pending section is the first thing.
+        app.update(press('?'));
+        stage_the_album_move(&mut app);
+        app.update(press('?'));
+        draw(&mut app, &mut terminal);
+        let rows = lines(&terminal);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("│pending — what is staged")),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_commit_posts_a_toast_with_the_txid_and_how_to_undo_it() {
+        let fx = Fixture::realistic();
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+        stage_the_album_move(&mut app);
+        app.toasts.clear();
+
+        app.update(press('c'));
+        settle_until(&mut app, &rx, |app| app.running.is_none());
+        let toast = app
+            .toasts
+            .iter()
+            .find(|toast| toast.text.starts_with("committed "))
+            .expect("a commit says so on the message line");
+        let txid = toast.text.split_whitespace().nth(1).expect("a txid");
+        assert!(
+            mpdfm_core::journal::TxId::parse(txid).is_ok(),
+            "{txid:?} is not a txid: {}",
+            toast.text
+        );
+        assert!(toast.text.contains("playlist"), "{}", toast.text);
+        assert!(toast.text.ends_with("u to undo"), "{}", toast.text);
+    }
+
+    #[test]
+    fn an_error_has_to_be_dismissed_and_shows_the_message_the_path_and_the_next_step() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(80, 24);
+        app.update(scanned(&fx));
+
+        let message = "the transaction stopped at step 3 of 8, after moving \
+                       hiphop/MF DOOM - Mm..Food (2004) [V0] scene-tag/01 Beef Rap.mp3 and \
+                       before rewriting any playlist; nothing after that step was attempted";
+        app.fail(
+            ErrorReport::new(message)
+                .path("/home/user/Music/hiphop/MF DOOM - Mm..Food (2004) [V0] scene-tag")
+                .next("run `mpdfm recover 20260101T101010Z-abcd`"),
+        );
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+        // Every word, wrapped rather than cut.
+        for word in message.split_whitespace() {
+            assert!(drawn.contains(word), "{word:?} is not on screen:\n{drawn}");
+        }
+        assert!(drawn.contains("path  /home/user/Music/hiphop"), "{drawn}");
+        assert!(drawn.contains("next  run `mpdfm recover"), "{drawn}");
+        assert!(drawn.contains("esc to dismiss"), "{drawn}");
+
+        // Nothing makes it go away but dismissing it: not time, not a key that
+        // means something else.
+        app.tick_at(Instant::now() + Duration::from_secs(60));
+        app.update(press('j'));
+        app.update(press(' '));
+        assert!(matches!(app.views.last(), Some(View::Error(_))));
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.views, vec![View::Browser]);
+
+        // And it is not lost once it is gone.
+        assert!(
+            app.toasts
+                .history()
+                .any(|entry| entry.level == Level::Error && entry.text.contains("mpdfm recover")),
+            "`:messages` keeps the error"
+        );
+    }
+
+    #[test]
+    fn an_error_too_long_for_its_panel_scrolls_rather_than_being_cut() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(80, 24);
+        let list: Vec<String> = (1..=40).map(|n| format!("  - file {n:02}.mp3")).collect();
+        app.fail(format!("these could not be read:\n\n{}", list.join("\n")));
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+        assert!(
+            drawn.contains("more — j / k to scroll · esc to dismiss"),
+            "{drawn}"
+        );
+        assert!(!drawn.contains("file 40.mp3"), "{drawn}");
+
+        assert!(app.update(press('G')));
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+        assert!(drawn.contains("file 40.mp3"), "{drawn}");
+        assert!(drawn.contains("esc to dismiss"), "{drawn}");
+    }
+
+    #[test]
+    fn colon_messages_lists_what_was_said_newest_first() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(100, 30);
+        app.notify(Level::Info, "the first thing");
+        app.notify(Level::Warn, "the second thing");
+        app.fail("the third thing went wrong");
+        app.update(key(KeyCode::Esc));
+        app.toasts.clear();
+
+        app.update(press(':'));
+        type_in(&mut app, "messages");
+        app.update(key(KeyCode::Enter));
+        assert!(matches!(app.views.last(), Some(View::Messages { .. })));
+
+        draw(&mut app, &mut terminal);
+        let rows = lines(&terminal);
+        let at = |needle: &str| {
+            rows.iter()
+                .position(|row| row.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} is not listed:\n{rows:#?}"))
+        };
+        let (third, second, first) = (
+            at("3 error the third thing went wrong"),
+            at("2 warn  the second thing"),
+            at("1 info  the first thing"),
+        );
+        assert!(third < second && second < first, "newest first:\n{rows:#?}");
+
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.views, vec![View::Browser]);
+    }
+
+    #[test]
+    fn a_long_toast_wraps_onto_more_rows_rather_than_being_cut() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(60, 15);
+        app.update(scanned(&fx));
+        app.toasts.clear();
+        draw(&mut app, &mut terminal);
+        let one_row = lines(&terminal);
+
+        let message =
+            "committed 20260924T224500Z-a3f1 — 14 file(s) moved, 2 playlist(s) · u to undo";
+        app.notify(Level::Info, message);
+        draw(&mut app, &mut terminal);
+        let rows = lines(&terminal);
+        let bottom = rows[rows.len() - 2..].join(" ");
+        assert_eq!(bottom, message, "the whole message, on two rows");
+        // The body gave up the row, rather than the toast drawing over it.
+        assert!(status_row(&app, &terminal).contains("marked"));
+        assert!(
+            one_row[one_row.len() - 2].contains("marked"),
+            "with one row of message, the bar was one row lower: {one_row:#?}"
+        );
+        assert_eq!(app.message_rows(60), 2);
+    }
+
+    #[test]
+    fn a_missing_music_dir_opens_the_first_run_screen_and_r_tries_again() {
+        let fx = Fixture::realistic();
+        let missing = fx.music_dir().join("not-yet");
+        let mut config = fx.config();
+        config.music_dir = missing.clone();
+        config.sources.music_dir = mpdfm_core::config::Source::MpdConf {
+            path: "/home/user/.config/mpd/mpd.conf".into(),
+            key: "music_directory",
+        };
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(config, KeyMap::defaults(), tx, Arc::new(Log::off()));
+        // The second candidate is a real file; the others do not exist.
+        let home = tempfile::tempdir().expect("a scratch home");
+        let mpdconf = camino::Utf8PathBuf::from_path_buf(home.path().join(".mpdconf"))
+            .expect("a UTF-8 temp path");
+        std::fs::write(&mpdconf, "music_directory \"~/Music\"\n").expect("a scratch file");
+        app.locate_config(Setup {
+            config_file: Some("/home/user/.config/mpdfm/config.toml".into()),
+            mpd_confs: vec![
+                "/nonexistent/.config/mpd/mpd.conf".into(),
+                mpdconf.clone(),
+                "/nonexistent/etc/mpd.conf".into(),
+            ],
+        });
+        let mut terminal = screen(100, 30);
+
+        app.rescan();
+        settle_until(&mut app, &rx, |app| app.no_library.is_some());
+        assert_eq!(
+            app.views,
+            vec![View::Browser],
+            "a screen, not an error panel"
+        );
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+        for needle in [
+            "no library",
+            "does not exist",
+            missing.as_str(),
+            "set by     /home/user/.config/mpd/mpd.conf (music_directory)",
+            "--music-dir",
+            "/home/user/.config/mpdfm/config.toml",
+            "/nonexistent/.config/mpd/mpd.conf",
+            &format!("{mpdconf}  ← the one MPD reads"),
+            "/nonexistent/etc/mpd.conf",
+            "R to scan again",
+            "mpdfm config show",
+        ] {
+            assert!(
+                drawn.contains(needle),
+                "{needle:?} is not on screen:\n{drawn}"
+            );
+        }
+        assert_eq!(
+            drawn.matches('←').count(),
+            1,
+            "only the file that exists is marked:\n{drawn}"
+        );
+
+        // The user fixes it, and `R` is all it takes.
+        std::fs::create_dir_all(missing.join("album")).expect("the fixture is ours");
+        std::fs::write(missing.join("album/01.mp3"), b"").expect("the fixture is ours");
+        app.update(press('R'));
+        settle_until(&mut app, &rx, |app| {
+            matches!(app.scan, ScanState::Done { .. })
+        });
+        assert_eq!(app.no_library, None);
+        draw(&mut app, &mut terminal);
+        assert!(!text(&terminal).contains("no library"));
+    }
+
+    #[test]
+    fn an_empty_music_dir_says_so_rather_than_showing_an_empty_pane() {
+        let fx = Fixture::builder().build();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(100, 30);
+        app.update(scanned(&fx));
+        assert!(matches!(app.no_library, Some(NoLibrary::Empty(_))));
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+        assert!(drawn.contains("There is no music in music_dir"), "{drawn}");
+        assert!(drawn.contains(fx.music_dir().as_str()), "{drawn}");
+    }
+
+    #[test]
+    fn esc_calls_a_scan_off_and_the_line_says_it_can() {
+        let fx = Fixture::realistic();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(100, 24);
+        app.update(scanned(&fx));
+        app.toasts.clear();
+
+        // A rescan in progress, with a report already in.
+        app.scan = ScanState::Running(Some(ScanProgress {
+            files: 1280,
+            dirs: 112,
+            dir: DirPath::parse("hiphop").expect("a dir"),
+        }));
+        draw(&mut app, &mut terminal);
+        let bottom = lines(&terminal).last().cloned().unwrap_or_default();
+        assert!(
+            bottom.starts_with("scanning… · 1280 files · 112 dirs · hiphop"),
+            "{bottom}"
+        );
+        assert!(bottom.ends_with("esc to stop"), "{bottom}");
+
+        assert!(app.update(key(KeyCode::Esc)));
+        assert!(
+            app.scan_cancel.load(Ordering::Relaxed),
+            "the worker's flag is set"
+        );
+        draw(&mut app, &mut terminal);
+        let bottom = lines(&terminal).last().cloned().unwrap_or_default();
+        assert!(bottom.starts_with("scanning: stopping…"), "{bottom}");
+        assert!(
+            !bottom.contains("to stop"),
+            "it is already stopping: {bottom}"
+        );
+
+        // The worker answers; the listing it had is kept.
+        app.update(Msg::ScanCancelled);
+        assert!(matches!(app.scan, ScanState::Done { .. }));
+        assert!(app.library.is_some());
+        let toast = app.toasts.back().expect("it says what happened");
+        assert!(toast.text.contains("scan called off"), "{}", toast.text);
+        assert!(toast.text.contains("R to scan again"), "{}", toast.text);
     }
 }

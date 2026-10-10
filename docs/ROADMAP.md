@@ -61,7 +61,7 @@ losing one malformed frame `lofty` will not re-emit. Numbers in task 17.
 | 23 | [Tag editor view](tasks/23-tagedit-view.md) | 16–18, 21, 22 | done |
 | 24 | [Pending ops view](tasks/24-pending-view.md) | 10–12, 20, 21 | done |
 | 25 | [Search and filter](tasks/25-search-and-filter.md) | 05, 16, 22 | done |
-| 26 | [Status bar, help, errors](tasks/26-tui-chrome.md) | 13, 20, 21 | not started |
+| 26 | [Status bar, help, errors](tasks/26-tui-chrome.md) | 13, 20, 21 | done |
 
 **M3 is done when:** the whole M1+M2 feature set is usable from the TUI, the
 pending view shows the same preview the CLI does, and the terminal is always
@@ -86,6 +86,14 @@ in 334 ms on a worker, with the slowest frame drawn during the walk at 192 µs. 
 hits are a flat listing the existing mark, stage and tag-edit keys work on
 unchanged, which is what makes "select every file with no genre, set genre" two
 keypresses.
+Task 26 closes M3 with the chrome: a status bar whose elision order is a
+declared list (and tested at every width from 60 to 200), help generated from
+the live keymap for every mode, a message line that wraps rather than truncates,
+`:messages`, an error panel with the path and the next step, a cancellable scan,
+and a first-run screen naming every place `music_dir` could have come from. The
+MPD indicator goes offline within one tick of the daemon stopping, against a real
+socket in a test, and a poll that never answers turns it off after two seconds
+without a second thread joining the first.
 
 ## M4 — Organize by template
 

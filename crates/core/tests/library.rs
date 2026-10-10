@@ -566,6 +566,54 @@ fn a_scan_reports_its_progress_as_it_goes_and_ends_on_the_total() {
     }
 }
 
+/// A scan can be called off, and a called-off scan returns no library at all
+/// rather than the part of the tree it had reached (task 26).
+#[test]
+fn a_scan_that_is_called_off_returns_nothing_rather_than_half_a_library() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let fx = Fixture::realistic();
+
+    // Set before the walk: it stops at the first entry.
+    let cancel = AtomicBool::new(true);
+    let mut calls = 0usize;
+    let library = Library::scan_cancellable(fx.music_dir(), &mut |_| calls += 1, &cancel)
+        .expect("the root exists, so this is not an error");
+    assert!(library.is_none(), "a cancelled walk is not a library");
+    assert_eq!(calls, 0);
+
+    // Not set: the same walk `scan` does.
+    let cancel = AtomicBool::new(false);
+    let library = Library::scan_cancellable(fx.music_dir(), &mut |_| {}, &cancel)
+        .expect("the fixture should scan")
+        .expect("nothing called it off");
+    assert_eq!(
+        library.len(),
+        Library::scan(fx.music_dir()).expect("scans").len()
+    );
+
+    // Set mid-walk, from the progress callback — which is on the walking
+    // thread, so this is exactly the moment a worker's flag would be seen.
+    let tracks: Vec<String> = (0..600).map(|n| format!("{n:03}.mp3")).collect();
+    let refs: Vec<&str> = tracks.iter().map(String::as_str).collect();
+    let fx = Fixture::builder().album("album", &refs).build();
+    let cancel = AtomicBool::new(false);
+    let library = Library::scan_cancellable(
+        fx.music_dir(),
+        &mut |_| cancel.store(true, Ordering::Relaxed),
+        &cancel,
+    )
+    .expect("the root exists");
+    assert!(
+        library.is_none(),
+        "the flag was seen after the first report"
+    );
+
+    // A missing root is still the error it always was.
+    let missing = fx.music_dir().join("no-such-dir");
+    assert!(Library::scan_cancellable(&missing, &mut |_| {}, &AtomicBool::new(false)).is_err());
+}
+
 /// The counterpart: a walk with nothing to report says nothing, rather than
 /// reporting a zero that would make a progress line flash up and vanish.
 #[test]

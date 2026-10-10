@@ -18,7 +18,9 @@
 //! Task 20 owns the shell the views live in and the one guarantee that is hard to
 //! add later — **the terminal is always restored**, see `terminal.rs` — task 21
 //! owns the vocabulary they dispatch through, task 22 the browser and task 23 the
-//! tag editor. Tasks 24–26 fill in the rest.
+//! tag editor. Tasks 24–26 fill in the rest: the pending view, search, and the
+//! chrome around all of them — the status bar, the help, the message line and
+//! the error panel.
 //!
 //! Task 23 is also where `work` grew the two jobs that *write* — a commit and an
 //! undo — for a stronger reason than responsiveness: a tag write copies the whole
@@ -75,11 +77,11 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use camino::{Utf8Path, Utf8PathBuf};
-use mpdfm_core::config::{Config, Env, keys_file_path};
+use mpdfm_core::config::{Config, Env, config_file_path, keys_file_path, mpd_conf_candidates};
 
 use crate::cli::Cli;
 use crate::output::Exit;
-use app::App;
+use app::{App, Setup};
 use event::Events;
 use log::Log;
 use terminal::TerminalGuard;
@@ -129,10 +131,10 @@ fn keys_path(cli: &Cli) -> Option<Utf8PathBuf> {
 ///
 /// If the log file cannot be opened, if the signal handlers cannot be installed,
 /// if the terminal cannot be taken, or if a draw fails. Nothing that happens to
-/// the *library* is an error here: a `music_directory` that does not exist opens
-/// the browser with an error panel on it, because the user's next move is to look
-/// at the configuration, and a TUI that refuses to start is a worse place to do
-/// that from than one that says what is wrong.
+/// the *library* is an error here: a `music_directory` that does not exist, or
+/// is empty, opens the first-run screen (task 26), because the user's next move
+/// is to look at the configuration, and a TUI that refuses to start is a worse
+/// place to do that from than one that says where the setting came from.
 pub fn run(cli: &Cli, config: &Config) -> Result<ExitCode> {
     // 1. The log, before there is anywhere else for a complaint to go.
     let log = Arc::new(match &cli.tui.log {
@@ -167,6 +169,15 @@ pub fn run(cli: &Cli, config: &Config) -> Result<ExitCode> {
     let (guard, mut screen) = TerminalGuard::enter(!cli.tui.no_alt_screen)?;
 
     let mut app = App::new(config.clone(), keymap, tx, Arc::clone(&log));
+    let env = Env::from_process();
+    app.locate_config(Setup {
+        config_file: cli
+            .globals
+            .config
+            .clone()
+            .or_else(|| config_file_path(&env)),
+        mpd_confs: mpd_conf_candidates(&env),
+    });
     app.report_key_warnings(&key_warnings);
     let result = app.run(&mut screen, &events);
 
