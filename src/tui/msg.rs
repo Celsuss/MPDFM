@@ -173,6 +173,14 @@ pub enum TaskOutcome {
     /// go — on a worker, with the form on screen saying what it is waiting for.
     Selection(Reads),
 
+    /// Every file the organize view was opened on was read (task 28).
+    ///
+    /// A selection like [`TaskOutcome::Selection`], but answered to a different
+    /// view and with a different rule: a file that would not read is not a
+    /// reason to refuse the rest, because organizing it would only have meant
+    /// moving it, and an unreadable file stays where it is.
+    Organize(Reads),
+
     /// A transaction was committed, or it was not.
     ///
     /// The thread that draws is never the thread that waits for a few hundred

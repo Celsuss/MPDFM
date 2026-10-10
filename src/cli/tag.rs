@@ -235,7 +235,7 @@ pub fn set(
 /// A path that is in the library but holds no audio is not an error; a path that
 /// is not in the library at all is, because the user named something that is not
 /// there.
-fn select(
+pub(super) fn select(
     cli: &Cli,
     library: &Library,
     paths: &[camino::Utf8PathBuf],
@@ -281,7 +281,12 @@ fn select(
 }
 
 /// Every audio file in `dir`, and below it when `recursive`.
-fn collect(library: &Library, dir: &DirPath, recursive: bool, into: &mut BTreeSet<RelPath>) {
+pub(super) fn collect(
+    library: &Library,
+    dir: &DirPath,
+    recursive: bool,
+    into: &mut BTreeSet<RelPath>,
+) {
     for entry in library.files_in(dir) {
         if entry.is_audio() {
             into.insert(entry.rel.clone());

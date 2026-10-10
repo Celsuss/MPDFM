@@ -217,7 +217,7 @@ fn decide(cli: &Cli, out: &Out, args: &MoveArgs, effects: &Effects) -> Result<Ve
 
 /// The lines after a successful commit: what happened, what to know, and how to
 /// put it back.
-fn print_committed(committed: &Committed, out: &Out) {
+pub(super) fn print_committed(committed: &Committed, out: &Out) {
     println!();
     for warning in &committed.warnings {
         println!("  {} {warning}", out.paint(Style::Yellow, "!"));
@@ -236,7 +236,7 @@ fn print_committed(committed: &Committed, out: &Out) {
 /// moved on from, or a plan with nothing in it. Every other
 /// [`CommitError`] stopped partway through and is a genuine failure with a
 /// recovery to run.
-fn refused_without_writing(err: &Error) -> bool {
+pub(super) fn refused_without_writing(err: &Error) -> bool {
     matches!(
         err,
         Error::Commit(

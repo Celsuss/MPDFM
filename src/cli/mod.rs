@@ -2,9 +2,7 @@
 //!
 //! One module per command, and this file is the switchboard: it parses the
 //! arguments, resolves the configuration **once** so that every command
-//! downstream shares one canonical library root, and dispatches. The one command
-//! that is not built yet — `organize`, task 28 — reports `not implemented` and
-//! the task that owns it, rather than panicking.
+//! downstream shares one canonical library root, and dispatches.
 //!
 //! [`crate::output`] holds the exit codes and the output mode, because those are
 //! a contract shared by every command rather than a detail of any one of them.
@@ -14,6 +12,7 @@ mod doctor;
 #[path = "move.rs"]
 mod r#move;
 mod mpd;
+mod organize;
 mod scan;
 mod tag;
 mod undo;
@@ -23,7 +22,6 @@ use std::process::ExitCode;
 use anyhow::{Context as _, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{ArgAction, Args, Parser, Subcommand};
-use mpdfm_core::Error;
 use mpdfm_core::config::{ConfigWarning, Env, Overrides};
 use mpdfm_core::paths::{self, RelPath};
 
@@ -140,17 +138,8 @@ pub enum Command {
     /// Move or rename a file or directory, rewriting every reference to it.
     Move(MoveArgs),
 
-    /// Re-file tracks into template-derived paths.
-    Organize {
-        /// Subtree to organize (default: the whole library).
-        path: Option<Utf8PathBuf>,
-        /// Path template, e.g. "{genre}/{albumartist}/{year} - {album}/{track:02} {title}".
-        #[arg(long, short = 't', value_name = "TEMPLATE")]
-        template: String,
-        /// Show the preview and write nothing.
-        #[arg(long)]
-        dry_run: bool,
-    },
+    /// Re-file tracks into template-derived paths, rewriting every reference.
+    Organize(OrganizeArgs),
 
     /// Read and write audio tags.
     Tag {
@@ -191,6 +180,51 @@ pub struct MoveArgs {
     /// what does not collide. Nothing is ever overwritten either way.
     #[arg(long)]
     pub merge: bool,
+
+    /// Hash every cross-device copy and read it back. Costs a second read of
+    /// each copied file.
+    #[arg(long)]
+    pub verify: bool,
+}
+
+/// `mpdfm organize [PATH]...`
+///
+/// Each `PATH` is a file or a directory, relative to the music directory or
+/// absolute inside it; a directory means every audio file below it. No `PATH`
+/// means the whole library. Files the template cannot place — a tag it needs is
+/// missing — are left where they are and listed at the end.
+#[derive(Debug, Args)]
+pub struct OrganizeArgs {
+    /// Files or directories to organize (default: the whole library).
+    pub paths: Vec<Utf8PathBuf>,
+
+    /// Path template (default: `organize_template` from the config), e.g.
+    /// "{genre}/{albumartist}/{year} - {album}/{track:02} {title}".
+    #[arg(long, short = 't', value_name = "TEMPLATE")]
+    pub template: Option<String>,
+
+    /// Show the preview and write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Skip the confirmation prompt. Required when stdin is not a terminal.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+
+    /// Only move files whose tags are complete for the template — no `{x?}`
+    /// segment left out, no `{x|default}` used — and that are not already in
+    /// place. The incremental way to work through a large library.
+    #[arg(long)]
+    pub only_missing: bool,
+
+    /// Move the tracks only; cover art, .nfo, .cue and other aux files stay
+    /// where they are.
+    #[arg(long)]
+    pub no_aux: bool,
+
+    /// Stage at most N tracks' worth of moves, for a cautious first run.
+    #[arg(long, value_name = "N")]
+    pub limit: Option<std::num::NonZeroUsize>,
 
     /// Hash every cross-device copy and read it back. Costs a second read of
     /// each copied file.
@@ -484,34 +518,22 @@ pub fn run() -> Result<ExitCode> {
     // than the confirmation prompt did about whether anyone is listening.
     let out = Out::detect(cli.globals.json);
 
-    let (what, task) = match command {
+    match command {
         Command::Config { command } => match command {
-            ConfigCommand::Show => return config::show(&cli, &settings, &warnings),
+            ConfigCommand::Show => config::show(&cli, &settings, &warnings),
         },
-        Command::Scan => return scan::run(&cli, &settings, &out),
-        Command::Doctor => return doctor::run(&cli, &settings, &out),
-        Command::Move(args) => return r#move::run(&cli, &settings, &out, args),
-        Command::Undo(args) => return undo::run(&cli, &settings, &out, args),
-        Command::Recover(args) => return undo::recover(&cli, &settings, &out, args),
-        Command::Organize {
-            path,
-            template,
-            dry_run,
-        } => {
-            let path = path.as_deref().map_or(".", Utf8Path::as_str);
-            cli.trace(format!(
-                "organize {path} as {template:?} (dry_run={dry_run})"
-            ));
-            ("mpdfm organize", "28-organize-command.md")
-        }
+        Command::Scan => scan::run(&cli, &settings, &out),
+        Command::Doctor => doctor::run(&cli, &settings, &out),
+        Command::Move(args) => r#move::run(&cli, &settings, &out, args),
+        Command::Organize(args) => organize::run(&cli, &settings, &out, args),
+        Command::Undo(args) => undo::run(&cli, &settings, &out, args),
+        Command::Recover(args) => undo::recover(&cli, &settings, &out, args),
         Command::Tag { command } => match command {
-            TagCommand::Show(args) => return tag::show(&cli, &settings, &out, args),
-            TagCommand::Set(args) => return tag::set(&cli, &settings, &out, args, false),
-            TagCommand::Diff(args) => return tag::set(&cli, &settings, &out, args, true),
+            TagCommand::Show(args) => tag::show(&cli, &settings, &out, args),
+            TagCommand::Set(args) => tag::set(&cli, &settings, &out, args, false),
+            TagCommand::Diff(args) => tag::set(&cli, &settings, &out, args, true),
         },
-    };
-
-    Err(Error::not_implemented(what, task).into())
+    }
 }
 
 /// Turn a `SRC`/`DST` argument into a path relative to the music directory.

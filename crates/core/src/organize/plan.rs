@@ -30,6 +30,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use super::sanitize::NameRules;
 use super::template::{RenderContext, Template, Unplaceable};
 use crate::library::{AlbumDir, DirPath, Library};
+use crate::ops::Operation;
 use crate::paths::RelPath;
 use crate::tags::TagSet;
 
@@ -159,6 +160,33 @@ impl Mapping {
             Warning::Unplaceable { path, reason } => Some((path, reason)),
             _ => None,
         })
+    }
+
+    /// The moves as operations for a [`Plan`][crate::ops::Plan], one
+    /// [`Operation::MoveFile`] per file, aux files included only if `aux`.
+    ///
+    /// Per file and never a [`Operation::MoveDir`], even for an album that
+    /// moves whole: the mapping has already decided where every aux file goes
+    /// (and that a `Scans/` subdirectory goes too), so a directory move would
+    /// only be a second, coarser opinion — one that would also sweep up a file
+    /// the scan could not model. Task 28 then validates and commits these like
+    /// any other plan.
+    #[must_use]
+    pub fn operations(&self, aux: bool) -> Vec<Operation> {
+        self.moves
+            .iter()
+            .filter(|m| aux || !m.aux)
+            .map(|m| Operation::MoveFile {
+                from: m.from.clone(),
+                to: m.to.clone(),
+            })
+            .collect()
+    }
+
+    /// How many tracks (not aux files) move.
+    #[must_use]
+    pub fn tracks_moving(&self) -> usize {
+        self.moves.iter().filter(|m| !m.aux).count()
     }
 
     /// The destination of `from`, if it moves.

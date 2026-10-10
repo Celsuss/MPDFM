@@ -75,6 +75,7 @@ use mpdfm_core::config::{Config, RootProblem};
 use mpdfm_core::library::{DirPath, Library, ScanProgress};
 use mpdfm_core::ops::commit::Progress;
 use mpdfm_core::ops::{Effects, Live, Operation, Plan};
+use mpdfm_core::organize::{self, Conflict as Collision, NameRules};
 use mpdfm_core::paths::RelPath;
 use mpdfm_core::playlist::PlaylistIndex;
 use mpdfm_core::query::{self, FindProgress, Query};
@@ -96,6 +97,7 @@ use super::msg::{
 use super::terminal::{MIN_SIZE, fits};
 use super::views::browser::{Browser, Enter, Pane, Results, Sort, TreeRow};
 use super::views::error::ErrorReport;
+use super::views::organize::Organize;
 use super::views::pending::{self, Pending, Report};
 use super::views::search::{Finding, Kind, Prompt};
 use super::views::tagedit::{Begin, FileAction, Hints, Preview, Started, TagEdit};
@@ -229,6 +231,12 @@ pub enum View {
     /// what makes staged operations survive `esc` and a resize — popping this
     /// view throws away a cursor and some folds, and nothing else.
     Pending(Box<Pending>),
+    /// The template line and where the first files would go. Task 28.
+    ///
+    /// Boxed because it holds every selected file's tags — a whole-library
+    /// organize is 2 800 `TagSet`s. Its `enter` stages into
+    /// [`View::Pending`], which is where the plan is read and committed.
+    Organize(Box<Organize>),
     /// The key help, generated from the live keymap (`widgets::help`): every
     /// mode's bindings, the one it was opened from first.
     Help {
@@ -292,6 +300,7 @@ impl View {
                 | Self::Error(_)
                 | Self::TagEdit(_)
                 | Self::Pending(_)
+                | Self::Organize(_)
         )
     }
 
@@ -301,6 +310,7 @@ impl View {
             Self::Browser => "browser",
             Self::TagEdit(_) => "tagedit",
             Self::Pending(_) => "pending",
+            Self::Organize(_) => "organize",
             Self::Help { .. } => "help",
             Self::Command(_) => "command",
             Self::Search(_) => "search",
@@ -737,7 +747,10 @@ impl App {
     /// [`Mode::Browser`] and then has its keys filtered in [`App::dispatch`].
     fn mode(&self) -> Mode {
         match self.views.last() {
-            Some(View::Command(_)) => Mode::Command,
+            // The template is a line of text, edited exactly as the `:` line
+            // is — so it takes that line's bindings, and every letter, being
+            // unbound there, types itself (`on_unbound`).
+            Some(View::Command(_) | View::Organize(_)) => Mode::Command,
             Some(View::Search(_)) => Mode::Search,
             Some(View::TagEdit(_)) => Mode::TagEdit,
             Some(View::Pending(_)) => Mode::Pending,
@@ -786,6 +799,13 @@ impl App {
         };
         match self.views.last_mut() {
             Some(View::Command(line)) => line.insert(c),
+            // And into the template, which re-renders the preview.
+            Some(View::Organize(view)) => {
+                let Some(library) = &self.library else {
+                    return false;
+                };
+                view.insert(c, library, NameRules::from_config(&self.config))
+            }
             // A character typed into the search line re-runs the search, which
             // is the whole of "matches as you type".
             Some(View::Search(prompt)) => {
@@ -863,6 +883,12 @@ impl App {
         // itself. What it does not claim — the help, quitting — falls through to
         // the panel rules below, which is how `?` opens the help over a form.
         if let Some(dirty) = self.tagedit_action(action) {
+            return dirty;
+        }
+
+        // The organize line claims the editing verbs and `enter`; the help and
+        // quitting fall through to the panel rules below.
+        if let Some(dirty) = self.organize_action(action) {
             return dirty;
         }
 
@@ -966,8 +992,7 @@ impl App {
             Action::SearchNext => self.step_search(true),
             Action::SearchPrev => self.step_search(false),
 
-            // -- the views that are not built yet ---------------------------
-            Action::Organize => self.not_yet(action.help(), Some("28-organize-command.md")),
+            Action::Organize => self.open_organize(None),
 
             // -- only meaningful inside the tag editor ----------------------
             Action::EditField
@@ -1448,6 +1473,176 @@ impl App {
         );
         self.notify(Level::Info, format!("undoing {what}…"));
         true
+    }
+
+    // -- organize -------------------------------------------------------------
+
+    /// The organize view on the stack, if it is on top.
+    fn organize_view(&self) -> Option<&Organize> {
+        match self.views.last() {
+            Some(View::Organize(view)) => Some(view),
+            _ => None,
+        }
+    }
+
+    /// `o`, and `:organize <template>`: open the organize view on the marks,
+    /// the row under the cursor, or — with neither — the directory on screen.
+    ///
+    /// Directories mean everything below them, as `mpdfm organize hiphop/`
+    /// does. The tags are read on a worker ([`TaskOutcome::Organize`]); the
+    /// view opens at once, with the configured template on its line.
+    fn open_organize(&mut self, template: Option<String>) -> bool {
+        let Some(library) = &self.library else {
+            return false;
+        };
+        let files = organize_targets(&self.browser, library);
+        if files.is_empty() {
+            self.notify(
+                Level::Warn,
+                "nothing to organize: no audio files are marked, under the cursor, or in this directory",
+            );
+            return true;
+        }
+        let template = template.unwrap_or_else(|| self.config.organize_template.clone());
+        self.log
+            .line(format!("organize: opening on {} file(s)", files.len()));
+        let root = library.root().to_path_buf();
+        work::read_organize(self.tx.clone(), files.clone(), root, Arc::clone(&self.log));
+        self.push(View::Organize(Box::new(Organize::opening(
+            files, &template,
+        ))))
+    }
+
+    /// The organize view's tags have been read.
+    fn on_organize_read(&mut self, reads: Reads) -> bool {
+        let rules = NameRules::from_config(&self.config);
+        let Some(library) = &self.library else {
+            return false;
+        };
+        // The user may have left while the read was out.
+        let Some(View::Organize(view)) = self.views.last_mut() else {
+            return false;
+        };
+        view.arrived(reads, library, rules);
+        true
+    }
+
+    /// The organize view's share of the actions: editing the line, `enter` and
+    /// `esc`. `None` when it is not on top or does not want this one.
+    fn organize_action(&mut self, action: Action) -> Option<bool> {
+        self.organize_view()?;
+        let rules = NameRules::from_config(&self.config);
+        if action == Action::Submit {
+            return Some(self.submit_organize());
+        }
+        let library = self.library.as_ref()?;
+        let Some(View::Organize(view)) = self.views.last_mut() else {
+            return None;
+        };
+        Some(match action {
+            Action::Left => view.left(),
+            Action::Right => view.right(),
+            Action::DeleteChar => view.backspace(library, rules),
+            Action::ClearLine => view.clear(library, rules),
+            _ => return None,
+        })
+    }
+
+    /// `enter` in the organize view: map the whole selection and stage it.
+    ///
+    /// Collisions refuse the lot, with both sources named, and leave the view
+    /// open so the template can be changed: the mapping has already dropped
+    /// the colliding files from its moves, so staging the rest would commit a
+    /// plan that silently leaves them behind. Everything else goes to the
+    /// pending view, where the full diff is read and committed.
+    fn submit_organize(&mut self) -> bool {
+        let Some(view) = self.organize_view() else {
+            return false;
+        };
+        let template = match view.template() {
+            Ok(template) => template.clone(),
+            Err(err) => {
+                self.notify(
+                    Level::Warn,
+                    format!("the template does not parse: {}", err.kind),
+                );
+                return true;
+            }
+        };
+        let Some(tracks) = view.tracks() else {
+            self.notify(Level::Info, "still reading tags — a moment");
+            return true;
+        };
+        let Some(library) = &self.library else {
+            return false;
+        };
+        let unreadable = view.unreadable().len();
+        let options = organize::Options {
+            rules: NameRules::from_config(&self.config),
+            ..organize::Options::default()
+        };
+        let started = Instant::now();
+        let mapping = organize::map(&template, library, tracks, &options);
+        self.log.line(format!(
+            "organize: mapped {} file(s) in {} ms: {} move(s), {} in place, {} conflict(s)",
+            tracks.len(),
+            started.elapsed().as_millis(),
+            mapping.moves.len(),
+            mapping.in_place.len(),
+            mapping.conflicts.len()
+        ));
+
+        if !mapping.is_committable() {
+            let mut text = format!(
+                "{} destination(s) would be taken twice, so nothing was staged:\n",
+                mapping.conflicts.len()
+            );
+            for conflict in &mapping.conflicts {
+                match conflict {
+                    Collision::Collision { to, sources } => {
+                        text.push_str(&format!("\n  {to}\n"));
+                        for source in sources {
+                            text.push_str(&format!("    ← {source}\n"));
+                        }
+                    }
+                    Collision::Occupied { .. } => text.push_str(&format!("\n  {conflict}\n")),
+                }
+            }
+            self.fail(
+                ErrorReport::new(text)
+                    .next("change the template so these differ, or tag the files apart, and press enter again"),
+            );
+            return true;
+        }
+
+        let unplaceable = mapping.unplaceable().count() + unreadable;
+        for (path, reason) in mapping.unplaceable() {
+            self.log.line(format!("organize: stays: {path}: {reason}"));
+        }
+        let ops = mapping.operations(true);
+        if ops.is_empty() {
+            self.notify(
+                Level::Info,
+                format!(
+                    "nothing to move: {} already in place, {unplaceable} cannot be placed",
+                    mapping.in_place.len()
+                ),
+            );
+            return true;
+        }
+
+        self.views.pop();
+        let dirty = self.stage(ops, "organize");
+        if unplaceable > 0 {
+            let plural = if unplaceable == 1 { "" } else { "s" };
+            self.notify(
+                Level::Warn,
+                format!(
+                    "{unplaceable} file{plural} cannot be placed and stay where they are — `mpdfm organize --dry-run` lists them by album"
+                ),
+            );
+        }
+        dirty
     }
 
     // -- staging, and the view that shows what is staged -------------------
@@ -2068,10 +2263,7 @@ impl App {
                 Action::Quit
             }),
             Command::Move { dst } => self.stage_move_to(&dst),
-            Command::Organize { template } => self.not_yet(
-                format!("organize by {template}"),
-                Some("28-organize-command.md"),
-            ),
+            Command::Organize { template } => self.open_organize(Some(template)),
             Command::Find { query } => match query::parse(&query) {
                 Ok(parsed) => self.start_find(parsed),
                 // The line is already closed by the time a command runs, so this
@@ -2845,6 +3037,7 @@ impl App {
                 filled || moved
             }
             TaskOutcome::Selection(reads) => self.on_selection(reads),
+            TaskOutcome::Organize(reads) => self.on_organize_read(reads),
             TaskOutcome::Found(outcome) => self.on_found(*outcome),
             TaskOutcome::Committed(result) => self.on_committed(result),
             TaskOutcome::Undone(result) => self.on_undone(result),
@@ -3418,6 +3611,7 @@ impl App {
             View::Help { mode, scroll } => self.render_help(*mode, *scroll, body, frame),
             View::TagEdit(form) => self.render_tagedit(form, body, frame),
             View::Pending(view) => self.render_pending(view, body, frame),
+            View::Organize(view) => self.render_organize(view, body, frame),
             View::Confirm(confirm) => panel(
                 " confirm ",
                 &format!("{}\n\ny to quit · n or esc to stay", confirm.question),
@@ -3501,6 +3695,37 @@ impl App {
 
         if let Some(preview) = form.preview() {
             self.render_preview(preview, body, frame, &hints);
+        }
+    }
+
+    /// The organize view: the template, and where the first files would go.
+    ///
+    /// The whole body, like the tag editor: twenty preview rows do not fit in
+    /// a centred box on a 24-row terminal.
+    fn render_organize(&self, view: &Organize, body: Rect, frame: &mut ratatui::Frame) {
+        let key = |action| self.keys.map().key_for(Mode::Command, action);
+        let footer = view.footer(key(Action::Submit), key(Action::Cancel));
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(Color::Cyan))
+            .title(fit(&view.title(), inner_width(body)))
+            .title_bottom(fit(&footer, inner_width(body)));
+        let inner = block.inner(body);
+        frame.render_widget(Clear, body);
+        frame.render_widget(block, body);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let cells = usize::from(inner.width);
+        Paragraph::new(view.lines(cells)).render(inner, frame.buffer_mut());
+        if matches!(self.views.last(), Some(View::Organize(_))) {
+            let (column, row) = view.caret(cells);
+            frame.set_cursor_position((
+                inner
+                    .x
+                    .saturating_add(column.min(inner.width.saturating_sub(1))),
+                inner.y.saturating_add(row),
+            ));
         }
     }
 
@@ -3971,6 +4196,40 @@ fn tag_targets(browser: &Browser, library: &Library) -> (Vec<RelPath>, usize) {
     files.sort_unstable();
     files.dedup();
     (files, skipped)
+}
+
+/// What `o` organizes: the marks, or the row under the cursor, or the
+/// directory on screen — with every directory among them expanded to all the
+/// audio below it. Sorted and deduplicated.
+fn organize_targets(browser: &Browser, library: &Library) -> Vec<RelPath> {
+    let mut marks = browser.marks();
+    if marks.is_empty() {
+        marks.extend(browser.focused_path(library));
+    }
+    let mut dirs: Vec<DirPath> = Vec::new();
+    let mut files: Vec<RelPath> = Vec::new();
+    if marks.is_empty() {
+        dirs.push(browser.dir().clone());
+    }
+    for rel in marks {
+        match library.get(&rel) {
+            Some(entry) if entry.is_audio() => files.push(rel),
+            Some(_) => {}
+            None => dirs.extend(DirPath::parse(rel.as_str()).ok()),
+        }
+    }
+    while let Some(dir) = dirs.pop() {
+        files.extend(
+            library
+                .files_in(&dir)
+                .filter(|entry| entry.is_audio())
+                .map(|entry| entry.rel.clone()),
+        );
+        dirs.extend(library.subdirs_in(&dir).iter().cloned());
+    }
+    files.sort_unstable();
+    files.dedup();
+    files
 }
 
 /// The operation that moves `from` to `to`: a file move, or a directory's.
@@ -5049,25 +5308,191 @@ mod tests {
         }
     }
 
+    // -- task 28: organize ----------------------------------------------------
+
+    /// Open the organize view on everything in `dir` and wait for its tags.
+    fn open_organize(app: &mut App, rx: &mpsc::Receiver<Msg>, dir: &str) {
+        in_dir(app, dir);
+        app.dispatch(Action::MarkAll);
+        assert!(app.update(press('o')), "`o` opens the organize view");
+        assert!(matches!(app.views.last(), Some(View::Organize(_))));
+        settle_until(app, rx, |app| {
+            app.organize_view().is_some_and(|view| !view.is_reading())
+        });
+    }
+
+    /// Replace the template line with `template`, a key at a time.
+    fn type_template(app: &mut App, template: &str) {
+        app.update(Msg::Input(Event::Key(KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+        ))));
+        for c in template.chars() {
+            app.update(press(c));
+        }
+    }
+
+    fn two_identical_tracks() -> Fixture {
+        // The fixture's mp3s all carry one set of tags, so under the default
+        // template these two collide, and under `{filename}` they do not.
+        Fixture::builder()
+            .album("hiphop/Twins", &["a.mp3", "b.mp3"])
+            .build()
+    }
+
     #[test]
-    fn an_action_this_task_does_not_implement_names_the_task_that_does() {
-        let fx = Fixture::realistic();
+    fn the_organize_view_previews_live_as_the_template_is_typed() {
+        let fx = two_identical_tracks();
+        let (mut app, rx) = app(&fx);
+        let mut terminal = screen(100, 30);
+        app.update(scanned(&fx));
+        open_organize(&mut app, &rx, "hiphop/Twins");
+
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+        assert!(drawn.contains("organize · 2 files"), "{drawn}");
+        assert!(
+            drawn.contains("→ Hip-Hop/MF DOOM/2004 - Mm..Food/01 Beef Rap.mp3"),
+            "the configured template, rendered: {drawn}"
+        );
+
+        // `j` and `q` are letters here, not a cursor and a way out.
+        type_template(&mut app, "{album}/q{filename}j");
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+        assert!(drawn.contains("→ Mm..Food/qaj.mp3"), "{drawn}");
+        assert!(drawn.contains("→ Mm..Food/qbj.mp3"), "{drawn}");
+        assert!(app.plan.is_empty(), "typing stages nothing");
+    }
+
+    #[test]
+    fn an_invalid_template_shows_an_inline_error_and_stages_nothing() {
+        let fx = two_identical_tracks();
+        let (mut app, rx) = app(&fx);
+        let mut terminal = screen(100, 30);
+        app.update(scanned(&fx));
+        open_organize(&mut app, &rx, "hiphop/Twins");
+
+        type_template(&mut app, "{album/{filename}");
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+        assert!(drawn.contains("^ unclosed `{`"), "{drawn}");
+        assert!(!drawn.contains("→ "), "no stale preview: {drawn}");
+
+        app.update(key(KeyCode::Enter));
+        assert!(app.plan.is_empty());
+        assert!(matches!(app.views.last(), Some(View::Organize(_))));
+    }
+
+    #[test]
+    fn a_collision_refuses_to_stage_and_names_both_sources() {
+        let fx = two_identical_tracks();
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+        open_organize(&mut app, &rx, "hiphop/Twins");
+
+        app.update(key(KeyCode::Enter));
+        assert!(app.plan.is_empty(), "nothing was staged");
+        let Some(View::Error(report)) = app.views.last() else {
+            panic!("an error panel, not {:?}", app.views.last());
+        };
+        let shown: String = report
+            .lines(200)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(shown.contains("hiphop/Twins/a.mp3"), "{shown}");
+        assert!(shown.contains("hiphop/Twins/b.mp3"), "{shown}");
+
+        // Dismissed, the template is still there to be fixed.
+        app.update(key(KeyCode::Esc));
+        assert!(matches!(app.views.last(), Some(View::Organize(_))));
+    }
+
+    #[test]
+    fn enter_stages_the_organize_into_the_pending_view() {
+        let fx = two_identical_tracks();
+        let (mut app, rx) = app(&fx);
+        app.update(scanned(&fx));
+        open_organize(&mut app, &rx, "hiphop/Twins");
+
+        type_template(&mut app, "{album}/{filename}");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.plan.len(), 2, "one move per file");
+        assert!(pending_view(&app).effects().is_committable());
+        assert!(
+            app.plan
+                .ops()
+                .iter()
+                .any(|op| op.destination().map(RelPath::as_str) == Some("Mm..Food/a.mp3"))
+        );
+    }
+
+    #[test]
+    fn colon_organize_opens_the_view_with_that_template() {
+        let fx = two_identical_tracks();
         let (mut app, _rx) = app(&fx);
         app.update(scanned(&fx));
-        app.toasts.clear();
-
-        assert!(app.update(press('o')), "`o` is bound to organize");
-        let toast = app.toasts.front().expect("it should say something");
-        assert!(toast.text.contains("organize"), "{}", toast.text);
-        assert!(
-            toast.text.contains("28-organize-command.md"),
-            "{}",
-            toast.text
-        );
+        in_dir(&mut app, "hiphop/Twins");
+        app.run_command(command::Command::Organize {
+            template: "{album}/{filename}".to_owned(),
+        });
+        let view = app.organize_view().expect("the organize view is open");
         assert_eq!(
-            toast.level,
-            Level::Warn,
-            "a key that did nothing is a surprise, not news"
+            view.template().map(organize::Template::as_str).ok(),
+            Some("{album}/{filename}")
+        );
+    }
+
+    /// The acceptance criterion at scale: 2 000 tracks staged by one `enter`,
+    /// then scrolled through a frame at a time.
+    #[test]
+    fn a_two_thousand_file_organize_stages_and_scrolls_without_stalling() {
+        let names: Vec<String> = (1..=10).map(|n| format!("{n:02} t.mp3")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut builder = Fixture::builder();
+        for album in 0..200 {
+            builder = builder.album(&format!("bulk/A{album:03}"), &names);
+        }
+        let fx = builder.build();
+        let (mut app, rx) = app(&fx);
+        let mut terminal = screen(120, 40);
+        app.update(scanned(&fx));
+        open_organize(&mut app, &rx, "bulk");
+        type_template(&mut app, "{genre}/{original_dir}/{filename}");
+
+        let started = Instant::now();
+        app.update(key(KeyCode::Enter));
+        let staging = started.elapsed();
+        assert_eq!(app.plan.len(), 2_000);
+
+        let frames = 200;
+        let started = Instant::now();
+        for _ in 0..frames {
+            app.update(press('j'));
+            draw(&mut app, &mut terminal);
+        }
+        let each = started.elapsed() / frames;
+        eprintln!(
+            "2 000-op organize: staged in {} ms, {} µs per frame ({} build)",
+            staging.as_millis(),
+            each.as_micros(),
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }
+        );
+        assert!(
+            each < Duration::from_millis(50),
+            "{} µs per frame is not smooth scrolling",
+            each.as_micros()
         );
     }
 
