@@ -16,6 +16,7 @@
 //! [`Library::indices_in`] and asks for tags for those alone.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -634,7 +635,7 @@ impl Library {
     /// Only if `root` itself is missing or is not a directory. Every other
     /// problem is a [`ScanWarning`].
     pub fn scan(root: &Utf8Path) -> crate::Result<Self> {
-        super::scan::scan(root, &mut |_| {})
+        Self::scan_reporting(root, &mut |_| {})
     }
 
     /// [`Library::scan`], reporting how far it has got as it goes.
@@ -653,7 +654,28 @@ impl Library {
         root: &Utf8Path,
         progress: &mut dyn FnMut(&ScanProgress),
     ) -> crate::Result<Self> {
-        super::scan::scan(root, progress)
+        let never = AtomicBool::new(false);
+        let library = super::scan::scan(root, progress, &never)?;
+        Ok(library.expect("a scan nobody can cancel ran to the end"))
+    }
+
+    /// [`Library::scan_reporting`], which stops when `cancel` is set.
+    ///
+    /// `Ok(None)` means it was called off, and nothing is returned for the part
+    /// of the tree it had walked: half a library is a model a move would trust to
+    /// know every file that references it. The flag is shared rather than sent
+    /// because the walk is one synchronous call on a thread that is not listening
+    /// for messages — the same reason a commit's cancel is an `AtomicBool`.
+    ///
+    /// # Errors
+    ///
+    /// The same one [`Library::scan`] raises, for the same reason.
+    pub fn scan_cancellable(
+        root: &Utf8Path,
+        progress: &mut dyn FnMut(&ScanProgress),
+        cancel: &AtomicBool,
+    ) -> crate::Result<Option<Self>> {
+        super::scan::scan(root, progress, cancel)
     }
 
     /// Assemble a library from what the walk collected: sort the entries into a

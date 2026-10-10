@@ -60,6 +60,9 @@ pub enum Command {
     },
     /// `:doctor` — the library and playlist health report.
     Doctor,
+    /// `:messages` — everything the message line has said this session, and
+    /// every error, whole (task 26).
+    Messages,
     /// `:set <k>=<v>` — change a setting for this session.
     Set {
         /// The setting's name, as `config.toml` spells it.
@@ -124,6 +127,7 @@ pub const USAGE: &[(&str, &str)] = &[
     ("find <query>", "search the whole library"),
     ("undo [txid]", "reverse a committed transaction"),
     ("doctor", "library and playlist health"),
+    ("messages", "everything said this session, errors included"),
     ("set <k>=<v>", "change a setting for this session"),
     ("q", "quit, asking if ops are pending"),
     ("q!", "quit, discarding pending ops"),
@@ -210,6 +214,11 @@ pub fn parse(line: &str) -> Result<Command, CommandError> {
             nothing("no arguments")?;
             Ok(Command::Doctor)
         }
+        // `mes` is vim's own abbreviation, and the one a vim user will type.
+        "messages" | "mes" => {
+            nothing("no arguments")?;
+            Ok(Command::Messages)
+        }
         "set" => {
             let (key, value) = rest.split_once('=').ok_or(CommandError::BadSetting)?;
             let (key, value) = (key.trim(), value.trim());
@@ -244,6 +253,7 @@ fn name_of(typed: &str) -> &'static str {
         "find" | "f" => "find",
         "undo" => "undo",
         "doctor" => "doctor",
+        "messages" | "mes" => "messages",
         "set" => "set",
         _ => "quit",
     }
@@ -386,6 +396,12 @@ mod tests {
             })
         );
         assert_eq!(parse("doctor"), Ok(Command::Doctor));
+        assert_eq!(parse("messages"), Ok(Command::Messages));
+        assert_eq!(parse("mes"), Ok(Command::Messages), "vim's abbreviation");
+        assert_eq!(
+            parse("messages 3").unwrap_err().to_string(),
+            "messages takes no arguments"
+        );
         assert_eq!(
             parse("set backup_keep=20"),
             Ok(Command::Set {

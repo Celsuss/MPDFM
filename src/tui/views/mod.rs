@@ -7,6 +7,7 @@
 //! | `tagedit` | the tag editor — the selection, what was typed into it, what that would write |
 //! | `pending` | the staged plan — what is about to happen, folded and unfolded |
 //! | `search` | the pattern being typed, and a library-wide walk in flight |
+//! | `error` | something that went wrong, the path it is about, and what to do next |
 //!
 //! The shape they all follow is the one `browser` sets:
 //!
@@ -20,6 +21,7 @@
 //!   `update`, never in `render`.
 
 pub mod browser;
+pub mod error;
 pub mod pending;
 pub mod search;
 pub mod tagedit;

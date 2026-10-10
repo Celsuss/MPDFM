@@ -73,8 +73,15 @@ const MPD_POLL_TIMEOUT: Duration = Duration::from_millis(250);
 /// Walk the library and load the playlist index, reporting progress as it goes.
 ///
 /// Sends [`Msg::Progress`] every few hundred files and exactly one
-/// [`Msg::ScanDone`] at the end, whatever happened.
-pub fn scan(tx: Sender<Msg>, music_dir: Utf8PathBuf, playlist_dir: Utf8PathBuf, log: Arc<Log>) {
+/// [`Msg::ScanDone`] at the end, whatever happened — or, when `cancel` was set
+/// before the walk finished, exactly one [`Msg::ScanCancelled`] instead.
+pub fn scan(
+    tx: Sender<Msg>,
+    music_dir: Utf8PathBuf,
+    playlist_dir: Utf8PathBuf,
+    cancel: Arc<AtomicBool>,
+    log: Arc<Log>,
+) {
     // Kept behind, because the thread takes the original: a scan that will not
     // start has to be answered too, or the app waits for a `ScanDone` forever.
     let fallback = tx.clone();
@@ -88,15 +95,24 @@ pub fn scan(tx: Sender<Msg>, music_dir: Utf8PathBuf, playlist_dir: Utf8PathBuf, 
             // does nothing but forward. `scan_reporting` is synchronous; this is
             // the thread it is synchronous on.
             let progress_tx = tx.clone();
-            let library = Library::scan_reporting(&music_dir, &mut |progress| {
-                // A full channel is not possible (it is unbounded) and a closed
-                // one means the UI has gone; either way there is nothing to do
-                // but carry on and let the final send fail too.
-                let _ = progress_tx.send(Msg::Progress(progress.clone()));
-            });
+            let library = Library::scan_cancellable(
+                &music_dir,
+                &mut |progress| {
+                    // A full channel is not possible (it is unbounded) and a
+                    // closed one means the UI has gone; either way there is
+                    // nothing to do but carry on and let the final send fail too.
+                    let _ = progress_tx.send(Msg::Progress(progress.clone()));
+                },
+                &cancel,
+            );
 
             let outcome = match library {
-                Ok(library) => {
+                Ok(None) => {
+                    log.line("scan: called off");
+                    let _ = tx.send(Msg::ScanCancelled);
+                    return;
+                }
+                Ok(Some(library)) => {
                     log.line(format!(
                         "scan: {} files in {} dirs, {} warnings",
                         library.len(),
