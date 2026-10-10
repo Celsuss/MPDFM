@@ -4,6 +4,7 @@
 //! | --- | --- |
 //! | `filelist` | the listing: a window of rows, marks, flags, duration, bitrate |
 //! | `details` | the narrow third column: tags, audio properties, playlists |
+//! | `image` | cover art in that column: kitty, sixel, iTerm2, or a placeholder |
 //! | `input` | one line of text being typed, and the window of it that fits |
 //! | `diff` | what a playlist line says now, and what it will say |
 //! | `statusbar` | the bottom bar, and the order it gives things up in when narrow |
@@ -34,6 +35,7 @@ pub mod details;
 pub mod diff;
 pub mod filelist;
 pub mod help;
+pub mod image;
 pub mod input;
 pub mod progress;
 pub mod statusbar;

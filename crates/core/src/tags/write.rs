@@ -122,6 +122,8 @@ use lofty::tag::items::Timestamp;
 
 use super::model::{Field, Values, parse_pair, render_pair};
 use super::{Parsed, TagError, read};
+use crate::art::{self, CoverEdit, CoverImage};
+use crate::library::Format;
 
 /// What to do to one field.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -181,11 +183,65 @@ impl std::fmt::Display for Edit {
 /// assert_eq!(delta.len(), 3);
 /// assert!(delta.get(Field::Album).is_none());
 /// ```
+///
+/// # The cover
+///
+/// A delta can also carry one [`CoverEdit`] (task 30), which is how embedding a
+/// cover rides the same `WriteTags` operation, preview, backup and undo as a
+/// field edit. It is not a [`Field`] because it is not text and is never read
+/// into a [`TagSet`][super::TagSet]; it counts as one change in [`TagDelta::len`].
+///
+/// On disk a delta with no cover is still the bare list of field edits it always
+/// was, so a journal written before task 30 reads back unchanged; one with a
+/// cover is `{"edits": [...], "cover": ...}`, which an older build refuses rather
+/// than silently dropping the cover.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(transparent)]
+#[serde(from = "DeltaRepr", into = "DeltaRepr")]
 pub struct TagDelta {
     /// Sorted by field, one entry per field.
     edits: Vec<(Field, Edit)>,
+    /// What happens to the front cover, if anything.
+    cover: Option<CoverEdit>,
+}
+
+/// [`TagDelta`]'s two shapes on disk. See its documentation.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum DeltaRepr {
+    /// Field edits only — every delta journaled before task 30.
+    Fields(Vec<(Field, Edit)>),
+    /// Field edits and a cover edit.
+    WithCover {
+        /// As [`TagDelta::edits`].
+        #[serde(default)]
+        edits: Vec<(Field, Edit)>,
+        /// As [`TagDelta::cover`].
+        cover: CoverEdit,
+    },
+}
+
+impl From<DeltaRepr> for TagDelta {
+    fn from(repr: DeltaRepr) -> Self {
+        match repr {
+            DeltaRepr::Fields(edits) => Self { edits, cover: None },
+            DeltaRepr::WithCover { edits, cover } => Self {
+                edits,
+                cover: Some(cover),
+            },
+        }
+    }
+}
+
+impl From<TagDelta> for DeltaRepr {
+    fn from(delta: TagDelta) -> Self {
+        match delta.cover {
+            None => Self::Fields(delta.edits),
+            Some(cover) => Self::WithCover {
+                edits: delta.edits,
+                cover,
+            },
+        }
+    }
 }
 
 impl TagDelta {
@@ -231,6 +287,27 @@ impl TagDelta {
         &self.edits
     }
 
+    /// Embed `image` as the front cover, replacing any front cover already
+    /// there.
+    #[must_use]
+    pub fn set_cover(mut self, image: CoverImage) -> Self {
+        self.cover = Some(CoverEdit::Set(image));
+        self
+    }
+
+    /// Remove the front cover, leaving every other picture.
+    #[must_use]
+    pub fn remove_cover(mut self) -> Self {
+        self.cover = Some(CoverEdit::Remove);
+        self
+    }
+
+    /// What this delta does to the front cover, if anything.
+    #[must_use]
+    pub fn cover(&self) -> Option<&CoverEdit> {
+        self.cover.as_ref()
+    }
+
     /// What this delta does to one field, if anything.
     #[must_use]
     pub fn get(&self, field: Field) -> Option<&Edit> {
@@ -240,16 +317,16 @@ impl TagDelta {
             .map(|at| &self.edits[at].1)
     }
 
-    /// How many fields it changes.
+    /// How many things it changes: fields, and the cover as one more.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.edits.len()
+        self.edits.len() + usize::from(self.cover.is_some())
     }
 
     /// Whether it changes nothing, in which case there is nothing to write.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.edits.is_empty()
+        self.edits.is_empty() && self.cover.is_none()
     }
 
     /// `genre="Hip Hop", comment=<cleared>` — the preview's rendering.
@@ -258,6 +335,7 @@ impl TagDelta {
         self.edits
             .iter()
             .map(|(field, edit)| format!("{field}={}", edit.rendered()))
+            .chain(self.cover.iter().map(|cover| format!("cover={cover}")))
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -423,6 +501,9 @@ pub fn write(abs: &Utf8Path, delta: &TagDelta, opts: &WriteOpts) -> Result<TagBa
     // Parsed after the cheap checks, so a file MPDFM cannot edit at all costs one
     // 36-byte read rather than a whole tag parse.
     let (parsed, _, _) = read::open(abs, read::parse_options(false))?;
+    // The cover's bytes, read now and checked against what the preview saw —
+    // before the backup, so an image that changed in between costs nothing.
+    let cover = cover_bytes(abs, delta)?;
 
     // Step 2 — the backup, before the original is touched in any way.
     let backup = take_backup(abs, meta.len(), opts)?;
@@ -435,7 +516,14 @@ pub fn write(abs: &Utf8Path, delta: &TagDelta, opts: &WriteOpts) -> Result<TagBa
 
     // Steps 3 to 5 — the temp file, and the one rename that publishes it.
     let temp = temp_path(abs);
-    let result = rewrite(abs, &temp, parsed, delta, opts, meta.permissions());
+    let result = rewrite(
+        abs,
+        &temp,
+        parsed,
+        (delta, cover.as_deref()),
+        opts,
+        meta.permissions(),
+    );
     if result.is_err() {
         // A failed write leaves nothing behind. An injected crash leaves nothing
         // behind either: the point of the case is that the *original* survives,
@@ -529,7 +617,8 @@ pub fn preflight(abs: &Utf8Path, delta: &TagDelta) -> Result<std::fs::Metadata, 
     // Refusing here rather than letting the write fail is the difference between
     // "this file is damaged" and "no format could be determined", and it happens
     // before a backup is taken.
-    if read::detect(abs)?.1 == read::Detected::Extension {
+    let (format, detected) = read::detect(abs)?;
+    if detected == read::Detected::Extension {
         return Err(TagError::Damaged {
             path: abs.to_owned(),
             reason: format!(
@@ -539,7 +628,24 @@ pub fn preflight(abs: &Utf8Path, delta: &TagDelta) -> Result<std::fs::Metadata, 
         });
     }
     check_edits(abs, delta)?;
+    if let Some(cover) = delta.cover() {
+        art::write::check(abs, cover, format == Format::Flac)?;
+    }
     Ok(meta)
+}
+
+/// The image a cover edit embeds, read and checked against the plan; `None`
+/// when the delta does not set a cover.
+fn cover_bytes(abs: &Utf8Path, delta: &TagDelta) -> Result<Option<Vec<u8>>, TagError> {
+    match delta.cover() {
+        Some(CoverEdit::Set(image)) => {
+            image.bytes().map(Some).map_err(|reason| TagError::BadEdit {
+                path: abs.to_owned(),
+                reason,
+            })
+        }
+        Some(CoverEdit::Remove) | None => Ok(None),
+    }
 }
 
 /// Whether the delta asks for anything this file cannot hold.
@@ -631,7 +737,7 @@ fn rewrite(
     abs: &Utf8Path,
     temp: &Utf8Path,
     parsed: Parsed,
-    delta: &TagDelta,
+    (delta, cover): (&TagDelta, Option<&[u8]>),
     opts: &WriteOpts,
     permissions: std::fs::Permissions,
 ) -> Result<(), TagError> {
@@ -647,9 +753,18 @@ fn rewrite(
         .map_err(|err| io(format!("{temp}: {err}")))?;
 
     let v23 = use_v23(&parsed, opts);
-    let edited = apply(parsed, delta, v23);
+    let mut edited = apply(parsed, delta, v23);
+    if let Some(edit) = delta.cover() {
+        art::write::apply(&mut edited, edit, cover);
+    }
     save(&edited, temp, write_options(v23)).map_err(io)?;
     verify(abs, temp, delta, v23)?;
+    if let Some(edit) = delta.cover() {
+        art::write::verify(temp, edit).map_err(|reason| TagError::NotWritten {
+            path: abs.to_owned(),
+            reason: format!("the cover {reason}"),
+        })?;
+    }
     fsync(temp).map_err(|err| io(format!("{temp}: {err}")))?;
 
     if opts.inject == Inject::BeforeRename {
@@ -1233,6 +1348,26 @@ mod tests {
             .clear(Field::Comment)
             .set(Field::Genre, "Jazz");
         assert_eq!(one, other);
+    }
+
+    #[test]
+    fn a_delta_journaled_before_covers_existed_still_reads_back() {
+        // Every journal written before task 30 holds the bare list.
+        let old = r#"[["genre",{"set":["Jazz"]}]]"#;
+        let delta: TagDelta = serde_json::from_str(old).expect("the old shape parses");
+        assert_eq!(delta, TagDelta::new().set(Field::Genre, "Jazz"));
+        assert_eq!(
+            serde_json::to_string(&delta).unwrap(),
+            old,
+            "and is written the same"
+        );
+
+        let with_cover = TagDelta::new().remove_cover();
+        let json = serde_json::to_string(&with_cover).unwrap();
+        assert_eq!(json, r#"{"edits":[],"cover":"remove"}"#);
+        let back: TagDelta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, with_cover);
+        assert_eq!(back.len(), 1);
     }
 
     #[test]

@@ -96,6 +96,7 @@ use std::time::SystemTime;
 
 use camino::{Utf8Path, Utf8PathBuf};
 
+use crate::art::ImageFacts;
 use crate::config::Config;
 use crate::paths::{self, PathError, RelPath};
 use crate::tags::{self, Id3Version, TagBackup, TagDelta, TagError, WriteOpts};
@@ -183,6 +184,21 @@ pub enum FsStep {
         backup: Option<Utf8PathBuf>,
     },
 
+    /// Write one picture embedded in `from` out to a new file at `to` (task 30).
+    ///
+    /// The only step that creates a file that was not somewhere else first, so
+    /// its receipt is the file as it was **created** — [`Done::Created`] — and
+    /// reversing it removes that file, after checking it is still the bytes this
+    /// step wrote. Never overwrites: an entry at `to` is [`FsError::Exists`].
+    ExtractArt {
+        /// The track holding the picture.
+        from: RelPath,
+        /// The image file to create.
+        to: RelPath,
+        /// Which picture, by size and hash.
+        picture: ImageFacts,
+    },
+
     /// Remove `at` if it is empty, then its parent if that is now empty, and so
     /// on up — stopping at the first directory that is not empty, and never
     /// touching `root` itself.
@@ -208,6 +224,7 @@ impl std::fmt::Display for FsStep {
                 backup: None,
             } => write!(f, "remove {target} (no backup)"),
             Self::WriteTags { target, delta, .. } => write!(f, "tag {target} ({delta})"),
+            Self::ExtractArt { from, to, .. } => write!(f, "extract-art {from} -> {to}"),
             Self::RmDirIfEmpty { at } => write!(f, "rmdir-if-empty {at}"),
         }
     }
@@ -351,6 +368,13 @@ pub enum Done {
         facts: Facts,
         /// How big the original was, which is what its backup must still be.
         original: u64,
+    },
+
+    /// [`FsStep::ExtractArt`]: a new file is at the step's `to`.
+    Created {
+        /// The file as it was written, hash included — what undo checks before
+        /// removing it, so a cover the user has since edited is left alone.
+        facts: Facts,
     },
 
     /// [`FsStep::RmDirIfEmpty`]: the directories removed, innermost first.
@@ -801,6 +825,7 @@ pub fn execute_with(
             delta,
             backup,
         } => write_tags(root, target, delta, backup.as_deref(), options)?,
+        FsStep::ExtractArt { from, to, picture } => extract_art(root, from, to, picture)?,
         FsStep::RmDirIfEmpty { at } => rmdir_upward(root, at)?,
     };
 
@@ -880,6 +905,10 @@ pub fn revert(receipt: &StepReceipt, root: &Utf8Path) -> Result<(), FsError> {
                 size: *original,
             })
             .map_err(|err| FsError::Tag(Box::new(err)))
+        }
+
+        (FsStep::ExtractArt { to, .. }, Done::Created { facts }) => {
+            remove_created_file(&guard(root, to)?, facts)
         }
 
         (FsStep::RmDirIfEmpty { .. }, Done::DirsRemoved { dirs }) => recreate(root, dirs),
@@ -1204,6 +1233,26 @@ fn inspect(step: &FsStep, root: &Utf8Path, options: &Options) -> Result<Vec<FsWa
             writable_by_mode(&parent_of(root, target))?;
         }
 
+        FsStep::ExtractArt { from, to, picture } => {
+            let from_abs = guard(root, from)?;
+            let to_abs = guard(root, to)?;
+            if !from_abs.is_file() {
+                return Err(FsError::Missing { path: from_abs });
+            }
+            if std::fs::symlink_metadata(&to_abs).is_ok() {
+                return Err(FsError::Exists { path: to_abs });
+            }
+            let parent = parent_of(root, to);
+            if !parent.is_dir() {
+                return Err(FsError::Missing { path: parent });
+            }
+            // One tag parse, so that a track whose cover has changed since the
+            // plan was made is a preview conflict and not a commit that stops.
+            embedded_picture(&from_abs, picture)?;
+            writable_by_mode(&parent)?;
+            collision_warning(root, to, &mut warnings);
+        }
+
         FsStep::RmDirIfEmpty { at } => {
             let abs = guard(root, at)?;
             // Already gone — a previous step's upward walk took it. Nothing to
@@ -1253,6 +1302,7 @@ fn probe(step: &FsStep, root: &Utf8Path) -> Result<(), FsError> {
                 None => Ok(()),
             }
         }
+        FsStep::ExtractArt { to, .. } => probe_writable(&parent_of(root, to)),
         FsStep::RmDirIfEmpty { at } => {
             if at.to_abs(root).is_dir() {
                 probe_writable(&parent_of(root, at))
@@ -1757,6 +1807,117 @@ fn write_tags(
     })
 }
 
+/// [`FsStep::ExtractArt`]: write the picture to a temp name beside `to`, make it
+/// durable, and publish it under `to` without ever replacing anything there.
+///
+/// Published by `link`, which fails if the name is taken — so an image that
+/// appeared at `to` after the check is not overwritten, which a `rename` would
+/// do. A filesystem that has no hard links falls back to a `rename` after one
+/// more look, which narrows the window to microseconds rather than closing it.
+fn extract_art(
+    root: &Utf8Path,
+    from: &RelPath,
+    to: &RelPath,
+    picture: &ImageFacts,
+) -> Result<Done, FsError> {
+    use std::io::Write as _;
+
+    let from_abs = guard(root, from)?;
+    let to_abs = guard(root, to)?;
+    let bytes = embedded_picture(&from_abs, picture)?;
+    let temp = temp_beside(&to_abs, "art");
+    let io = |path: &Utf8Path| {
+        let path = path.to_owned();
+        move |source| FsError::Io { path, source }
+    };
+
+    let written = (|| -> Result<(), FsError> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(io(&temp))?;
+        file.write_all(&bytes).map_err(io(&temp))?;
+        file.sync_all().map_err(io(&temp))?;
+        drop(file);
+        match std::fs::hard_link(&temp, &to_abs) {
+            Ok(()) => {
+                std::fs::remove_file(&temp).map_err(io(&temp))?;
+                Ok(())
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(FsError::Exists {
+                path: to_abs.clone(),
+            }),
+            Err(_) => {
+                if std::fs::symlink_metadata(&to_abs).is_ok() {
+                    return Err(FsError::Exists {
+                        path: to_abs.clone(),
+                    });
+                }
+                std::fs::rename(&temp, &to_abs).map_err(io(&to_abs))
+            }
+        }
+    })();
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(err);
+    }
+    sync_dir(to_abs.parent());
+
+    let mut facts = Facts::of(&to_abs)?;
+    facts.hash = Some(picture.hash);
+    Ok(Done::Created { facts })
+}
+
+/// The bytes of the picture in `track` that `picture` describes.
+///
+/// # Errors
+///
+/// [`FsError::Tag`] when the track cannot be read or no longer holds a picture
+/// with that size and hash.
+fn embedded_picture(track: &Utf8Path, picture: &ImageFacts) -> Result<Vec<u8>, FsError> {
+    let found = crate::art::read::picture_data(track, |candidate| {
+        candidate.image.size == picture.size && candidate.image.hash == picture.hash
+    })
+    .map_err(|err| FsError::Tag(Box::new(err)))?;
+    found.map(|(_, bytes)| bytes).ok_or_else(|| {
+        FsError::Tag(Box::new(TagError::BadEdit {
+            path: track.to_owned(),
+            reason: format!(
+                "it no longer holds the {} picture this was planned against",
+                crate::art::human_bytes(picture.size)
+            ),
+        }))
+    })
+}
+
+/// Undo an [`FsStep::ExtractArt`]: remove the file it created, if it is still
+/// the file it created.
+///
+/// The check is here and not only in `undo`'s survey because removing is the
+/// one thing in this module that cannot be put right afterwards. `undo --force`
+/// skips what the survey reports; it must not be able to make this delete a
+/// cover the user has replaced since.
+fn remove_created_file(path: &Utf8Path, facts: &Facts) -> Result<(), FsError> {
+    let current = Facts::of(path)?;
+    let same = current.size == facts.size
+        && facts
+            .hash
+            .is_none_or(|expected| hash_file(path).is_ok_and(|actual| actual == expected));
+    if !same {
+        return Err(FsError::Verify {
+            path: path.to_owned(),
+            detail: "it is not the file this transaction wrote, so it is left alone".to_owned(),
+        });
+    }
+    std::fs::remove_file(path).map_err(|source| FsError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    sync_dir(path.parent());
+    Ok(())
+}
+
 fn move_back(
     current: &Utf8Path,
     original: &Utf8Path,
@@ -1977,6 +2138,14 @@ pub fn hash_file(path: &Utf8Path) -> Result<u64, FsError> {
         }
         digest = fold(digest, &buffer[..read]);
     }
+}
+
+/// FNV-1a of bytes already in memory — the same number [`hash_file`] gives for a
+/// file holding them, which is what lets an embedded picture and the file it was
+/// extracted to be recognized as the same image.
+#[must_use]
+pub fn hash_bytes(bytes: &[u8]) -> u64 {
+    fold(FNV_OFFSET, bytes)
 }
 
 /// One FNV-1a round per byte. Streaming or not, the result is the same number

@@ -8,6 +8,7 @@
 //! a contract shared by every command rather than a detail of any one of them.
 
 mod config;
+mod cover;
 mod doctor;
 #[path = "move.rs"]
 mod r#move;
@@ -145,6 +146,12 @@ pub enum Command {
     Tag {
         #[command(subcommand)]
         command: TagCommand,
+    },
+
+    /// See, extract and set album art.
+    Cover {
+        #[command(subcommand)]
+        command: CoverCommand,
     },
 
     /// Reverse a committed transaction.
@@ -294,6 +301,93 @@ pub struct RecoverArgs {
     /// Skip the confirmation prompt. Required when stdin is not a terminal.
     #[arg(long, short = 'y')]
     pub yes: bool,
+}
+
+/// `mpdfm cover …`
+///
+/// `ALBUM_DIR` is a directory relative to the music directory, or absolute
+/// inside it; the audio files directly in it are the album. Every write is one
+/// transaction, previewed first and reversible with `mpdfm undo`.
+#[derive(Debug, Subcommand)]
+pub enum CoverCommand {
+    /// Show embedded and loose art for a track or an album directory, and what
+    /// disagrees between them.
+    Show(CoverShowArgs),
+
+    /// Embed an image as the front cover of every track in an album, replacing
+    /// any front cover already there.
+    Set(CoverSetArgs),
+
+    /// Write the album's embedded cover out as an image file beside its tracks.
+    Extract(CoverExtractArgs),
+
+    /// Remove the embedded front cover from every track in an album, leaving any
+    /// other pictures.
+    Remove(CoverRemoveArgs),
+}
+
+/// `mpdfm cover show <PATH>`
+#[derive(Debug, Args)]
+pub struct CoverShowArgs {
+    /// A track, or an album directory.
+    pub path: Utf8PathBuf,
+}
+
+/// The flags every cover write takes.
+#[derive(Debug, Args)]
+pub struct CoverWriteFlags {
+    /// Show the preview and write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Skip the confirmation prompt. Required when stdin is not a terminal.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+}
+
+/// `mpdfm cover set <ALBUM_DIR> [IMAGE]`
+#[derive(Debug, Args)]
+pub struct CoverSetArgs {
+    /// The album directory.
+    pub album_dir: Utf8PathBuf,
+
+    /// The image: a path, or the name of an image in the album directory.
+    /// Default: the album's own cover.jpg, folder.jpg or front.jpg, in that
+    /// order of preference.
+    pub image: Option<Utf8PathBuf>,
+
+    /// Re-encode an image larger than PX on its longer side as a JPEG that
+    /// fits, keeping its aspect ratio. Off unless given: re-encoding is lossy.
+    #[arg(long, value_name = "PX")]
+    pub max_dimension: Option<std::num::NonZeroU32>,
+
+    #[command(flatten)]
+    pub flags: CoverWriteFlags,
+}
+
+/// `mpdfm cover extract <ALBUM_DIR>`
+#[derive(Debug, Args)]
+pub struct CoverExtractArgs {
+    /// The album directory.
+    pub album_dir: Utf8PathBuf,
+
+    /// File name to write in the album directory (default: cover.jpg, or
+    /// cover.png for a PNG).
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    #[command(flatten)]
+    pub flags: CoverWriteFlags,
+}
+
+/// `mpdfm cover remove <ALBUM_DIR>`
+#[derive(Debug, Args)]
+pub struct CoverRemoveArgs {
+    /// The album directory.
+    pub album_dir: Utf8PathBuf,
+
+    #[command(flatten)]
+    pub flags: CoverWriteFlags,
 }
 
 /// `mpdfm config …`
@@ -555,6 +649,12 @@ pub fn run() -> Result<ExitCode> {
             TagCommand::Set(args) => tag::set(&cli, &settings, &out, args, false),
             TagCommand::Diff(args) => tag::set(&cli, &settings, &out, args, true),
         },
+        Command::Cover { command } => match command {
+            CoverCommand::Show(args) => cover::show(&cli, &settings, &out, args),
+            CoverCommand::Set(args) => cover::set(&cli, &settings, &out, args),
+            CoverCommand::Extract(args) => cover::extract(&cli, &settings, &out, args),
+            CoverCommand::Remove(args) => cover::remove(&cli, &settings, &out, args),
+        },
     }
 }
 
@@ -639,7 +739,7 @@ mod tests {
         let cmd = Cli::command();
         let names: Vec<&str> = cmd.get_subcommands().map(|s| s.get_name()).collect();
         for expected in [
-            "config", "scan", "doctor", "move", "organize", "tag", "undo", "recover",
+            "config", "scan", "doctor", "move", "organize", "tag", "cover", "undo", "recover",
         ] {
             assert!(names.contains(&expected), "missing subcommand `{expected}`");
         }

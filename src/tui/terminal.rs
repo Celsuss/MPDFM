@@ -56,6 +56,30 @@ use ratatui::backend::CrosstermBackend;
 /// The terminal MPDFM draws on.
 pub type Screen = Terminal<CrosstermBackend<Stdout>>;
 
+/// A backend that cover art can be written to directly, after a frame (task 30).
+///
+/// Sixel and iTerm2 images are drawn at the cursor rather than in cells, so they
+/// cannot travel through the cell buffer; kitty's image data is sent once,
+/// outside it. A real terminal is a writer; a test's `TestBackend` is not, and
+/// says so with `None` — which is also how the loop's tests prove that a
+/// terminal with no graphics gets none.
+pub trait Graphics {
+    /// Where to write graphics escapes, if anywhere.
+    fn graphics(&mut self) -> Option<&mut dyn Write>;
+}
+
+impl<W: Write> Graphics for CrosstermBackend<W> {
+    fn graphics(&mut self) -> Option<&mut dyn Write> {
+        Some(self)
+    }
+}
+
+impl Graphics for ratatui::backend::TestBackend {
+    fn graphics(&mut self) -> Option<&mut dyn Write> {
+        None
+    }
+}
+
 /// Ownership of the terminal's modes, and the obligation to put them back.
 ///
 /// Hold it for as long as the TUI is drawing and drop it to restore. It is not
