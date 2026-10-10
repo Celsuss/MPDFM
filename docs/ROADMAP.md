@@ -107,7 +107,7 @@ without a second thread joining the first.
 | # | Task | Depends on | Status |
 | --- | --- | --- | --- |
 | 29 | [Library doctor](tasks/29-doctor.md) | 07, 15, 16 | done |
-| 30 | [Cover art](tasks/30-cover-art.md) | 16, 17, 22 | not started |
+| 30 | [Cover art](tasks/30-cover-art.md) | 16, 17, 22 | done |
 
 ## M6 — Polish
 

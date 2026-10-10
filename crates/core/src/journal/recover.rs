@@ -567,6 +567,17 @@ fn landed(record: &Record, step: &StepRecord) -> Landed {
             }
         }
 
+        // An extraction creates `to` and nothing else, and the plan refused one
+        // whose `to` was already taken — so `to` being there is the step having
+        // run.
+        FsStep::ExtractArt { to, .. } => {
+            if there(&to.to_abs(root)) {
+                Landed::Yes
+            } else {
+                Landed::No
+            }
+        }
+
         FsStep::RmDirIfEmpty { at } => {
             if there(&at.to_abs(root)) {
                 Landed::No
@@ -600,6 +611,18 @@ fn reconstruct(record: &Record, step: &StepRecord) -> std::result::Result<StepRe
             backup: Some(backup),
             delta: _,
         } => tags_receipt(step, &target.to_abs(root), backup),
+        FsStep::ExtractArt { to, picture, .. } => {
+            // The hash is the one the step meant to write; a file at `to` that
+            // does not have it is not this step's, and undo will say so rather
+            // than remove it.
+            let mut facts = Facts::of(&to.to_abs(root)).map_err(|err| err.to_string())?;
+            facts.hash = Some(picture.hash);
+            Ok(StepReceipt {
+                step: step.step.clone(),
+                done: Done::Created { facts },
+                warnings: Vec::new(),
+            })
+        }
         // None is reachable: `look` sends an unbacked delete and an unbacked tag
         // write to `CannotTell`, and a `MkDir` never gets this far.
         FsStep::RemoveFile { backup: None, .. }

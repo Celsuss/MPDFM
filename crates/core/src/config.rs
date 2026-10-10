@@ -65,6 +65,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     "organize_template",
     "organize_portable_names",
     "id3_version",
+    "image_protocol",
 ];
 
 // ---------------------------------------------------------------------------
@@ -646,6 +647,8 @@ pub struct Config {
     pub organize_portable_names: bool,
     /// Which ID3v2 revision a tag write leaves an mp3 in.
     pub id3_version: crate::tags::Id3Version,
+    /// How the TUI draws cover art (task 30).
+    pub image_protocol: ImageProtocol,
     /// Where each of the above came from.
     pub sources: Sources,
 }
@@ -679,6 +682,64 @@ pub struct Sources {
     pub organize_portable_names: Source,
     /// Where [`Config::id3_version`] came from.
     pub id3_version: Source,
+    /// Where [`Config::image_protocol`] came from.
+    pub image_protocol: Source,
+}
+
+/// How the TUI draws cover art: `image_protocol` in `config.toml` (task 30).
+///
+/// Printing a graphics escape to a terminal that does not understand it
+/// scribbles over the screen, so `auto` only picks a protocol the terminal has
+/// positively identified itself as supporting, and draws a text placeholder
+/// otherwise. The other four force the answer either way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ImageProtocol {
+    /// Detect, conservatively. The default.
+    #[default]
+    Auto,
+    /// The kitty graphics protocol.
+    Kitty,
+    /// DEC sixel graphics.
+    Sixel,
+    /// iTerm2's inline images.
+    Iterm,
+    /// Never draw an image; always the placeholder.
+    None,
+}
+
+impl ImageProtocol {
+    /// The spelling `config.toml` uses.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Kitty => "kitty",
+            Self::Sixel => "sixel",
+            Self::Iterm => "iterm",
+            Self::None => "none",
+        }
+    }
+
+    /// Read the setting back.
+    ///
+    /// ```
+    /// use mpdfm_core::config::ImageProtocol;
+    ///
+    /// assert_eq!(ImageProtocol::parse("Kitty"), Some(ImageProtocol::Kitty));
+    /// assert_eq!(ImageProtocol::parse("iterm2"), Some(ImageProtocol::Iterm));
+    /// assert_eq!(ImageProtocol::parse("ascii"), None);
+    /// ```
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "kitty" => Some(Self::Kitty),
+            "sixel" => Some(Self::Sixel),
+            "iterm" | "iterm2" => Some(Self::Iterm),
+            "none" | "off" => Some(Self::None),
+            _ => None,
+        }
+    }
 }
 
 /// One row of `mpdfm config show`.
@@ -766,6 +827,11 @@ impl Config {
                 name: "id3_version",
                 value: self.id3_version.as_str().to_owned(),
                 source: s.id3_version.clone(),
+            },
+            Setting {
+                name: "image_protocol",
+                value: self.image_protocol.as_str().to_owned(),
+                source: s.image_protocol.clone(),
             },
         ]
     }
@@ -1218,6 +1284,7 @@ impl Resolver<'_> {
             .toml_bool("organize_portable_names")
             .unwrap_or((true, Source::Default));
         let (id3_version, id3_version_source) = self.id3_version();
+        let (image_protocol, image_protocol_source) = self.image_protocol();
 
         Config {
             music_dir,
@@ -1233,6 +1300,7 @@ impl Resolver<'_> {
             organize_template,
             organize_portable_names,
             id3_version,
+            image_protocol,
             sources: Sources {
                 music_dir: music_dir_source,
                 playlist_dir: playlist_dir_source,
@@ -1247,6 +1315,7 @@ impl Resolver<'_> {
                 organize_template: organize_template_source,
                 organize_portable_names: organize_portable_names_source,
                 id3_version: id3_version_source,
+                image_protocol: image_protocol_source,
             },
         }
     }
@@ -1271,6 +1340,27 @@ impl Resolver<'_> {
                     ),
                 });
                 (crate::tags::Id3Version::default(), Source::Default)
+            }
+        }
+    }
+
+    /// `image_protocol` from the config, else `auto`. A bad value warns and
+    /// falls back to `auto`, which is itself the conservative choice.
+    fn image_protocol(&mut self) -> (ImageProtocol, Source) {
+        let Some((raw, origin)) = self.toml_str("image_protocol") else {
+            return (ImageProtocol::default(), Source::Default);
+        };
+        match ImageProtocol::parse(&raw) {
+            Some(protocol) => (protocol, origin),
+            None => {
+                self.warnings.push(ConfigWarning::BadValue {
+                    origin,
+                    message: format!(
+                        "`image_protocol` should be \"auto\", \"kitty\", \"sixel\", \"iterm\" \
+                         or \"none\", found {raw:?}"
+                    ),
+                });
+                (ImageProtocol::default(), Source::Default)
             }
         }
     }
@@ -2119,7 +2209,8 @@ mod tests {
                 "backup_keep",
                 "organize_template",
                 "organize_portable_names",
-                "id3_version"
+                "id3_version",
+                "image_protocol"
             ]
         );
 

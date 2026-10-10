@@ -160,6 +160,14 @@ pub struct MpdState {
 /// [`Msg`] and touching the loop.
 #[derive(Debug)]
 pub enum TaskOutcome {
+    /// One entry's cover art was loaded for the details pane (task 30).
+    Art {
+        /// The entry.
+        rel: RelPath,
+        /// Its art, `None` for none, or why it could not be read.
+        result: Result<Option<super::widgets::image::Art>, String>,
+    },
+
     /// A window of files was read for the browser (task 22).
     ///
     /// See [`Reads`] for the shape, which is also the one a failure takes.

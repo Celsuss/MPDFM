@@ -614,6 +614,9 @@ impl Record {
                 summary.tags_written, summary.fields_changed
             ));
         }
+        if summary.files_created > 0 {
+            parts.push(format!("{} file(s) created", summary.files_created));
+        }
         if summary.playlists_affected > 0 {
             parts.push(format!("{} playlist(s)", summary.playlists_affected));
         }

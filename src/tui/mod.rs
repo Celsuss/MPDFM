@@ -179,6 +179,15 @@ pub fn run(cli: &Cli, config: &Config) -> Result<ExitCode> {
         mpd_confs: mpd_conf_candidates(&env),
     });
     app.report_key_warnings(&key_warnings);
+    // Cover art: which protocol this terminal has said it speaks, and how big a
+    // cell is. Asked of the environment and the tty's window size, never of the
+    // terminal itself — see `widgets::image`.
+    let protocol = widgets::image::detect(config.image_protocol, |name| std::env::var(name).ok());
+    let cell = crossterm::terminal::window_size().ok().and_then(|size| {
+        (size.width > 0 && size.height > 0 && size.columns > 0 && size.rows > 0)
+            .then(|| (size.width / size.columns, size.height / size.rows))
+    });
+    app.set_art_protocol(protocol, cell);
     let result = app.run(&mut screen, &events);
 
     // Explicit, so that whatever is printed after this — the `Err` on its way to

@@ -13,6 +13,12 @@ camino = { version = "=1.2.6", features = ["serde1"] }
 clap = { version = "=4.6.7", features = ["derive"] }
 crossterm = "=0.29.0"
 insta = "=1.48.0"
+# Cover art (task 30): decoding JPEG and PNG for the TUI's image protocols, and
+# the opt-in downscale of an oversized cover before it is embedded. The one heavy
+# dependency in the project, so it is cut down to the two formats album art
+# actually comes in and to no thread pool: `default-features = false` drops
+# rayon and a dozen codecs nobody puts in a `folder.jpg`.
+image = { version = "=0.25.6", default-features = false, features = ["jpeg", "png"] }
 lofty = "=0.25.4"
 ratatui = "=0.30.2"
 serde = { version = "=1.0.229", features = ["derive"] }
@@ -56,6 +62,9 @@ mpdfm-core.workspace = true
 anyhow.workspace = true
 camino.workspace = true
 clap.workspace = true
+# Decoding cover art for the kitty and sixel protocols, which take pixels rather
+# than a JPEG (task 30). Already in the tree through core.
+image.workspace = true
 # The terminal, and the widgets drawn on it (task 20). Both live here and not in
 # core: the dependency direction is one-way, and `crates/core/tests/manifest_deps.rs`
 # keeps it that way.

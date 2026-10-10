@@ -94,6 +94,7 @@ use super::log::Log;
 use super::msg::{
     FoundOutcome, MpdSnapshot, Msg, NotCommitted, Reads, ScanOutcome, TaskOutcome, TrackInfo,
 };
+use super::terminal::Graphics;
 use super::terminal::{MIN_SIZE, fits};
 use super::views::browser::{Browser, Enter, Pane, Results, Sort, TreeRow};
 use super::views::error::ErrorReport;
@@ -103,6 +104,7 @@ use super::views::search::{Finding, Kind, Prompt};
 use super::views::tagedit::{Begin, FileAction, Hints, Preview, Started, TagEdit};
 use super::widgets::details::DetailsPane;
 use super::widgets::filelist::FileList;
+use super::widgets::image::{ArtCache, Protocol};
 use super::widgets::input::Input;
 use super::widgets::progress::Progress as Busy;
 use super::widgets::statusbar::{Light, Status};
@@ -486,6 +488,12 @@ pub struct App {
     /// per row. Cleared when the answer lands, which is also when the next
     /// window is asked for.
     tags_in_flight: bool,
+    /// Cover art for the details pane: what is loaded, how it is drawn, and what
+    /// the terminal has already been sent (task 30).
+    art: ArtCache,
+    /// The terminal's size when graphics were last written, so a resize — which
+    /// clears the screen, sixels and all — is noticed.
+    art_size: (u16, u16),
     /// How many things the last scan could not model — non-UTF-8 names, an
     /// unreadable directory, a playlist that would not parse.
     ///
@@ -557,6 +565,11 @@ impl App {
             focus: Focus::Tree,
             browser: Browser::new(),
             tags_in_flight: false,
+            // The placeholder until `tui::run` has looked at the terminal: a test
+            // that builds an `App` gets no graphics escapes, whatever `$TERM` the
+            // test runner happens to have.
+            art: ArtCache::new(Protocol::Placeholder, DEFAULT_CELL),
+            art_size: (0, 0),
             warnings: 0,
             keys: Keys::new(keys),
             views: vec![View::Browser],
@@ -579,6 +592,14 @@ impl App {
         }
     }
 
+    /// Say how cover art is drawn on this terminal, and how big a cell is in
+    /// pixels. Called by `tui::run` once the terminal is known.
+    pub fn set_art_protocol(&mut self, protocol: Protocol, cell: Option<(u16, u16)>) {
+        self.log
+            .line(format!("art: protocol {protocol:?}, cell {cell:?}"));
+        self.art = ArtCache::new(protocol, cell.unwrap_or(DEFAULT_CELL));
+    }
+
     /// Tell the first-run screen where the configuration could have come from.
     pub fn locate_config(&mut self, setup: Setup) {
         let in_use = setup.mpd_confs.iter().position(|path| path.is_file());
@@ -599,7 +620,7 @@ impl App {
     /// are all states of the app, not ends of it.
     pub fn run<B>(&mut self, terminal: &mut Terminal<B>, events: &Events) -> Result<()>
     where
-        B: Backend,
+        B: Backend + Graphics,
         B::Error: std::error::Error + Send + Sync + 'static,
     {
         // Before the first frame, so that a half-page jump has a page to measure
@@ -614,6 +635,7 @@ impl App {
             if dirty {
                 terminal.draw(|frame| self.render(frame.area(), frame))?;
                 self.remember_scroll();
+                self.flush_art(terminal.backend_mut());
                 dirty = false;
             }
 
@@ -672,6 +694,7 @@ impl App {
         // the one place that asks — after the state has settled and before the
         // frame is drawn. It never reads a file itself; see `request_tags`.
         self.request_tags();
+        self.request_art();
         dirty
     }
 
@@ -2907,6 +2930,9 @@ impl App {
                 self.no_library = library
                     .is_empty()
                     .then(|| NoLibrary::Empty(library.root().to_path_buf()));
+                // Any file may have changed since the art was read — a commit
+                // that embedded a cover rescans through here.
+                self.art.clear();
                 self.library = Some(library);
                 self.index = index;
                 // Where the browser was may not exist any more, and whatever it
@@ -3035,6 +3061,14 @@ impl App {
                 let filled = self.browser.tags_arrived(reads, self.library.as_ref());
                 let moved = self.reprobe();
                 filled || moved
+            }
+            TaskOutcome::Art { rel, result } => {
+                let focused = self
+                    .library
+                    .as_ref()
+                    .and_then(|library| self.browser.focused_path(library));
+                self.art.arrived(rel.clone(), result);
+                focused.as_ref() == Some(&rel)
             }
             TaskOutcome::Selection(reads) => self.on_selection(reads),
             TaskOutcome::Organize(reads) => self.on_organize_read(reads),
@@ -3229,6 +3263,45 @@ impl App {
             library.root().to_path_buf(),
             Arc::clone(&self.log),
         );
+    }
+
+    /// Ask a worker for the focused entry's cover art, if the details pane is on
+    /// screen and nothing is known about it yet. One load at a time, so a held
+    /// `j` loads the entry it lands on and not every entry it passes.
+    fn request_art(&mut self) {
+        if self.size.0 < DETAILS_FROM {
+            return;
+        }
+        let Some(library) = &self.library else {
+            return;
+        };
+        let Some(rel) = self.browser.focused_path(library) else {
+            return;
+        };
+        if let Some(rel) = self.art.want(&rel) {
+            work::read_art(
+                self.tx.clone(),
+                rel,
+                library.root().to_path_buf(),
+                self.art.protocol.draws(),
+                Arc::clone(&self.log),
+            );
+        }
+    }
+
+    /// After a frame: send the terminal whatever cover art the frame placed.
+    ///
+    /// A failure is logged and not raised: a picture that did not arrive is not a
+    /// reason to stop the browser.
+    fn flush_art<B: Graphics>(&mut self, backend: &mut B) {
+        let resized = self.art_size != self.size;
+        self.art_size = self.size;
+        if let Some(out) = backend.graphics()
+            && let Err(err) = self.art.flush(out, resized)
+        {
+            self.log
+                .line(format!("art: could not write to the terminal: {err}"));
+        }
     }
 
     /// How many rows the listing has room for, from the last size the terminal
@@ -3448,10 +3521,27 @@ impl App {
         self.render_tree(tree_area, library, frame);
         self.render_files(files_area, library, height, frame);
         if details_area.width > 0 {
+            // Cover art at the top of the pane when the focused entry has some,
+            // and the details below it.
+            let focused = self.browser.focused_path(library);
+            let art_rows = focused.as_ref().map_or(0, |rel| {
+                self.art
+                    .rows_for(rel, details_area.width, details_area.height)
+            });
+            let [art_area, text_area] =
+                Layout::vertical([Constraint::Length(art_rows), Constraint::Min(0)])
+                    .areas(details_area);
+            if let Some(rel) = focused.filter(|_| art_rows > 0) {
+                // Graphics only when nothing is drawn over the browser: sixel and
+                // iTerm2 pixels would be painted on top of an overlay.
+                let graphics = !self.views.iter().any(View::is_overlay);
+                self.art
+                    .render(&rel, art_area, frame.buffer_mut(), graphics);
+            }
             frame.render_widget(
                 DetailsPane::new(&self.browser.details(library, self.index.as_ref()))
                     .block(Block::new().borders(Borders::ALL).title(" details ")),
-                details_area,
+                text_area,
             );
         }
     }
@@ -4128,6 +4218,9 @@ impl App {
 /// `render_browser` decides not to draw it — a width and not a flag, so there is
 /// one source of truth for the layout instead of a `bool` that could disagree
 /// with it.
+/// A cell's size in pixels when the terminal will not say: the usual 1:2.
+const DEFAULT_CELL: (u16, u16) = (10, 20);
+
 fn panes(body: Rect) -> [Rect; 3] {
     let details = if body.width >= DETAILS_FROM {
         DETAILS_W
@@ -6169,13 +6262,16 @@ mod tests {
             "only the two screenfuls that were looked at"
         );
 
-        // And going back over rows that are already cached reads nothing.
+        // And going back over rows that are already cached reads nothing. Only
+        // tag reads count: the cover-art worker (task 30) answers for the row
+        // the cursor is on, which is a different read.
         app.update(press('g'));
         app.update(press('g'));
-        assert!(
-            rx.recv_timeout(Duration::from_millis(200)).is_err(),
-            "a cached row must not be read a second time"
-        );
+        let reread = std::iter::from_fn(|| rx.recv_timeout(Duration::from_millis(200)).ok())
+            .any(|msg| {
+                matches!(&msg, Msg::TaskDone(outcome) if matches!(outcome.as_ref(), TaskOutcome::Tags(_)))
+            });
+        assert!(!reread, "a cached row must not be read a second time");
     }
 
     #[test]
@@ -9164,5 +9260,182 @@ mod tests {
         let toast = app.toasts.back().expect("it says what happened");
         assert!(toast.text.contains("scan called off"), "{}", toast.text);
         assert!(toast.text.contains("R to scan again"), "{}", toast.text);
+    }
+
+    // -- cover art (task 30) -------------------------------------------------
+
+    /// One album holding one track, whose front cover is `cover`.
+    fn art_fixture(cover: &[u8]) -> (Fixture, String) {
+        let fx = Fixture::builder()
+            .album("covers/album", &["01 Track.mp3"])
+            .build();
+        let track = "covers/album/01 Track.mp3".to_owned();
+        mpdfm_core::testing::tags::embed_picture(
+            &fx.abs(&track),
+            cover,
+            mpdfm_core::art::PictureKind::FRONT.code(),
+        );
+        (fx, track)
+    }
+
+    /// Bytes a test terminal was sent, shared with the test that reads them.
+    #[derive(Clone, Default)]
+    struct Capture(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    type BytesScreen = Terminal<ratatui::backend::CrosstermBackend<Capture>>;
+
+    /// A terminal that writes real escape sequences into memory, so a test can
+    /// read every byte a real one would have been sent.
+    fn bytes_screen(width: u16, height: u16) -> (BytesScreen, Capture) {
+        let capture = Capture::default();
+        let terminal = Terminal::with_options(
+            ratatui::backend::CrosstermBackend::new(capture.clone()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, width, height)),
+            },
+        )
+        .expect("a fixed viewport needs no tty");
+        (terminal, capture)
+    }
+
+    /// Open the fixture's album, wait for the focused track's art, and leave the
+    /// app ready to draw it.
+    fn with_art_loaded(app: &mut App, rx: &mpsc::Receiver<Msg>, fx: &Fixture, track: &str) {
+        app.update(scanned(fx));
+        let mut terminal = screen(110, 30);
+        go_to(app, &mut terminal, "covers/album");
+        app.request_art();
+        let rel = RelPath::parse(track).expect("a fixture path");
+        settle_until(app, rx, |app| {
+            matches!(
+                app.art.slot(&rel),
+                Some(super::super::widgets::image::Slot::Ready(_))
+            )
+        });
+    }
+
+    /// Draw `frames` frames into `terminal` the way `App::run` does, graphics
+    /// flush included, and return everything written.
+    fn draw_frames(
+        app: &mut App,
+        (terminal, capture): &mut (BytesScreen, Capture),
+        frames: usize,
+    ) -> String {
+        for _ in 0..frames {
+            app.size = (110, 30);
+            terminal
+                .draw(|frame| app.render(frame.area(), frame))
+                .expect("drawing into memory works");
+            app.flush_art(terminal.backend_mut());
+        }
+        String::from_utf8_lossy(&capture.0.borrow()).into_owned()
+    }
+
+    const GRAPHICS: [&str; 3] = ["\x1b_G", "\x1bPq", "\x1b]1337"];
+
+    #[test]
+    fn an_unknown_terminal_gets_the_placeholder_and_not_one_graphics_escape() {
+        let (fx, track) = art_fixture(&mpdfm_core::testing::tags::jpeg(64, 64));
+        let (mut app, rx) = app(&fx);
+        let detected =
+            super::super::widgets::image::detect(mpdfm_core::config::ImageProtocol::Auto, |name| {
+                (name == "TERM").then(|| "xterm-256color".to_owned())
+            });
+        app.set_art_protocol(detected, None);
+        with_art_loaded(&mut app, &rx, &fx, &track);
+
+        let mut terminal = bytes_screen(110, 30);
+        let written = draw_frames(&mut app, &mut terminal, 3);
+        for escape in GRAPHICS {
+            assert!(!written.contains(escape), "{escape:?} reached the terminal");
+        }
+        // The placeholder says what the picture is instead.
+        assert!(written.contains("front cover"), "no placeholder was drawn");
+        assert!(
+            written.contains("image/jpeg 64"),
+            "no placeholder was drawn"
+        );
+    }
+
+    #[test]
+    fn kitty_is_sent_the_image_once_however_many_frames_show_it() {
+        let (fx, track) = art_fixture(&mpdfm_core::testing::tags::jpeg(64, 64));
+        let (mut app, rx) = app(&fx);
+        app.set_art_protocol(
+            super::super::widgets::image::Protocol::Kitty,
+            Some((10, 20)),
+        );
+        with_art_loaded(&mut app, &rx, &fx, &track);
+
+        let mut terminal = bytes_screen(110, 30);
+        let written = draw_frames(&mut app, &mut terminal, 10);
+        assert_eq!(written.matches("\x1b_Ga=T").count(), 1, "one transmission");
+        assert!(
+            written.contains('\u{10EEEE}'),
+            "the cells hold kitty's placeholders"
+        );
+        assert_eq!(app.art.encodes(), 1);
+    }
+
+    #[test]
+    fn a_five_megabyte_png_is_decoded_once_and_not_re_encoded_per_frame() {
+        let png = mpdfm_core::testing::tags::png(1300, 1300);
+        assert!(png.len() > 5_000_000, "{} bytes", png.len());
+        let (fx, track) = art_fixture(&png);
+        let (mut app, rx) = app(&fx);
+        app.set_art_protocol(
+            super::super::widgets::image::Protocol::Sixel,
+            Some((10, 20)),
+        );
+        with_art_loaded(&mut app, &rx, &fx, &track);
+
+        let rel = RelPath::parse(&track).expect("a fixture path");
+        assert!(
+            app.art.want(&rel).is_none(),
+            "loaded, so not asked for again"
+        );
+
+        let mut terminal = bytes_screen(110, 30);
+        let written = draw_frames(&mut app, &mut terminal, 20);
+        assert_eq!(app.art.encodes(), 1, "one pane size, one encode");
+        assert_eq!(
+            written.matches("\x1bPq").count(),
+            1,
+            "the sixel is written once"
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "no second load was started"
+        );
+    }
+
+    #[test]
+    fn an_overlay_keeps_sixel_pixels_off_the_screen() {
+        let (fx, track) = art_fixture(&mpdfm_core::testing::tags::jpeg(64, 64));
+        let (mut app, rx) = app(&fx);
+        app.set_art_protocol(
+            super::super::widgets::image::Protocol::Sixel,
+            Some((10, 20)),
+        );
+        with_art_loaded(&mut app, &rx, &fx, &track);
+        app.update(press('?'));
+        assert!(app.views.iter().any(View::is_overlay), "the help is open");
+
+        let mut terminal = bytes_screen(110, 30);
+        let written = draw_frames(&mut app, &mut terminal, 2);
+        assert!(
+            !written.contains("\x1bPq"),
+            "a sixel was drawn over the help"
+        );
     }
 }

@@ -87,6 +87,23 @@
 # replaced whatever this says: no Linux filesystem accepts them in a name.
 # organize_portable_names = true
 
+# How the TUI's details pane draws cover art.
+#
+#   "auto"   detect, conservatively (the default)
+#   "kitty"  the kitty graphics protocol
+#   "sixel"  DEC sixel graphics
+#   "iterm"  iTerm2 inline images (also WezTerm)
+#   "none"   never draw an image, only the text placeholder
+#
+# A graphics escape sent to a terminal that does not understand it scribbles over
+# the screen, so "auto" picks a protocol only when the terminal has identified
+# itself — kitty by $KITTY_WINDOW_ID or TERM=xterm-kitty, iTerm2 and WezTerm by
+# $TERM_PROGRAM, foot and mlterm (sixel) by $TERM — and never inside tmux or
+# screen, which do not pass the escapes through. Everything else gets a bordered
+# placeholder with the image's size, type and dimensions. Set it explicitly if
+# your terminal supports one of these and is not recognized.
+# image_protocol = "auto"
+
 # The TUI's key bindings are *not* in this file: they live in `keys.toml`, in this
 # same directory, and `docs/keys.example.toml` documents them. Two files because
 # they are two things — this one is read by every command, that one only by the

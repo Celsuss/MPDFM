@@ -868,6 +868,10 @@ fn inspect_reverse(
             });
             return;
         }
+        // An extracted cover is removed rather than moved back, so like a tag
+        // write there is only the file to check: still the bytes it was written
+        // with, or the user has made it theirs since.
+        (FsStep::ExtractArt { to, .. }, Done::Created { .. }) => (to.to_abs(root), None),
         // A directory step has no contents to compare, and whether one can be
         // removed is not knowable yet: the steps reversed before it are what
         // empty it. `DirKept` is the answer, and the revert itself is the only
@@ -888,7 +892,8 @@ fn inspect_reverse(
     let facts = match &receipt.done {
         Done::Moved { facts, .. }
         | Done::Removed { facts, .. }
-        | Done::TagsWritten { facts, .. } => facts,
+        | Done::TagsWritten { facts, .. }
+        | Done::Created { facts } => facts,
         // Unreachable: the match above only produced a path for the other three.
         Done::DirsCreated { .. } | Done::DirsRemoved { .. } => return,
     };

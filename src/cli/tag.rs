@@ -512,7 +512,7 @@ fn shown(value: &str) -> String {
 }
 
 /// The lines after a successful commit.
-fn print_committed(committed: &Committed, out: &Out) {
+pub(super) fn print_committed(committed: &Committed, out: &Out) {
     println!();
     for warning in &committed.warnings {
         println!("  {} {warning}", out.paint(Style::Yellow, "!"));
@@ -523,7 +523,7 @@ fn print_committed(committed: &Committed, out: &Out) {
 
 /// Whether this failure left the library exactly as it was — see `move`'s copy of
 /// this, which it shares the reasoning with.
-fn refused_without_writing(err: &Error) -> bool {
+pub(super) fn refused_without_writing(err: &Error) -> bool {
     matches!(
         err,
         Error::Commit(

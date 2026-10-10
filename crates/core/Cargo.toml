@@ -21,6 +21,9 @@ camino.workspace = true
 # D1). Container detection is by content, not extension, which is what task 16
 # needs for the mislabelled files in this library.
 lofty.workspace = true
+# Cover art (task 30): the opt-in downscale of a cover before it is embedded,
+# and a real JPEG for the fixtures. JPEG and PNG only; see the workspace entry.
+image.workspace = true
 serde.workspace = true
 # The journal is JSON on disk (task 11, `docs/PLAN.md` §7): one record per
 # transaction, read back after a crash by a build that may be newer than the one

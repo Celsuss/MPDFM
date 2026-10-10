@@ -148,6 +148,90 @@ pub fn embed_cover(path: &Utf8Path, data: &[u8]) {
     }
 }
 
+/// Embed a picture of any kind, in the FLAC's own `PICTURE` blocks rather than
+/// its comment block, and in an m4a's `covr` — the shapes [`embed_cover`] does
+/// not make (task 30).
+///
+/// `kind` is the ID3v2/FLAC picture type code: 3 is the front cover, 4 the back.
+/// An m4a has no picture types, so `kind` is ignored there. The MIME type is
+/// taken from the bytes.
+///
+/// # Panics
+///
+/// If `path` cannot be read or written.
+pub fn embed_picture(path: &Utf8Path, data: &[u8], kind: u8) {
+    let mime = match crate::art::ImageFormat::sniff(data) {
+        crate::art::ImageFormat::Png => MimeType::Png,
+        _ => MimeType::Jpeg,
+    };
+    let picture = Picture::unchecked(data.to_vec())
+        .pic_type(PictureType::from_u8(kind))
+        .mime_type(mime)
+        .build();
+
+    match detect(path) {
+        FileType::Mpeg => {
+            let mut file = mp3(path);
+            let _ = id3v2(&mut file).insert_picture(picture);
+            save(path, &file);
+        }
+        FileType::Flac => {
+            let mut file = flac(path);
+            file.insert_picture(picture, None)
+                .unwrap_or_else(|err| panic!("cannot embed a picture in {path}: {err}"));
+            save(path, &file);
+        }
+        FileType::Mp4 => {
+            let mut file = mp4(path);
+            let mut ilst = file.ilst().cloned().unwrap_or_default();
+            ilst.insert_picture(picture);
+            let _ = file.set_ilst(ilst);
+            save(path, &file);
+        }
+        other => panic!("{path} is {other:?}, which carries no pictures here"),
+    }
+}
+
+/// A real `width`×`height` JPEG, a gradient so it is not trivially compressible.
+///
+/// # Panics
+///
+/// Never, in practice: encoding an in-memory image cannot fail for lack of room.
+#[must_use]
+pub fn jpeg(width: u32, height: u32) -> Vec<u8> {
+    encoded(width, height, image::ImageFormat::Jpeg)
+}
+
+/// A real `width`×`height` PNG. Noisy, so a large one is genuinely large: a
+/// 1200×1200 one is a little over 4 MB, which is the oversized scene-release
+/// cover the task asks about.
+///
+/// # Panics
+///
+/// As [`jpeg`].
+#[must_use]
+pub fn png(width: u32, height: u32) -> Vec<u8> {
+    encoded(width, height, image::ImageFormat::Png)
+}
+
+/// An image in `format`, with content that varies per pixel.
+fn encoded(width: u32, height: u32, format: image::ImageFormat) -> Vec<u8> {
+    let mut seed = 0x9e37_79b9_u32;
+    let pixels = image::RgbImage::from_fn(width, height, |x, y| {
+        // xorshift: noise, so PNG's deflate has nothing to find.
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        let [a, b, ..] = seed.to_le_bytes();
+        image::Rgb([(x % 256) as u8 ^ a, (y % 256) as u8 ^ b, 128])
+    });
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(pixels)
+        .write_to(&mut out, format)
+        .expect("an in-memory image encodes");
+    out.into_inner()
+}
+
 /// A 1×1 transparent PNG — a real image, 67 bytes, decodable by anything.
 pub const COVER_PNG: &[u8] = &[
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,

@@ -388,8 +388,12 @@ pub struct Summary {
     #[serde(default)]
     pub tags_written: usize,
     /// Field edits across those files — three files with two fields each is six.
+    /// A cover edit counts as one.
     #[serde(default)]
     pub fields_changed: usize,
+    /// New files written into the library — an extracted cover (task 30).
+    #[serde(default)]
+    pub files_created: usize,
     /// Directories that will be created. An upper bound: `MkDir` is idempotent,
     /// so one whose directory already exists is a no-op at commit time.
     pub dirs_created: usize,
@@ -428,6 +432,7 @@ impl Summary {
                     summary.tags_written += 1;
                     summary.fields_changed += delta.len();
                 }
+                FsStep::ExtractArt { .. } => summary.files_created += 1,
                 FsStep::RmDirIfEmpty { .. } => summary.dirs_removed += 1,
             }
         }

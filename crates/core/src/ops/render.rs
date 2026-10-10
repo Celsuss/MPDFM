@@ -273,15 +273,21 @@ impl Effects {
 
         // `(field, rendered edit)` → the operations that write it, keeping field
         // order and then first-seen order within a field.
-        let mut counts: Vec<((crate::tags::Field, String), Vec<usize>)> = Vec::new();
+        let mut counts: Vec<((Changed, String), Vec<usize>)> = Vec::new();
         let mut refused = false;
         for effect in &self.ops {
             let Operation::WriteTags { changes, .. } = &effect.op else {
                 continue;
             };
             refused |= effect.refused;
-            for (field, edit) in changes.edits() {
-                let key = (*field, edit.rendered());
+            let fields = changes
+                .edits()
+                .iter()
+                .map(|(field, edit)| (Changed::Field(*field), edit.rendered()));
+            let cover = changes
+                .cover()
+                .map(|cover| (Changed::Cover, cover.rendered()));
+            for key in fields.chain(cover) {
                 match counts.iter_mut().find(|(seen, _)| *seen == key) {
                     Some((_, ops)) => ops.push(effect.index),
                     None => counts.push((key, vec![effect.index])),
@@ -296,7 +302,7 @@ impl Effects {
         let mut rows = Vec::new();
         let mut field = None;
         let mut group: Vec<(String, Vec<usize>)> = Vec::new();
-        let mut flush = |field: crate::tags::Field, group: &mut Vec<(String, Vec<usize>)>| {
+        let mut flush = |field: Changed, group: &mut Vec<(String, Vec<usize>)>| {
             let files: usize = group.iter().map(|(_, ops)| ops.len()).sum();
             let mut ops: Vec<usize> = group
                 .iter()
@@ -398,6 +404,24 @@ impl Effects {
     }
 }
 
+/// What one `TAG` row is about: a field, or the front cover — which is not a
+/// [`Field`][crate::tags::Field] but is staged, previewed and undone like one.
+/// Ordered so the cover's row comes after every field's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Changed {
+    Field(crate::tags::Field),
+    Cover,
+}
+
+impl std::fmt::Display for Changed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Field(field) => field.fmt(f),
+            Self::Cover => f.pad("cover"),
+        }
+    }
+}
+
 /// A [`PreviewLine`], at the call sites that build one of each.
 fn line(text: String, kind: LineKind) -> PreviewLine {
     PreviewLine { text, kind }
@@ -419,6 +443,11 @@ fn op_line(effect: &OpEffect, width: usize) -> String {
             format!("{left} → {right}")
         }
         Operation::Delete { target } => tail(target.as_str(), room),
+        Operation::ExtractArt { from, to, .. } => {
+            let budget = room.saturating_sub(3);
+            let (left, right) = share(from.as_str(), to.as_str(), budget);
+            format!("{left} → {right}")
+        }
         // Rendered by `tag_rows`, which collapses them by field; this arm is
         // unreachable from `render` and is here so that a caller formatting one
         // operation on its own still gets something true.

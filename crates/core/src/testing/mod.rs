@@ -308,6 +308,7 @@ impl Fixture {
             organize_template: DEFAULT_ORGANIZE_TEMPLATE.to_owned(),
             organize_portable_names: true,
             id3_version: crate::tags::Id3Version::default(),
+            image_protocol: crate::config::ImageProtocol::default(),
             sources: Sources {
                 music_dir: Source::Default,
                 playlist_dir: Source::Default,
@@ -322,6 +323,7 @@ impl Fixture {
                 organize_template: Source::Default,
                 organize_portable_names: Source::Default,
                 id3_version: Source::Default,
+                image_protocol: Source::Default,
             },
         }
     }

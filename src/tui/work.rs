@@ -176,6 +176,37 @@ pub fn read_tags(tx: Sender<Msg>, paths: Vec<RelPath>, root: Utf8PathBuf, log: A
     read(tx, paths, root, log, "tags", TaskOutcome::Tags);
 }
 
+/// Load one entry's cover art for the details pane (task 30).
+///
+/// A worker because a 5 MB PNG takes a visible moment to decode, and the decode
+/// happens exactly once per entry: the answer is cached by the app, and what the
+/// drawing thread does with it afterwards is encode a pane-sized copy.
+pub fn read_art(tx: Sender<Msg>, rel: RelPath, root: Utf8PathBuf, decode: bool, log: Arc<Log>) {
+    let fallback = tx.clone();
+    let spawned = thread::Builder::new()
+        .name("mpdfm-art".to_owned())
+        .spawn(move || {
+            let started = Instant::now();
+            let result = super::widgets::image::load(&rel, &rel.to_abs(&root), decode);
+            log.line(format!(
+                "art: {rel} in {} µs ({})",
+                started.elapsed().as_micros(),
+                match &result {
+                    Ok(Some(art)) => art.facts.to_string(),
+                    Ok(None) => "none".to_owned(),
+                    Err(err) => err.clone(),
+                }
+            ));
+            let _ = tx.send(Msg::TaskDone(Box::new(TaskOutcome::Art { rel, result })));
+        });
+    if let Err(err) = spawned {
+        let _ = fallback.send(Msg::TaskDone(Box::new(TaskOutcome::Failed {
+            what: "read cover art".to_owned(),
+            message: format!("cannot start the art thread: {err}"),
+        })));
+    }
+}
+
 /// Read every file the tag editor was opened on.
 ///
 /// [`read_tags`] answers a different question: the bulk view has to see the

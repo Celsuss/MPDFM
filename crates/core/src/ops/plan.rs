@@ -216,6 +216,13 @@ pub(super) fn validate(
                 // entry is affected by it — it is not a `PathMove`. It is still
                 // a file this operation touches, which is what the row counts.
                 FsStep::WriteTags { target, .. } => target,
+                // A new file, which no playlist can point at yet: one aux file
+                // of the picture's size, and nothing touched.
+                FsStep::ExtractArt { picture, .. } => {
+                    mine.files += 1;
+                    mine.bytes += picture.size;
+                    continue;
+                }
                 FsStep::MkDir { .. } | FsStep::RmDirIfEmpty { .. } => continue,
             };
             mine.files += 1;
@@ -360,8 +367,10 @@ fn execution_order(ops: &[Operation]) -> (Vec<usize>, Vec<Conflict>) {
         // A tag write has to happen while the file is still where it is: staging
         // "tag a/x.mp3" and "move a/x.mp3 to b/x.mp3" means both, in that order,
         // and the other order would leave the tag write with nothing to open.
-        // This is the only edge that is not about a destination being freed.
-        if let Operation::WriteTags { target, .. } = op {
+        // This is the only edge that is not about a destination being freed —
+        // and an extraction reads its track the same way, so it gets it too.
+        if let Operation::WriteTags { target, .. } | Operation::ExtractArt { from: target, .. } = op
+        {
             for (x, other) in ops.iter().enumerate() {
                 if x != y && other.vacates(target) {
                     blockers[x].insert(y);
@@ -565,6 +574,21 @@ fn expand(
                         .join("tags")
                         .join(target.as_str()),
                 ),
+            }]
+        }
+
+        Operation::ExtractArt { from, to, picture } => {
+            if lib.get(from).is_none() {
+                effects.conflicts.push(Conflict::SourceMissing {
+                    op: index,
+                    at: from.clone(),
+                });
+                return Vec::new();
+            }
+            vec![FsStep::ExtractArt {
+                from: from.clone(),
+                to: to.clone(),
+                picture: *picture,
             }]
         }
 

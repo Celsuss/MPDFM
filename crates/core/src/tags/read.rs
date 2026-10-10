@@ -203,7 +203,7 @@ pub(super) fn detect(abs: &Utf8Path) -> Result<(Format, Detected), TagError> {
 pub(super) const MAX_JUNK_BYTES: usize = 64 * 1024;
 
 /// The parse options every read in this module uses.
-pub(super) fn parse_options(properties: bool) -> ParseOptions {
+pub(crate) fn parse_options(properties: bool) -> ParseOptions {
     ParseOptions::new()
         .read_properties(properties)
         .max_junk_bytes(MAX_JUNK_BYTES)
@@ -234,7 +234,7 @@ fn format_of(abs: &Utf8Path, file_type: Option<FileType>) -> Result<Format, TagE
 /// `options` decides whether the audio properties are parsed; the properties
 /// come back either way and are [`FileProperties::default`] — every field zero —
 /// when they were not asked for.
-pub(super) fn open(
+pub(crate) fn open(
     abs: &Utf8Path,
     options: ParseOptions,
 ) -> Result<(Parsed, FileProperties, Format), TagError> {

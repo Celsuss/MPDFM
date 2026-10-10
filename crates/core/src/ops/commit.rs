@@ -793,6 +793,9 @@ fn sources(steps: &[FsStep]) -> Vec<RelPath> {
         .filter_map(|step| match step {
             FsStep::RenameFile { from, .. } | FsStep::CopyDelete { from, .. } => Some(from),
             FsStep::RemoveFile { target, .. } | FsStep::WriteTags { target, .. } => Some(target),
+            // The track the picture comes out of: if it changed since the
+            // preview, so may the picture.
+            FsStep::ExtractArt { from, .. } => Some(from),
             FsStep::MkDir { .. } | FsStep::RmDirIfEmpty { .. } => None,
         })
         .filter(|path| seen.insert((*path).clone()))
@@ -986,6 +989,9 @@ pub fn affected_dirs(steps: &[FsStep]) -> Vec<DirPath> {
             FsStep::RemoveFile { target, .. } | FsStep::WriteTags { target, .. } => {
                 dirs.push(DirPath::of(target));
             }
+            // MPD does not index images, but its `albumart` command reads the
+            // directory, and a rescan of one album is cheap.
+            FsStep::ExtractArt { to, .. } => dirs.push(DirPath::of(to)),
             // The directory may well be gone; its parent covers it.
             FsStep::RmDirIfEmpty { at } => {
                 dirs.push(

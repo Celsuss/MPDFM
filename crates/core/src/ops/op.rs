@@ -12,6 +12,7 @@
 //! an `Operation` has to be cheap to hold, cheap to compare, and free of anything
 //! derived — no step counts, no byte totals, no conflict flags.
 
+use crate::art::ImageFacts;
 use crate::config::Config;
 use crate::library::Library;
 use crate::paths::RelPath;
@@ -74,6 +75,23 @@ pub enum Operation {
         /// Which fields change, and to what.
         changes: TagDelta,
     },
+
+    /// Copy one picture embedded in a track out into a new image file — `cover
+    /// extract` (task 30).
+    ///
+    /// The bytes are the embedded picture's, exactly: nothing is decoded or
+    /// re-encoded. The picture is named by its [`ImageFacts`] rather than carried,
+    /// so a plan stays small, and the extraction is refused if the track no
+    /// longer holds a picture with that size and hash. Like every other
+    /// operation it never overwrites: an image already at `to` is a conflict.
+    ExtractArt {
+        /// The track the picture is in.
+        from: RelPath,
+        /// The image file to create.
+        to: RelPath,
+        /// Which picture.
+        picture: ImageFacts,
+    },
 }
 
 impl Operation {
@@ -83,6 +101,7 @@ impl Operation {
         match self {
             Self::MoveFile { from, .. } | Self::MoveDir { from, .. } => from,
             Self::Delete { target } | Self::WriteTags { target, .. } => target,
+            Self::ExtractArt { from, .. } => from,
         }
     }
 
@@ -91,7 +110,9 @@ impl Operation {
     #[must_use]
     pub fn destination(&self) -> Option<&RelPath> {
         match self {
-            Self::MoveFile { to, .. } | Self::MoveDir { to, .. } => Some(to),
+            Self::MoveFile { to, .. } | Self::MoveDir { to, .. } | Self::ExtractArt { to, .. } => {
+                Some(to)
+            }
             Self::Delete { .. } | Self::WriteTags { .. } => None,
         }
     }
@@ -108,8 +129,9 @@ impl Operation {
         match self {
             Self::MoveFile { from, .. } | Self::Delete { target: from } => from == path,
             Self::MoveDir { from, .. } => path == from || path.starts_with_dir(from),
-            // A tag write leaves the file exactly where it is.
-            Self::WriteTags { .. } => false,
+            // A tag write leaves the file exactly where it is, and an
+            // extraction only reads it.
+            Self::WriteTags { .. } | Self::ExtractArt { .. } => false,
         }
     }
 
@@ -121,6 +143,7 @@ impl Operation {
             Self::MoveDir { .. } => "MOVE",
             Self::Delete { .. } => "DELETE",
             Self::WriteTags { .. } => "TAG",
+            Self::ExtractArt { .. } => "COVER",
         }
     }
 }
@@ -132,6 +155,7 @@ impl std::fmt::Display for Operation {
             Self::MoveDir { from, to } => write!(f, "move {from}/ -> {to}/"),
             Self::Delete { target } => write!(f, "delete {target}"),
             Self::WriteTags { target, changes } => write!(f, "tag {target}: {changes}"),
+            Self::ExtractArt { from, to, .. } => write!(f, "extract cover {from} -> {to}"),
         }
     }
 }

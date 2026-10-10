@@ -5,6 +5,7 @@
 //! `mpdfm` binary's CLI and TUI) are built on top of it, never the other way
 //! around — see `docs/PLAN.md` §4.
 
+pub mod art;
 pub mod config;
 pub mod doctor;
 pub mod journal;
@@ -92,6 +93,10 @@ pub enum Error {
     /// A file's tags could not be read, or could not be written.
     #[error(transparent)]
     Tag(#[from] tags::TagError),
+
+    /// An image that cannot be used as cover art.
+    #[error(transparent)]
+    Art(#[from] art::ArtError),
 
     /// An `organize` template that does not parse.
     #[error(transparent)]
