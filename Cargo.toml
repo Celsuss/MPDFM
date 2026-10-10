@@ -11,6 +11,10 @@ anyhow = "=1.0.104"
 assert_cmd = "=2.2.2"
 camino = { version = "=1.2.6", features = ["serde1"] }
 clap = { version = "=4.6.7", features = ["derive"] }
+# Shell completions and the man page, both generated from the same `clap` tree the
+# parser is built from, so neither can drift (task 31).
+clap_complete = "=4.6.11"
+clap_mangen = "=0.3.3"
 crossterm = "=0.29.0"
 insta = "=1.48.0"
 # Cover art (task 30): decoding JPEG and PNG for the TUI's image protocols, and
@@ -62,6 +66,8 @@ mpdfm-core.workspace = true
 anyhow.workspace = true
 camino.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
+clap_mangen.workspace = true
 # Decoding cover art for the kitty and sixel protocols, which take pixels rather
 # than a JPEG (task 30). Already in the tree through core.
 image.workspace = true

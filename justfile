@@ -20,6 +20,14 @@ test:
 build:
     cargo build --workspace
 
+# The man pages and shell completions, generated from the argument definitions into
+# target/docs. `man -l target/docs/man/mpdfm.1` to read one.
+docs:
+    cargo build --quiet
+    mkdir -p target/docs/completions
+    ./target/debug/mpdfm man --dir target/docs/man
+    for shell in bash zsh fish; do ./target/debug/mpdfm completions $shell > target/docs/completions/mpdfm.$shell; done
+
 # Pass arguments through, e.g. `just run scan --json`.
 run *ARGS:
     cargo run --quiet -- {{ARGS}}
