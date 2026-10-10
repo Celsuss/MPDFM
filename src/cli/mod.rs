@@ -133,7 +133,7 @@ pub enum Command {
     Scan,
 
     /// Report library and playlist health.
-    Doctor,
+    Doctor(DoctorArgs),
 
     /// Move or rename a file or directory, rewriting every reference to it.
     Move(MoveArgs),
@@ -230,6 +230,28 @@ pub struct OrganizeArgs {
     /// each copied file.
     #[arg(long)]
     pub verify: bool,
+}
+
+/// `mpdfm doctor [--check NAME]... [--full] [--deep]`
+///
+/// Every check runs unless `--check` names some. A name is a check's own
+/// (`broken-references`) or a group's (`references`, `tags`, `filesystem`,
+/// `duplicates`); `--json` lists every check's name under `checks`.
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// Run only this check, or this group of checks; repeatable, or
+    /// comma-separated.
+    #[arg(long, value_name = "NAME", value_delimiter = ',')]
+    pub check: Vec<String>,
+
+    /// List every finding instead of the first ten of each check.
+    #[arg(long)]
+    pub full: bool,
+
+    /// Also find byte-identical audio files. Reads every same-sized file in
+    /// full, which on a large library is minutes of I/O.
+    #[arg(long)]
+    pub deep: bool,
 }
 
 /// `mpdfm undo [TXID]`
@@ -523,7 +545,7 @@ pub fn run() -> Result<ExitCode> {
             ConfigCommand::Show => config::show(&cli, &settings, &warnings),
         },
         Command::Scan => scan::run(&cli, &settings, &out),
-        Command::Doctor => doctor::run(&cli, &settings, &out),
+        Command::Doctor(args) => doctor::run(&cli, &settings, &out, args),
         Command::Move(args) => r#move::run(&cli, &settings, &out, args),
         Command::Organize(args) => organize::run(&cli, &settings, &out, args),
         Command::Undo(args) => undo::run(&cli, &settings, &out, args),

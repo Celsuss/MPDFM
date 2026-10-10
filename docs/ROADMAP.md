@@ -106,7 +106,7 @@ without a second thread joining the first.
 
 | # | Task | Depends on | Status |
 | --- | --- | --- | --- |
-| 29 | [Library doctor](tasks/29-doctor.md) | 07, 15, 16 | not started |
+| 29 | [Library doctor](tasks/29-doctor.md) | 07, 15, 16 | done |
 | 30 | [Cover art](tasks/30-cover-art.md) | 16, 17, 22 | not started |
 
 ## M6 — Polish
@@ -182,7 +182,11 @@ one of the large ones (08, 10, 11, 22, 27).
   emit — an invalid `TDRC`, a `WXXX` with no description, a v2.4-only frame in a
   v2.3 tag. Task 17 measured them and leaves them alone; naming them is task 29's
   business, not the writer's.
-- How much of `--deep` duplicate detection is worth it on a 2 800-file library
-  (task 29) — measure before building the hash pass.
+- ~~How much of `--deep` duplicate detection is worth it on a 2 800-file library
+  (task 29) — measure before building the hash pass.~~ **Cheap, because size
+  goes first.** Only 6 of the real library's 2 809 audio files share a size with
+  another, so `--deep` hashes 6 files and adds ~30 ms; none of them are
+  identical. It stays opt-in anyway, because a library of rips from one source
+  can share sizes far more often. Numbers in task 29.
 - Whether to add a `mpdfm find` CLI command mirroring the TUI query parser
   (task 25) — cheap once the parser is in core.

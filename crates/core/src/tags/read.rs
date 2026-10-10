@@ -104,6 +104,34 @@ pub fn read_tags(abs: &Utf8Path) -> Result<TagSet, TagError> {
     Ok(tag_set(native))
 }
 
+/// Which tag blocks a file carries, beyond what its [`TagSet`] shows.
+///
+/// A [`TagSet`] is read from the file's *primary* tag only — ID3v2 for an mp3 —
+/// so an mp3 carrying nothing but an ID3v1 tag reads as empty, exactly like one
+/// with no tag at all. Those are different situations for `doctor` (task 29):
+/// one has metadata MPD can see and MPDFM cannot edit, the other has none. This
+/// is what tells them apart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TagLayout {
+    /// The container's own tag is there: ID3v2, a Vorbis comment block, `ilst`.
+    pub primary: bool,
+    /// An ID3v1 tag is there. Only ever true for an mp3.
+    pub id3v1: bool,
+}
+
+/// [`read_tags`], plus which tag blocks the file carries.
+///
+/// The same single parse, so `doctor` pays nothing extra for knowing.
+///
+/// # Errors
+///
+/// As [`read`].
+pub fn read_tags_with_layout(abs: &Utf8Path) -> Result<(TagSet, TagLayout), TagError> {
+    let (native, _, _) = open(abs, parse_options(false))?;
+    let layout = native.layout();
+    Ok((tag_set(native), layout))
+}
+
 /// Read the tags of many files, keeping each one's own answer.
 ///
 /// One entry per input path, in the order given, each holding either its
@@ -534,6 +562,24 @@ pub(super) enum NativeTagData {
 }
 
 impl Parsed {
+    /// Which tag blocks the parsed file carries.
+    pub(super) fn layout(&self) -> TagLayout {
+        match self {
+            Self::Mpeg(file) => TagLayout {
+                primary: file.id3v2().is_some(),
+                id3v1: file.id3v1().is_some(),
+            },
+            Self::Flac(file) => TagLayout {
+                primary: file.vorbis_comments().is_some(),
+                id3v1: false,
+            },
+            Self::Mp4(file) => TagLayout {
+                primary: file.ilst().is_some(),
+                id3v1: false,
+            },
+        }
+    }
+
     /// The file's primary tag, or `None` when it has none.
     ///
     /// For a FLAC that is the Vorbis comment block and deliberately not an
