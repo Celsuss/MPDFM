@@ -2,7 +2,7 @@
 
 - **Phase:** M4 · Organize by template
 - **Depends on:** 10, 15, 24, 27
-- **Status:** not started
+- **Status:** done
 
 ## Goal
 
@@ -40,22 +40,95 @@ playlist), the preview must be scrollable and the commit must show progress.
 
 ## Acceptance criteria
 
-- [ ] `organize --dry-run` on the real library (read-only) completes and reports
+- [x] `organize --dry-run` on the real library (read-only) completes and reports
       counts of placeable, already-correct and unplaceable files
-- [ ] organizing a fixture album moves audio + aux and rewrites all playlist
+- [x] organizing a fixture album moves audio + aux and rewrites all playlist
       references; every previously resolvable reference still resolves
-- [ ] `undo` after an organize restores a byte-identical fixture
-- [ ] unplaceable files are listed and untouched
-- [ ] `--only-missing` skips files already at their destination
-- [ ] `--limit 5` stages exactly 5 files' worth of moves
-- [ ] collisions block the commit and are listed with both sources
-- [ ] the TUI organize view previews live as the template is typed and an
+- [x] `undo` after an organize restores a byte-identical fixture
+- [x] unplaceable files are listed and untouched
+- [x] `--only-missing` skips files already at their destination
+- [x] `--limit 5` stages exactly 5 files' worth of moves
+- [x] collisions block the commit and are listed with both sources
+- [x] the TUI organize view previews live as the template is typed and an
       invalid template shows an inline error
-- [ ] a 2 000-op plan previews without the UI stalling, and commit shows progress
+- [x] a 2 000-op plan previews without the UI stalling, and commit shows progress
+
+## Hand-verified against the real library
+
+Read-only, as `docs/PLAN.md` §8 allows: `mpdfm organize --dry-run --no-mpd`
+with the default template, release build. **1 852 tracks and 135 aux files
+placeable, 0 already in place, 957 unplaceable** (task 27's 956 plus the one
+ADTS-in-`.mp3` file whose tags cannot be read), 0 collisions, 31 split-album
+warnings and 6 case-only warnings. The to-do list is 957 files in 138
+directories. 0.4 s end to end with the tags in the page cache. Exit 0, nothing
+written.
+
+## Measured at scale
+
+- **CLI** (`two_thousand_files_organize_and_undo_byte_identically`): 2 000
+  tracks + 200 aux files in 200 albums, one playlist naming every track. Organize
+  and commit took ~3 s end to end in a debug build; the journal is **2.9 MB**.
+  `undo` restores the fixture byte for byte.
+- **TUI** (`a_two_thousand_file_organize_stages_and_scrolls_without_stalling`):
+  `enter` maps, validates and stages 2 000 ops in **206 ms** release (663 ms
+  debug), and the pending view then scrolls at **3.7 ms per frame** release
+  (18.8 ms debug). Per-frame cost grows with the plan, since the pending view
+  lays out the whole preview each frame; it is well inside a 60 Hz frame at
+  this size, and the first place to look if a larger plan ever stutters.
+
+## Decisions
+
+**Per-file `MoveFile`s, never `MoveDir`.** Task 27's mapping has already
+decided where every aux file goes (`Mapping::operations`). A directory move
+would be a second, coarser opinion that also sweeps up whatever the scan could
+not model.
+
+**Mapping conflicts refuse the whole run**, in the CLI (exit 2, every source
+listed) and in the TUI (an error panel over the still-open organize view). The
+mapping drops colliding files from its moves, so staging the rest would commit
+cleanly and leave them behind without a word.
+
+**An unreadable file does not refuse the run**, unlike `tag set`: nothing is
+written to it, it simply stays where it is and goes on the to-do list.
+
+**`--only-missing` maps with `Template::strict()`**: every `{x?}` and
+`{x|default}` becomes required, so a file is only placed when its tags are
+complete. Files already in place are skipped in either mode; the strictness is
+the difference.
+
+**`--limit N` maps again on the first N moving tracks** rather than cutting
+the full mapping, so an album the limit splits keeps its aux files where they
+are, as any split album does.
+
+**Output order.** Preview, then split and case warnings, then collisions, then
+the counts in bold, then the prompt, which names the file count ("Move 1 987
+files?"). The to-do list comes last, grouped by directory and reason.
+
+**The TUI view edits like the `:` line.** It takes `[command]`'s bindings, so
+every letter types itself. Only the first 20 files are rendered per keystroke;
+the full mapping runs on `enter`. Directories among the marks are expanded
+recursively, and with nothing marked or under the cursor, `o` means the
+directory on screen.
+
+**Not exposed:** `SplitAux::FollowMajority` and lower-casing extensions. Both
+are `Options` fields in core, waiting for a flag if wanted.
+
+## Found along the way
+
+Bare `mpdfm undo` picks the newest transaction by `TxId`, but two ids minted by
+*different processes* in the same second sort by their random salt. So
+`mpdfm tag set …; mpdfm organize …; mpdfm undo` within one second can choose the
+tag write. Here it refused safely, because the files had moved. The comment on
+`TxId` says only retention reads the order, and that is not true. Not fixed here:
+`tests/cli_organize.rs` undoes by explicit txid. Worth its own task.
 
 ## Files
 
 `src/cli/organize.rs`, `src/tui/views/organize.rs`, `tests/cli_organize.rs`
+
+Also touched: `crates/core/src/organize/{template.rs,plan.rs}`
+(`Template::strict`, `Mapping::operations`, `Mapping::tracks_moving`),
+`src/cli/{mod.rs,move.rs,tag.rs}`, `src/tui/{app.rs,msg.rs,work.rs,views/mod.rs}`.
 
 ## Pitfalls
 

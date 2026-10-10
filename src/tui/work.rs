@@ -187,10 +187,19 @@ pub fn read_selection(tx: Sender<Msg>, paths: Vec<RelPath>, root: Utf8PathBuf, l
     read(tx, paths, root, log, "selection", TaskOutcome::Selection);
 }
 
-/// The body both reads share: one thread, one message, whatever happened.
+/// Read every file the organize view is about, on a thread (task 28).
+///
+/// The whole library at the outside — 2 800 opens, which is seconds — so
+/// never on the keypress that opens the view. The view says what it is waiting
+/// for and the template can be typed meanwhile.
+pub fn read_organize(tx: Sender<Msg>, paths: Vec<RelPath>, root: Utf8PathBuf, log: Arc<Log>) {
+    read(tx, paths, root, log, "organize", TaskOutcome::Organize);
+}
+
+/// The body every read shares: one thread, one message, whatever happened.
 ///
 /// `wrap` is the only difference between them, and it is a function pointer
-/// rather than two copies of the thread because the part that must not drift is
+/// rather than three copies of the thread because the part that must not drift is
 /// "exactly one answer comes back" — the app holds a flag or a half-open view
 /// that a missing answer would strand.
 fn read(

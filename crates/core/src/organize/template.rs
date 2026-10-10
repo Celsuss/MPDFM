@@ -338,6 +338,44 @@ impl Template {
         &self.source
     }
 
+    /// This template with every `{field?}` and `{field|default}` made required.
+    ///
+    /// What `mpdfm organize --only-missing` maps with (task 28): a file is only
+    /// "complete" if the template can place it without leaving a segment out or
+    /// falling back to a literal, so a file the lenient template would file
+    /// under `Unsorted` is reported as missing `genre` instead.
+    ///
+    /// ```
+    /// use mpdfm_core::organize::{RenderContext, Template, Unplaceable, Token};
+    /// use mpdfm_core::paths::RelPath;
+    /// use mpdfm_core::tags::{TagSet, Values};
+    ///
+    /// let lenient = Template::parse("{genre|Unsorted}/{album}/{title}")?;
+    /// let tags = TagSet {
+    ///     album: Values::one("Mm..Food"),
+    ///     title: Values::one("Beef Rap"),
+    ///     ..TagSet::default()
+    /// };
+    /// let from = RelPath::parse("a/01.mp3")?;
+    /// let ctx = RenderContext::default();
+    /// assert!(lenient.render(&from, &tags, &ctx).is_ok());
+    /// assert_eq!(
+    ///     lenient.strict().render(&from, &tags, &ctx),
+    ///     Err(Unplaceable::Missing(vec![Token::Genre])),
+    /// );
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn strict(&self) -> Self {
+        let mut strict = self.clone();
+        for part in strict.segments.iter_mut().flatten() {
+            if let Part::Field(field) = part {
+                field.absent = Absent::Required;
+            }
+        }
+        strict
+    }
+
     /// Whether the template mentions `token` anywhere.
     #[must_use]
     pub fn uses(&self, token: Token) -> bool {
