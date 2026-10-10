@@ -63,6 +63,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     "delete_enabled",
     "backup_keep",
     "organize_template",
+    "organize_portable_names",
     "id3_version",
 ];
 
@@ -639,6 +640,10 @@ pub struct Config {
     pub backup_keep: u32,
     /// The default path template for `organize`.
     pub organize_template: String,
+    /// Whether `organize` also replaces the characters FAT and NTFS refuse
+    /// (`: * ? " < > | \` and control characters), so the library survives a
+    /// copy onto a phone or a USB stick. On by default.
+    pub organize_portable_names: bool,
     /// Which ID3v2 revision a tag write leaves an mp3 in.
     pub id3_version: crate::tags::Id3Version,
     /// Where each of the above came from.
@@ -670,6 +675,8 @@ pub struct Sources {
     pub backup_keep: Source,
     /// Where [`Config::organize_template`] came from.
     pub organize_template: Source,
+    /// Where [`Config::organize_portable_names`] came from.
+    pub organize_portable_names: Source,
     /// Where [`Config::id3_version`] came from.
     pub id3_version: Source,
 }
@@ -749,6 +756,11 @@ impl Config {
                 name: "organize_template",
                 value: self.organize_template.clone(),
                 source: s.organize_template.clone(),
+            },
+            Setting {
+                name: "organize_portable_names",
+                value: self.organize_portable_names.to_string(),
+                source: s.organize_portable_names.clone(),
             },
             Setting {
                 name: "id3_version",
@@ -1202,6 +1214,9 @@ impl Resolver<'_> {
         let (organize_template, organize_template_source) = self
             .toml_str("organize_template")
             .unwrap_or_else(|| (DEFAULT_ORGANIZE_TEMPLATE.to_owned(), Source::Default));
+        let (organize_portable_names, organize_portable_names_source) = self
+            .toml_bool("organize_portable_names")
+            .unwrap_or((true, Source::Default));
         let (id3_version, id3_version_source) = self.id3_version();
 
         Config {
@@ -1216,6 +1231,7 @@ impl Resolver<'_> {
             delete_enabled,
             backup_keep,
             organize_template,
+            organize_portable_names,
             id3_version,
             sources: Sources {
                 music_dir: music_dir_source,
@@ -1229,6 +1245,7 @@ impl Resolver<'_> {
                 delete_enabled: delete_enabled_source,
                 backup_keep: backup_keep_source,
                 organize_template: organize_template_source,
+                organize_portable_names: organize_portable_names_source,
                 id3_version: id3_version_source,
             },
         }
@@ -2101,6 +2118,7 @@ mod tests {
                 "delete_enabled",
                 "backup_keep",
                 "organize_template",
+                "organize_portable_names",
                 "id3_version"
             ]
         );

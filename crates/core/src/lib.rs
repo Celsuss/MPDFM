@@ -11,6 +11,7 @@ pub mod library;
 pub mod mpd;
 pub mod mpdconf;
 pub mod ops;
+pub mod organize;
 pub mod paths;
 pub mod playlist;
 pub mod query;
@@ -90,6 +91,10 @@ pub enum Error {
     /// A file's tags could not be read, or could not be written.
     #[error(transparent)]
     Tag(#[from] tags::TagError),
+
+    /// An `organize` template that does not parse.
+    #[error(transparent)]
+    Template(#[from] organize::TemplateError),
 
     /// An I/O failure, with the path that caused it.
     #[error("{path}: {source}")]
