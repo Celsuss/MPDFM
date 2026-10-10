@@ -55,7 +55,7 @@ pub use bulk::{BulkView, FieldValue, MULTIPLE, merge, title_from_filename};
 pub use model::{
     AudioInfo, FIELDS, Field, NumberPair, SEPARATOR, TagSet, Values, parse_pair, render_pair,
 };
-pub use read::{read, read_many, read_tags};
+pub use read::{TagLayout, read, read_many, read_tags, read_tags_with_layout};
 pub use write::{Edit, Id3Version, TagBackup, TagDelta, WriteOpts, restore, write};
 
 use camino::{Utf8Path, Utf8PathBuf};
