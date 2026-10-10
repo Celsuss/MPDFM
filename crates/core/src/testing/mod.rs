@@ -306,6 +306,7 @@ impl Fixture {
             delete_enabled: true,
             backup_keep: DEFAULT_BACKUP_KEEP,
             organize_template: DEFAULT_ORGANIZE_TEMPLATE.to_owned(),
+            organize_portable_names: true,
             id3_version: crate::tags::Id3Version::default(),
             sources: Sources {
                 music_dir: Source::Default,
@@ -319,6 +320,7 @@ impl Fixture {
                 delete_enabled: Source::Default,
                 backup_keep: Source::Default,
                 organize_template: Source::Default,
+                organize_portable_names: Source::Default,
                 id3_version: Source::Default,
             },
         }

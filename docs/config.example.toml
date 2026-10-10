@@ -80,6 +80,13 @@
 # `--template`.
 # organize_template = "{genre}/{albumartist}/{year} - {album}/{track:02} {title}"
 
+# Whether `organize` also replaces the characters FAT and NTFS refuse in a name —
+# `: * ? " < > | \` and control characters — with `_`. On by default, because a
+# library tends to end up on a phone or a USB stick eventually, and a name ext4
+# accepts and FAT refuses is a file that silently fails to copy. `/` and NUL are
+# replaced whatever this says: no Linux filesystem accepts them in a name.
+# organize_portable_names = true
+
 # The TUI's key bindings are *not* in this file: they live in `keys.toml`, in this
 # same directory, and `docs/keys.example.toml` documents them. Two files because
 # they are two things — this one is read by every command, that one only by the

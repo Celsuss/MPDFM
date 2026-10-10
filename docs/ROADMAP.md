@@ -99,7 +99,7 @@ without a second thread joining the first.
 
 | # | Task | Depends on | Status |
 | --- | --- | --- | --- |
-| 27 | [Template engine](tasks/27-template-engine.md) | 02, 05, 16 | not started |
+| 27 | [Template engine](tasks/27-template-engine.md) | 02, 05, 16 | done |
 | 28 | [`mpdfm organize`](tasks/28-organize-command.md) | 10, 15, 24, 27 | not started |
 
 ## M5 — Extras
