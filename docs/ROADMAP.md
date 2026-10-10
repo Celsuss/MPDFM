@@ -113,7 +113,7 @@ without a second thread joining the first.
 
 | # | Task | Depends on | Status |
 | --- | --- | --- | --- |
-| 31 | [Documentation](tasks/31-docs-and-readme.md) | 15, 19, 26, 28 | not started |
+| 31 | [Documentation](tasks/31-docs-and-readme.md) | 15, 19, 26, 28 | done |
 | 32 | [Packaging and release](tasks/32-packaging-and-release.md) | 31 | not started |
 
 ---

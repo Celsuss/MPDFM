@@ -7,9 +7,11 @@
 //! [`crate::output`] holds the exit codes and the output mode, because those are
 //! a contract shared by every command rather than a detail of any one of them.
 
+mod completions;
 mod config;
 mod cover;
 mod doctor;
+mod examples;
 #[path = "move.rs"]
 mod r#move;
 mod mpd;
@@ -125,40 +127,57 @@ pub struct TuiArgs {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Show where MPDFM is looking and why.
+    #[command(after_help = examples::CONFIG)]
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
     },
 
     /// Survey the library: counts by format, album dirs, warnings.
+    #[command(after_help = examples::SCAN)]
     Scan,
 
     /// Report library and playlist health.
+    #[command(after_help = examples::DOCTOR)]
     Doctor(DoctorArgs),
 
     /// Move or rename a file or directory, rewriting every reference to it.
+    #[command(after_help = examples::MOVE)]
     Move(MoveArgs),
 
     /// Re-file tracks into template-derived paths, rewriting every reference.
+    #[command(after_help = examples::ORGANIZE)]
     Organize(OrganizeArgs),
 
     /// Read and write audio tags.
+    #[command(after_help = examples::TAG)]
     Tag {
         #[command(subcommand)]
         command: TagCommand,
     },
 
     /// See, extract and set album art.
+    #[command(after_help = examples::COVER)]
     Cover {
         #[command(subcommand)]
         command: CoverCommand,
     },
 
     /// Reverse a committed transaction.
+    #[command(after_help = examples::UNDO)]
     Undo(UndoArgs),
 
     /// Finish or roll back a transaction that a crash left pending.
+    #[command(after_help = examples::RECOVER)]
     Recover(RecoverArgs),
+
+    /// Print a shell completion script (bash, zsh, fish, elvish, powershell).
+    #[command(after_help = examples::COMPLETIONS)]
+    Completions(CompletionsArgs),
+
+    /// Print the mpdfm(1) man page, or write it and one per subcommand to a directory.
+    #[command(after_help = examples::MAN)]
+    Man(ManArgs),
 }
 
 /// `mpdfm move <SRC> <DST>`
@@ -303,6 +322,22 @@ pub struct RecoverArgs {
     pub yes: bool,
 }
 
+/// `mpdfm completions <SHELL>`
+#[derive(Debug, Args)]
+pub struct CompletionsArgs {
+    /// The shell to generate for.
+    pub shell: clap_complete::Shell,
+}
+
+/// `mpdfm man [--dir DIR]`
+#[derive(Debug, Args)]
+pub struct ManArgs {
+    /// Write `mpdfm.1` and one `mpdfm-<subcommand>.1` per subcommand into DIR
+    /// (created if missing) instead of printing `mpdfm.1`.
+    #[arg(long, value_name = "DIR")]
+    pub dir: Option<Utf8PathBuf>,
+}
+
 /// `mpdfm cover …`
 ///
 /// `ALBUM_DIR` is a directory relative to the music directory, or absolute
@@ -312,17 +347,21 @@ pub struct RecoverArgs {
 pub enum CoverCommand {
     /// Show embedded and loose art for a track or an album directory, and what
     /// disagrees between them.
+    #[command(after_help = examples::COVER_SHOW)]
     Show(CoverShowArgs),
 
     /// Embed an image as the front cover of every track in an album, replacing
     /// any front cover already there.
+    #[command(after_help = examples::COVER_SET)]
     Set(CoverSetArgs),
 
     /// Write the album's embedded cover out as an image file beside its tracks.
+    #[command(after_help = examples::COVER_EXTRACT)]
     Extract(CoverExtractArgs),
 
     /// Remove the embedded front cover from every track in an album, leaving any
     /// other pictures.
+    #[command(after_help = examples::COVER_REMOVE)]
     Remove(CoverRemoveArgs),
 }
 
@@ -394,6 +433,7 @@ pub struct CoverRemoveArgs {
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
     /// Print every resolved setting with the source that supplied it.
+    #[command(after_help = examples::CONFIG_SHOW)]
     Show,
 }
 
@@ -402,12 +442,15 @@ pub enum ConfigCommand {
 #[derive(Debug, Subcommand)]
 pub enum TagCommand {
     /// Print the tags of a file, or of every audio file in a directory.
+    #[command(after_help = examples::TAG_SHOW)]
     Show(TagShowArgs),
 
-    /// Write tags.
+    /// Write tags to files or whole directories, previewing the change first.
+    #[command(after_help = examples::TAG_SET)]
     Set(TagSetArgs),
 
     /// Show what `tag set` would change, and write nothing.
+    #[command(after_help = examples::TAG_DIFF)]
     Diff(TagSetArgs),
 }
 
@@ -610,6 +653,15 @@ fn report(cli: &Cli, warnings: &[ConfigWarning]) {
 /// Parse arguments and run.
 pub fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
+
+    // Pure functions of the argument definitions: they need no library, no
+    // configuration and no journal, and must work on a machine where none of
+    // those exist yet — which is exactly where a package build runs them.
+    match &cli.command {
+        Some(Command::Completions(args)) => return completions::script(args),
+        Some(Command::Man(args)) => return completions::man(args),
+        _ => {}
+    }
     cli.trace(cli.globals.describe());
 
     // Resolved once, before anything dispatches: every command downstream
@@ -649,6 +701,7 @@ pub fn run() -> Result<ExitCode> {
             TagCommand::Set(args) => tag::set(&cli, &settings, &out, args, false),
             TagCommand::Diff(args) => tag::set(&cli, &settings, &out, args, true),
         },
+        Command::Completions(_) | Command::Man(_) => unreachable!("handled before resolution"),
         Command::Cover { command } => match command {
             CoverCommand::Show(args) => cover::show(&cli, &settings, &out, args),
             CoverCommand::Set(args) => cover::set(&cli, &settings, &out, args),
@@ -739,7 +792,17 @@ mod tests {
         let cmd = Cli::command();
         let names: Vec<&str> = cmd.get_subcommands().map(|s| s.get_name()).collect();
         for expected in [
-            "config", "scan", "doctor", "move", "organize", "tag", "cover", "undo", "recover",
+            "config",
+            "scan",
+            "doctor",
+            "move",
+            "organize",
+            "tag",
+            "cover",
+            "undo",
+            "recover",
+            "completions",
+            "man",
         ] {
             assert!(names.contains(&expected), "missing subcommand `{expected}`");
         }
@@ -871,5 +934,106 @@ mod tests {
         };
         assert_eq!(args.fields.edits(), ["genre=Hip Hop", "comment=<cleared>"]);
         assert_eq!(args.paths, [Utf8PathBuf::from("rock/a.mp3")]);
+    }
+    /// Every command in the tree, depth first, with the words it is invoked by.
+    fn walk(cmd: &clap::Command, path: &str, out: &mut Vec<(String, clap::Command)>) {
+        for sub in cmd.get_subcommands().filter(|s| s.get_name() != "help") {
+            let name = format!("{path} {}", sub.get_name());
+            out.push((name.clone(), sub.clone()));
+            walk(sub, &name, out);
+        }
+    }
+
+    #[test]
+    fn every_command_has_a_description_and_an_example() {
+        let mut all = Vec::new();
+        walk(&Cli::command(), "mpdfm", &mut all);
+        assert!(all.len() >= 18, "the walk found only {all:?}");
+
+        for (name, cmd) in &all {
+            let about = cmd.get_about().map(ToString::to_string).unwrap_or_default();
+            assert!(
+                about.len() > 15,
+                "`{name}` has no real description: {about:?}"
+            );
+
+            let after = cmd
+                .get_after_help()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            assert!(
+                after.starts_with("Examples:"),
+                "`{name}` has no example in its --help"
+            );
+            // An example must name the command it is an example of.
+            assert!(
+                after.contains(name.as_str()) || cmd.has_subcommands(),
+                "`{name}`'s examples never run it:\n{after}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_example_in_the_help_parses() {
+        // An example that does not parse is worse than none: the user types it.
+        // Each is split the way a shell would, quotes included, and `#` comments
+        // dropped.
+        let mut all = Vec::new();
+        walk(&Cli::command(), "mpdfm", &mut all);
+        let mut seen = 0;
+        for (name, cmd) in &all {
+            let after = cmd
+                .get_after_help()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            for line in after.lines().skip(1).map(str::trim) {
+                if !line.starts_with("mpdfm ") {
+                    continue;
+                }
+                let line = line.split(" #").next().unwrap_or(line);
+                let argv = shell_words(line);
+                // `mpdfm man | man -l -` and `> file` are shell, not arguments.
+                let argv: Vec<_> = argv
+                    .into_iter()
+                    .take_while(|w| w != "|" && w != ">")
+                    .collect();
+                Cli::try_parse_from(&argv).unwrap_or_else(|e| {
+                    panic!("`{line}` (in `{name} --help`) does not parse:\n{e}")
+                });
+                seen += 1;
+            }
+        }
+        assert!(seen >= 30, "only {seen} examples were checked");
+    }
+
+    /// Enough of a shell's word splitting for the examples: whitespace, and
+    /// double quotes.
+    fn shell_words(line: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut cur = String::new();
+        let mut quoted = false;
+        let mut started = false;
+        for c in line.chars() {
+            match c {
+                '"' => {
+                    quoted = !quoted;
+                    started = true;
+                }
+                c if c.is_whitespace() && !quoted => {
+                    if started {
+                        words.push(std::mem::take(&mut cur));
+                        started = false;
+                    }
+                }
+                c => {
+                    cur.push(c);
+                    started = true;
+                }
+            }
+        }
+        if started {
+            words.push(cur);
+        }
+        words
     }
 }
