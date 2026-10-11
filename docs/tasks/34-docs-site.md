@@ -2,12 +2,12 @@
 
 - **Phase:** M6 · Polish
 - **Depends on:** 31
-- **Status:** built; needs repo Settings → Pages → Source = "GitHub Actions" and a first deploy
+- **Status:** done; deployed at https://lorden.dev/MPDFM/ (the repo's Pages site is served from a custom domain)
 
 ## Goal
 
 Host the documentation as a searchable site on GitHub Pages
-(`https://celsuss.github.io/MPDFM/`), without a second copy of anything that
+(`https://lorden.dev/MPDFM/`), without a second copy of anything that
 already lives in `docs/`.
 
 ## What was built
@@ -28,4 +28,4 @@ already lives in `docs/`.
 
 - [x] `just book` builds with no warnings
 - [x] `lychee --offline` finds no dead links in the built site
-- [ ] first deploy to `main` succeeds and the site loads
+- [x] first deploy to `main` succeeds and the site loads

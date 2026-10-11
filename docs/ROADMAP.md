@@ -116,7 +116,7 @@ without a second thread joining the first.
 | 31 | [Documentation](tasks/31-docs-and-readme.md) | 15, 19, 26, 28 | done |
 | 33 | [Fix the bugs earlier tasks reported](tasks/33-fix-reported-bugs.md) | 12, 17, 28, 29 | not started |
 | 32 | [Packaging and release](tasks/32-packaging-and-release.md) | 31 | not started |
-| 34 | [Documentation site](tasks/34-docs-site.md) | 31 | done, pending first deploy |
+| 34 | [Documentation site](tasks/34-docs-site.md) | 31 | done |
 
 ---
 
