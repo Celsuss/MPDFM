@@ -27,7 +27,7 @@ scanned 24 files in 14 directories in 7 ms
 and the details pane, whose `⚠` marks say which entries a playlist refers to and
 what is wrong with them. Drawn by the same code that draws it on your screen.</sup>
 
-**Documentation:** <https://celsuss.github.io/MPDFM/> — guides, the TUI, the safety model and a command reference.
+**Documentation:** <https://lorden.dev/MPDFM/> — guides, the TUI, the safety model and a command reference.
 
 ## Why it exists — the safety model in three sentences
 
