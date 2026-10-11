@@ -1,0 +1,20 @@
+[book]
+title = "MPDFM"
+authors = ["Celsuss"]
+description = "Edit tags and re-organize an MPD music library without breaking your playlists."
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+
+[output.html]
+site-url = "/MPDFM/"
+git-repository-url = "https://github.com/Celsuss/MPDFM"
+edit-url-template = "https://github.com/Celsuss/MPDFM/edit/main/book/{path}"
+default-theme = "light"
+preferred-dark-theme = "navy"
+
+[output.html.search]
+enable = true
+limit-results = 20

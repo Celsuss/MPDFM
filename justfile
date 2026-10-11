@@ -28,6 +28,17 @@ docs:
     ./target/debug/mpdfm man --dir target/docs/man
     for shell in bash zsh fish; do ./target/debug/mpdfm completions $shell > target/docs/completions/mpdfm.$shell; done
 
+# The documentation site (mdBook) into book/book. The CLI reference is generated
+# from the binary's --help, so it is built first.
+book:
+    cargo build --quiet
+    ./scripts/gen-cli-reference.sh
+    mdbook build book
+
+# The same, served at http://localhost:3000 and rebuilt on change.
+book-serve: book
+    mdbook serve book
+
 # Pass arguments through, e.g. `just run scan --json`.
 run *ARGS:
     cargo run --quiet -- {{ARGS}}

@@ -6,3 +6,8 @@
 
 # Ralph loop session bookkeeping
 .claude/ralph-loop.local.md
+
+# mdBook output and the CLI pages generated into it (scripts/gen-cli-reference.sh)
+/book/book/
+/book/src/reference/cli/
+/book/src/design/roadmap.md
