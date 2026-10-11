@@ -26,21 +26,16 @@ use std::process::ExitCode;
 
 use anyhow::{Context as _, Result};
 use camino::{Utf8Path, Utf8PathBuf};
-use mpdfm_core::art::{self, AlbumArt, CoverImage, Embedded, ImageFormat, human_bytes};
+use mpdfm_core::art::{self, AlbumArt, CoverImage, Embedded, human_bytes};
 use mpdfm_core::config::Config;
 use mpdfm_core::library::{DirPath, Library};
 use mpdfm_core::ops::commit::{self, Previewed};
-use mpdfm_core::ops::{Committed, Effects, Operation, Plan};
+use mpdfm_core::ops::{Committed, Effects, Plan};
 use mpdfm_core::paths::RelPath;
 use mpdfm_core::playlist::PlaylistIndex;
-use mpdfm_core::tags::TagDelta;
 
 use super::{Cli, CoverExtractArgs, CoverRemoveArgs, CoverSetArgs, CoverShowArgs, CoverWriteFlags};
 use crate::output::{self, Exit, Out, Style};
-
-/// An image over this size gets the `--max-dimension` hint: the task's
-/// threshold, and where a cover stops being a cover and starts being a scan.
-const LARGE_COVER: u64 = 1_000_000;
 
 /// `mpdfm cover show <PATH>` — what art a track or an album has, and where the
 /// embedded and the loose disagree.
@@ -111,54 +106,15 @@ pub fn set(cli: &Cli, config: &Config, out: &Out, args: &CoverSetArgs) -> Result
         image = resized;
     }
 
-    // Tracks already carrying exactly this front cover, and nothing else in
-    // front, need no write.
-    let pictures = album.pictures();
-    let mut targets = Vec::new();
-    let mut growth: i128 = 0;
-    for (rel, pictures) in &pictures {
-        let fronts: Vec<&Embedded> = pictures.iter().filter(|p| p.kind.is_front()).collect();
-        if let [front] = fronts.as_slice()
-            && front.image.hash == image.image.hash
-        {
-            continue;
-        }
-        growth += i128::from(image.image.size)
-            - fronts
-                .iter()
-                .map(|p| i128::from(p.image.size))
-                .sum::<i128>();
-        targets.push(rel.clone());
-    }
-    if targets.is_empty() {
+    let planned = art::plan::embed(&album.pictures(), &image);
+    if planned.is_empty() {
         return nothing(out, "Every track already has that front cover.");
     }
-
-    notes.push(format!(
-        "embedding a {} image into {} adds {} to the library{}",
-        human_bytes(image.image.size),
-        plural(targets.len(), "file"),
-        signed_bytes(growth),
-        if growth < 0 {
-            " (it replaces larger covers)"
-        } else {
-            ""
-        }
-    ));
-    if image.image.size > LARGE_COVER && args.max_dimension.is_none() {
+    notes.extend(planned.notes);
+    if image.image.size > art::plan::LARGE_COVER && args.max_dimension.is_none() {
         notes.push("the image is over 1 MB; `--max-dimension 1000` would shrink it".to_owned());
     }
-
-    let delta = TagDelta::new().set_cover(image);
-    let plan = Plan::of(
-        targets
-            .into_iter()
-            .map(|target| Operation::WriteTags {
-                target,
-                changes: delta.clone(),
-            })
-            .collect(),
-    );
+    let plan = Plan::of(planned.ops);
     run(
         cli,
         config,
@@ -179,63 +135,28 @@ pub fn set(cli: &Cli, config: &Config, out: &Out, args: &CoverSetArgs) -> Result
 /// that is not a plain file name.
 pub fn extract(cli: &Cli, config: &Config, out: &Out, args: &CoverExtractArgs) -> Result<ExitCode> {
     let album = Album::open(config, &args.album_dir)?;
-    let pictures = album.pictures();
-    let Some((from, picture)) = pictures
-        .iter()
-        .find_map(|(rel, pictures)| art::read::preferred(pictures).map(|p| (rel, p)))
-    else {
-        anyhow::bail!("no track in {} embeds a picture to extract", album.dir);
+    let root = album.library.root().to_owned();
+    let planned = match art::plan::extract(
+        &album.dir,
+        &album.pictures(),
+        args.name.as_deref(),
+        |to| {
+            std::fs::read(to.to_abs(&root))
+                .ok()
+                .map(|bytes| mpdfm_core::ops::exec_fs::hash_bytes(&bytes))
+        },
+    ) {
+        Ok(planned) => planned,
+        Err(err @ art::plan::ExtractError::AlreadyThere { .. }) => {
+            return nothing(out, &format!("{err}."));
+        }
+        Err(art::plan::ExtractError::NotAName { name }) => {
+            anyhow::bail!("--name takes a file name, not a path: {name:?}")
+        }
+        Err(err) => return Err(err.into()),
     };
-
-    let extension = picture.image.format.extension();
-    let name = args
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("cover.{extension}"));
-    anyhow::ensure!(
-        !name.is_empty() && !name.contains('/') && name != "." && name != "..",
-        "--name takes a file name, not a path: {name:?}"
-    );
-    let to = album
-        .dir
-        .join(&name)
-        .with_context(|| format!("{name:?} cannot be a file name in {}", album.dir))?;
-
-    let mut notes = vec![format!(
-        "the {} of {} — {}, written byte for byte",
-        picture.kind,
-        from.file_name(),
-        picture.image
-    )];
-    let named = name
-        .rsplit_once('.')
-        .map(|(_, ext)| ext.to_ascii_lowercase());
-    let fits = match picture.image.format {
-        ImageFormat::Jpeg => matches!(named.as_deref(), Some("jpg" | "jpeg")),
-        ImageFormat::Tiff => matches!(named.as_deref(), Some("tif" | "tiff")),
-        format => named.as_deref() == Some(format.extension()),
-    };
-    if !fits {
-        notes.push(format!(
-            "the picture is {} but {name} says otherwise; a player trusting the name \
-             may not open it",
-            picture.image.format
-        ));
-    }
-
-    // Already there, and the same bytes: nothing to do, and not a conflict.
-    let existing = to.to_abs(album.library.root());
-    if std::fs::read(&existing)
-        .is_ok_and(|bytes| mpdfm_core::ops::exec_fs::hash_bytes(&bytes) == picture.image.hash)
-    {
-        return nothing(out, &format!("{to} already holds that picture."));
-    }
-
-    let plan = Plan::of(vec![Operation::ExtractArt {
-        from: from.clone(),
-        to,
-        picture: picture.image,
-    }]);
+    let notes = planned.notes;
+    let plan = Plan::of(planned.ops);
     run(
         cli,
         config,
@@ -255,38 +176,12 @@ pub fn extract(cli: &Cli, config: &Config, out: &Out, args: &CoverExtractArgs) -
 /// As [`show`], plus anything a commit raises that is not a refusal.
 pub fn remove(cli: &Cli, config: &Config, out: &Out, args: &CoverRemoveArgs) -> Result<ExitCode> {
     let album = Album::open(config, &args.album_dir)?;
-    let mut freed = 0u64;
-    let targets: Vec<RelPath> = album
-        .pictures()
-        .into_iter()
-        .filter_map(|(rel, pictures)| {
-            let fronts: u64 = pictures
-                .iter()
-                .filter(|p| p.kind.is_front())
-                .map(|p| p.image.size)
-                .sum();
-            freed += fronts;
-            (fronts > 0).then_some(rel)
-        })
-        .collect();
-    if targets.is_empty() {
+    let planned = art::plan::remove(&album.pictures());
+    if planned.is_empty() {
         return nothing(out, "No track in that album embeds a front cover.");
     }
-    let notes = vec![format!(
-        "removing the front cover from {} frees {}; other pictures stay",
-        plural(targets.len(), "file"),
-        human_bytes(freed)
-    )];
-    let delta = TagDelta::new().remove_cover();
-    let plan = Plan::of(
-        targets
-            .into_iter()
-            .map(|target| Operation::WriteTags {
-                target,
-                changes: delta.clone(),
-            })
-            .collect(),
-    );
+    let notes = planned.notes;
+    let plan = Plan::of(planned.ops);
     run(
         cli,
         config,
@@ -570,20 +465,5 @@ fn print_survey(survey: &AlbumArt, out: &Out) {
         for mismatch in &survey.mismatches {
             println!("{} {mismatch}", out.paint(Style::Yellow, "!"));
         }
-    }
-}
-
-/// `+70.0 MB` or `-1.2 MB`.
-fn signed_bytes(n: i128) -> String {
-    let size = human_bytes(u64::try_from(n.unsigned_abs()).unwrap_or(u64::MAX));
-    if n < 0 { format!("-{size}") } else { size }
-}
-
-/// `1 file`, `14 files`.
-fn plural(n: usize, one: &str) -> String {
-    if n == 1 {
-        format!("1 {one}")
-    } else {
-        format!("{n} {one}s")
     }
 }
