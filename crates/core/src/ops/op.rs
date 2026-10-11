@@ -14,8 +14,8 @@
 
 use crate::art::ImageFacts;
 use crate::config::Config;
-use crate::library::Library;
-use crate::paths::RelPath;
+use crate::library::{DirPath, Library};
+use crate::paths::{PathError, RelPath};
 use crate::playlist::PlaylistIndex;
 use crate::tags::TagDelta;
 
@@ -283,12 +283,153 @@ impl FromIterator<Operation> for Plan {
     }
 }
 
+/// The destination of a move, as the user typed it.
+///
+/// For a file, `mv`'s rule, which is the one a user's fingers already know: a
+/// destination ending in `/` is a directory to move it into, and so is a
+/// directory that already exists. Anything else is the file's new name, which
+/// is what makes a move a rename as well.
+///
+/// A directory is always moved to exactly the path given, `/` or not. Shell
+/// completion puts a `/` on every directory name it completes, and moving a
+/// directory onto an existing one already means something — a merge
+/// (`--merge`) or a [`DestinationExists`] refusal, both of which say what is in
+/// the way. Quietly nesting it one level deeper would be a third meaning for
+/// the same command line.
+///
+/// Without this, `:move Singles` on one track renamed it to a file called
+/// `Singles` — which is also why the planner refuses a track that would lose
+/// its extension ([`KindChanged`]), whoever built the operation.
+///
+/// [`DestinationExists`]: super::effects::Conflict::DestinationExists
+/// [`KindChanged`]: super::effects::Conflict::KindChanged
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Destination {
+    /// Typed with a trailing `/`: a file moved there keeps its own name.
+    Into(DirPath),
+    /// Typed without one: the new path, unless it is an existing directory and
+    /// what is moved is a file.
+    Exactly(RelPath),
+}
+
+impl Destination {
+    /// Parse a destination relative to the music directory. `/` alone is the
+    /// library root.
+    ///
+    /// ```
+    /// use mpdfm_core::library::DirPath;
+    /// use mpdfm_core::ops::op::Destination;
+    /// use mpdfm_core::paths::RelPath;
+    ///
+    /// assert_eq!(
+    ///     Destination::parse("coding-music/Singles/")?,
+    ///     Destination::Into(DirPath::parse("coding-music/Singles")?),
+    /// );
+    /// assert_eq!(
+    ///     Destination::parse("coding-music/Singles")?,
+    ///     Destination::Exactly(RelPath::parse("coding-music/Singles")?),
+    /// );
+    /// assert_eq!(Destination::parse("/")?, Destination::Into(DirPath::root()));
+    /// # Ok::<(), mpdfm_core::paths::PathError>(())
+    /// ```
+    pub fn parse(s: &str) -> Result<Self, PathError> {
+        match s.strip_suffix('/') {
+            Some(dir) => DirPath::parse(dir).map(Self::Into),
+            None => RelPath::parse(s).map(Self::Exactly),
+        }
+    }
+
+    /// Where `from` ends up.
+    ///
+    /// Whether `from` is a file and whether the destination is a directory are
+    /// both the library's answer. A directory moved to the root itself (`/`)
+    /// is [`PathError::Empty`]: the root is not somewhere a directory can be
+    /// renamed to.
+    pub fn for_source(&self, library: &Library, from: &RelPath) -> Result<RelPath, PathError> {
+        let is_file = library.get(from).is_some();
+        match self {
+            Self::Into(dir) if is_file => dir.join(from.file_name()),
+            Self::Into(dir) => dir.as_rel().cloned().ok_or(PathError::Empty),
+            Self::Exactly(to) => {
+                let dir = DirPath::from(to.clone());
+                if is_file && library.dir(&dir).is_some() {
+                    dir.join(from.file_name())
+                } else {
+                    Ok(to.clone())
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn rel(s: &str) -> RelPath {
         RelPath::parse(s).expect("test path")
+    }
+
+    fn library() -> crate::testing::Fixture {
+        crate::testing::Fixture::builder()
+            .album("coding-music/SwitchAngel", &["Coding_Trance.mp3"])
+            .album("coding-music/Singles", &["Other.mp3"])
+            .build()
+    }
+
+    #[test]
+    fn a_trailing_slash_moves_a_file_into_a_directory_that_does_not_exist_yet() {
+        let fx = library();
+        let lib = Library::scan(fx.music_dir()).expect("scan");
+        let from = rel("coding-music/SwitchAngel/Coding_Trance.mp3");
+
+        let to = Destination::parse("coding-music/SwitchAngel/Singles/")
+            .and_then(|dst| dst.for_source(&lib, &from));
+        assert_eq!(
+            to,
+            Ok(rel("coding-music/SwitchAngel/Singles/Coding_Trance.mp3"))
+        );
+    }
+
+    #[test]
+    fn an_existing_directory_takes_a_file_in_under_its_own_name() {
+        let fx = library();
+        let lib = Library::scan(fx.music_dir()).expect("scan");
+        let from = rel("coding-music/SwitchAngel/Coding_Trance.mp3");
+
+        let into = |dst: &str| {
+            Destination::parse(dst)
+                .and_then(|dst| dst.for_source(&lib, &from))
+                .expect("a destination")
+        };
+        assert_eq!(
+            into("coding-music/Singles"),
+            rel("coding-music/Singles/Coding_Trance.mp3")
+        );
+        // Not there: the user typed a new name, and gets it.
+        assert_eq!(
+            into("coding-music/Faves.mp3"),
+            rel("coding-music/Faves.mp3")
+        );
+        assert_eq!(into("/"), rel("Coding_Trance.mp3"));
+    }
+
+    #[test]
+    fn a_directory_goes_exactly_where_it_is_told_slash_or_not() {
+        // Moving `SwitchAngel` onto `Singles` stays a merge or a refusal, and
+        // the `/` that shell completion adds does not change that.
+        let fx = library();
+        let lib = Library::scan(fx.music_dir()).expect("scan");
+        let from = rel("coding-music/SwitchAngel");
+
+        for dst in ["coding-music/Singles", "coding-music/Singles/"] {
+            let to = Destination::parse(dst).and_then(|dst| dst.for_source(&lib, &from));
+            assert_eq!(to, Ok(rel("coding-music/Singles")), "{dst}");
+        }
+        assert_eq!(
+            Destination::parse("/").and_then(|dst| dst.for_source(&lib, &from)),
+            Err(PathError::Empty)
+        );
     }
 
     #[test]

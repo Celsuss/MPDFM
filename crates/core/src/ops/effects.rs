@@ -179,6 +179,26 @@ pub enum Conflict {
         at: RelPath,
     },
 
+    /// A file move would take a track (or a CUE sheet) to a name MPD does not
+    /// index as one — `Coding_Trance.mp3 → Singles`, or `.mp3 → .flac`.
+    ///
+    /// Refused rather than warned about because the playlists would be rewritten
+    /// to follow it: every line naming the track would end up pointing at a
+    /// file MPD cannot `add`, which is the one thing MPDFM exists to prevent.
+    /// Most often this is a directory typed without its trailing `/`.
+    #[error(
+        "operation {op}: {to} is not a name MPD reads as a track, so {from} would \
+         vanish from MPD and its playlists; end a directory with / to move into it"
+    )]
+    KindChanged {
+        /// Index into the plan's operations.
+        op: usize,
+        /// The track.
+        from: RelPath,
+        /// Where it was going.
+        to: RelPath,
+    },
+
     /// A path that leaves the music directory — a `..`, an absolute path, a
     /// destination that climbs out. Safety invariant 5: MPDFM writes inside the
     /// three roots it was configured with and nowhere else.
@@ -249,6 +269,7 @@ impl Conflict {
         match self {
             Self::DestinationExists { op, .. }
             | Self::SourceMissing { op, .. }
+            | Self::KindChanged { op, .. }
             | Self::OutsideRoot { op, .. }
             | Self::NotWritable { op, .. }
             | Self::NotTaggable { op, .. }

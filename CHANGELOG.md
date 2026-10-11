@@ -6,6 +6,24 @@ All notable changes to MPDFM are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **A move can no longer hide a track from MPD.** Moving one file to a name that
+  is not a folder — `:move Singles` in the TUI, `mpdfm move song.mp3 Singles` —
+  renamed it to a file called `Singles` with no audio extension, and rewrote the
+  playlists to follow it, so MPD refused the line with "No such directory". A
+  file move that drops or changes a track's (or CUE sheet's) extension is now
+  refused before anything is written.
+- **A trailing `/` or an existing folder moves a file into it**, as with `mv`:
+  `:move coding-music/Singles/` and `mpdfm move song.mp3 coding-music/Singles/`
+  both give `coding-music/Singles/song.mp3`, creating the folder if needed. A
+  directory still goes to exactly the path given, so `--merge` and shell
+  completion's trailing `/` mean what they did. `:move dir/` with several marks
+  is no longer refused for its trailing slash.
+- **`mpdfm doctor` reports a playlist or saved-queue line that names a file which
+  is not a track** (an extensionless file, an image), which MPD cannot play but
+  which used to pass as "in the library".
+
 ## [0.1.0] - Unreleased
 
 The first release. Everything below is new.

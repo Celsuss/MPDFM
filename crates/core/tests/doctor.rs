@@ -296,6 +296,44 @@ fn a_cue_track_whose_audio_file_is_gone_is_broken() {
 }
 
 #[test]
+fn a_line_naming_a_file_that_is_not_a_track_is_broken() {
+    // What a track renamed to `Singles` left in `Coding flow.m3u` on the real
+    // library: the file is there, so "is it in the library?" said yes, and MPD
+    // still refused the line with "No such directory".
+    let fx = Fixture::builder()
+        .album("coding-music/SwitchAngel", &["Coding_Trance.mp3"])
+        .aux("coding-music", &["Singles", "folder.jpg"])
+        .playlist(
+            "Coding flow.m3u",
+            &[
+                names::SWITCHANGEL_TRACK,
+                "coding-music/Singles",
+                "coding-music/folder.jpg",
+            ],
+        )
+        .state_file_queue(&[names::SWITCHANGEL_TRACK, "coding-music/Singles"])
+        .build();
+    let report = report(&fx);
+
+    assert_eq!(
+        whats(&report, "broken-references"),
+        [
+            "Coding flow:2 → coding-music/Singles",
+            "Coding flow:3 → coding-music/folder.jpg",
+        ]
+    );
+    assert!(
+        check(&report, "broken-references").items[0]
+            .detail
+            .contains("not read as a track"),
+    );
+    assert_eq!(
+        whats(&report, "broken-queue-entries"),
+        ["queue position 1 → coding-music/Singles"]
+    );
+}
+
+#[test]
 fn a_line_outside_the_music_directory_says_so() {
     let fx = Fixture::builder()
         .album("jazz/album", &["01.mp3"])

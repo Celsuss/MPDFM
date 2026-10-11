@@ -6,7 +6,8 @@
 //!
 //! ```text
 //! 1  resolve SRC and DST against music_dir
-//! 2  scan, index, and ask MPD what it is holding
+//! 2  scan, index, and ask MPD what it is holding; a file moved onto a
+//!    directory, or onto a DST ending in `/`, goes into it
 //! 3  validate — writes nothing
 //! 4  print the FULL preview
 //! 5  refused?    → exit 2, nothing written
@@ -36,7 +37,7 @@ use anyhow::Result;
 use mpdfm_core::config::Config;
 use mpdfm_core::library::Library;
 use mpdfm_core::ops::commit::{self, CommitError, Previewed};
-use mpdfm_core::ops::{Committed, Effects, Merge, Operation, Plan, Prefs};
+use mpdfm_core::ops::{Committed, Destination, Effects, Merge, Operation, Plan, Prefs};
 use mpdfm_core::paths::RelPath;
 use mpdfm_core::playlist::PlaylistIndex;
 use mpdfm_core::{Error, library::DirPath};
@@ -57,14 +58,22 @@ pub fn run(cli: &Cli, config: &Config, out: &Out, args: &MoveArgs) -> Result<Exi
     // Step 1 — the two paths, measured against the library root.
     let root = config.require_music_dir()?;
     let from = super::inside(&args.src, root)?;
-    let to = super::inside(&args.dst, root)?;
+    // `inside` drops a trailing `/`, which is the one thing that says "into this
+    // directory" when it does not exist yet — so it is read off first.
+    let dst = super::inside(&args.dst, root)?;
+    let dst = if args.dst.as_str().ends_with('/') {
+        Destination::Into(DirPath::from(dst))
+    } else {
+        Destination::Exactly(dst)
+    };
+
+    // Step 2 — the three inputs a preview is computed from.
+    let library = Library::scan(root)?;
+    let to = dst.for_source(&library, &from)?;
     cli.trace(format!(
         "move {from} -> {to} (dry_run={} yes={} merge={} verify={})",
         args.dry_run, args.yes, args.merge, args.verify
     ));
-
-    // Step 2 — the three inputs a preview is computed from.
-    let library = Library::scan(root)?;
     let (index, index_warnings) = PlaylistIndex::load(&config.playlist_dir);
     for warning in &index_warnings {
         // Never routine: a playlist MPDFM could not read is a playlist it cannot

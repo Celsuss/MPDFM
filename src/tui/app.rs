@@ -74,7 +74,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use mpdfm_core::config::{Config, RootProblem};
 use mpdfm_core::library::{DirPath, Library, ScanProgress};
 use mpdfm_core::ops::commit::Progress;
-use mpdfm_core::ops::{Effects, Live, Operation, Plan};
+use mpdfm_core::ops::{Destination, Effects, Live, Operation, Plan};
 use mpdfm_core::organize::{self, Conflict as Collision, NameRules};
 use mpdfm_core::paths::RelPath;
 use mpdfm_core::playlist::PlaylistIndex;
@@ -1896,12 +1896,12 @@ impl App {
         self.push(View::Command(CommandLine::of(format!("move {target}"))))
     }
 
-    /// `:move <dst>` — one source to that exact path, several into that
-    /// directory.
+    /// `:move <dst>` — one source to that path, several into that directory.
     ///
-    /// The distinction is what makes the command a rename as well: with one
-    /// thing selected, the destination the user typed is the destination, and
-    /// with several there is nothing else `dst` could sensibly be.
+    /// With one thing selected the destination is a new name, which is what
+    /// makes the command a rename as well — unless it ends in `/`, or is a
+    /// directory a file can go into ([`Destination`]). With several there is
+    /// nothing else `dst` could sensibly be but a directory.
     fn stage_move_to(&mut self, dst: &str) -> bool {
         let targets = self.targets();
         if targets.is_empty() {
@@ -1912,19 +1912,21 @@ impl App {
             return true;
         }
 
-        let ops = match targets.as_slice() {
-            [only] => {
-                let Some(library) = &self.library else {
-                    return false;
-                };
-                RelPath::parse(dst)
-                    .map(|to| vec![move_op(library, only, to)])
-                    .map_err(|err| format!("{dst}: {err}"))
-            }
-            many => DirPath::parse(dst)
-                .map_err(|err| format!("{dst}: {err}"))
-                .and_then(|dir| self.move_ops_into(&dir, many)),
-        };
+        let ops = Destination::parse(dst)
+            .map_err(|err| format!("{dst}: {err}"))
+            .and_then(|destination| match (targets.as_slice(), destination) {
+                ([only], destination) => {
+                    let Some(library) = &self.library else {
+                        return Ok(Vec::new());
+                    };
+                    destination
+                        .for_source(library, only)
+                        .map(|to| vec![move_op(library, only, to)])
+                        .map_err(|err| format!("{dst}: {err}"))
+                }
+                (many, Destination::Into(dir)) => self.move_ops_into(&dir, many),
+                (many, Destination::Exactly(dir)) => self.move_ops_into(&DirPath::from(dir), many),
+            });
         match ops {
             Ok(ops) => self.stage_moves(ops),
             Err(message) => {
@@ -7564,6 +7566,103 @@ mod tests {
         assert!(app.running.is_none(), "nothing is being written");
         let toast = app.toasts.front().expect("it said why");
         assert!(toast.text.contains("1 conflict"), "{}", toast.text);
+    }
+
+    /// The SwitchAngel album, and the playlist that names its first track.
+    fn coding_flow() -> Fixture {
+        Fixture::builder()
+            .album(
+                "coding-music/SwitchAngel",
+                &["Coding_Trance.mp3", "Coding_Trance_Reprise.m4a"],
+            )
+            .playlist("Coding flow.m3u", &[names::SWITCHANGEL_TRACK])
+            .build()
+    }
+
+    /// What the plan's one move is moving its file to.
+    fn staged_destination(app: &App) -> Vec<String> {
+        app.plan
+            .ops()
+            .iter()
+            .filter_map(|op| op.destination().map(ToString::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn move_to_a_name_without_a_slash_is_refused_rather_than_breaking_the_playlist() {
+        // Found on the real library: `:move Singles` on one track renamed it to
+        // a file called `Singles` at the root, and `Coding flow.m3u` followed
+        // it there — a line MPD answers with "No such directory".
+        let fx = coding_flow();
+        let (mut app, _rx) = app(&fx);
+        let mut terminal = screen(140, 30);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "coding-music/SwitchAngel");
+        mark_first(&mut app, 1);
+
+        app.run_command(command::Command::Move {
+            dst: "Singles".to_owned(),
+        });
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+
+        assert!(!pending_view(&app).is_committable(), "{drawn}");
+        assert!(drawn.contains("REFUSED"), "{drawn}");
+        assert!(
+            drawn.contains("not a name MPD reads as a track"),
+            "the reason: {drawn}"
+        );
+    }
+
+    #[test]
+    fn move_to_a_trailing_slash_moves_the_track_into_that_directory() {
+        let fx = coding_flow();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "coding-music/SwitchAngel");
+        mark_first(&mut app, 1);
+
+        app.run_command(command::Command::Move {
+            dst: "coding-music/SwitchAngel/Singles/".to_owned(),
+        });
+
+        assert_eq!(
+            staged_destination(&app),
+            ["coding-music/SwitchAngel/Singles/Coding_Trance.mp3"]
+        );
+        let view = pending_view(&app);
+        assert!(view.is_committable(), "{:?}", view.effects().conflicts);
+        assert_eq!(
+            view.effects().playlist_edits[0].line_edits[0]
+                .new
+                .as_deref(),
+            Some("coding-music/SwitchAngel/Singles/Coding_Trance.mp3"),
+            "the playlist follows the track to a path MPD can play"
+        );
+    }
+
+    #[test]
+    fn move_of_several_marks_takes_a_trailing_slash_too() {
+        // It used to be refused as "a trailing slash", which is the one
+        // spelling of a directory a user is most likely to type.
+        let fx = coding_flow();
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        in_dir(&mut app, "coding-music/SwitchAngel");
+        mark_first(&mut app, 2);
+
+        app.run_command(command::Command::Move {
+            dst: "coding-music/SwitchAngel/Singles/".to_owned(),
+        });
+
+        assert_eq!(
+            staged_destination(&app),
+            [
+                "coding-music/SwitchAngel/Singles/Coding_Trance.mp3",
+                "coding-music/SwitchAngel/Singles/Coding_Trance_Reprise.m4a",
+            ]
+        );
+        assert!(pending_view(&app).is_committable());
     }
 
     #[test]

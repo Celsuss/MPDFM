@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use camino::Utf8Path;
 
 use super::super::{Check, Info, Inputs, Item, Queue};
-use crate::library::{DirPath, Library};
+use crate::library::{DirPath, Kind, Library};
 use crate::paths::RelPath;
 use crate::playlist::{Entry, IndexWarning, PlaylistIndex};
 
@@ -46,7 +46,7 @@ pub(crate) fn run(info: Info, inputs: &Inputs<'_>) -> Check {
                     .map(|(position, rel)| {
                         Item::new(
                             format!("queue position {position} → {rel}"),
-                            "names a file that is not in the library; MPD drops it on load",
+                            "names a file that is not a track in the library; MPD drops it on load",
                         )
                     })
                     .collect(),
@@ -58,11 +58,11 @@ pub(crate) fn run(info: Info, inputs: &Inputs<'_>) -> Check {
     }
 }
 
-/// Whether a queue path names something in the library: a file, or a virtual
+/// Whether a queue path names something in the library: a track, or a virtual
 /// track `…/x.cue/trackNNNN` whose sheet is there.
 fn resolves(library: &Library, rel: &RelPath) -> bool {
     if library.get(rel).is_some() {
-        return true;
+        return plays(rel);
     }
     let dir = DirPath::of(rel);
     dir.as_rel().is_some_and(|sheet| {
@@ -70,6 +70,12 @@ fn resolves(library: &Library, rel: &RelPath) -> bool {
             && rel.file_name().starts_with("track")
             && library.get(sheet).is_some()
     })
+}
+
+/// Whether a file a playlist names is one MPD can `add`: a track, or a CUE sheet
+/// (whose virtual tracks are indexed under the sheet's own path).
+fn plays(rel: &RelPath) -> bool {
+    matches!(Kind::of(rel), Kind::Audio(_) | Kind::Cue)
 }
 
 /// `playlist:line → path`, the way a user finds the line.
@@ -105,6 +111,25 @@ fn broken_references(library: &Library, index: &PlaylistIndex) -> Vec<Item> {
             )
         })
         .collect();
+
+    // There, but not a track: what a move to a name without an audio extension
+    // used to leave behind (`Coding flow.m3u` → `Singles`). MPD reads the line
+    // as a directory and refuses it with "No such directory", so to the user it
+    // is as broken as a missing file.
+    for path in index.paths() {
+        if library.get(path).is_none() || plays(path) {
+            continue;
+        }
+        for reference in index.refs_to(path) {
+            found.push((
+                *reference,
+                Item::new(
+                    locate(index, reference.playlist, reference.entry, path.as_str()),
+                    "names a file MPD does not read as a track",
+                ),
+            ));
+        }
+    }
 
     // Sheets are read once each, however many lines name tracks in them.
     let mut sheets: BTreeMap<&RelPath, Option<Sheet>> = BTreeMap::new();
