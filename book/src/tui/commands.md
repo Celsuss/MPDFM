@@ -9,7 +9,7 @@ not parse stays open with the reason under it, so you can edit rather than retyp
 
 | Command | Does |
 | --- | --- |
-| `:move <dst>` (`:mv`) | stage a move or rename of the marks / cursor row |
+| `:move <dst>` (`:mv`) | stage a move or rename of the marks / cursor row; a trailing `/` moves a file into that folder |
 | `:organize <template>` | open the organize view with this template |
 | `:find <query>` (`:f`) | find across the whole library |
 | `:undo [txid]` | reverse a committed transaction, the latest by default |

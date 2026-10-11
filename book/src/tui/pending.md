@@ -29,8 +29,9 @@ cannot disagree.
   line that changes (`-` old, `+` new), or a refused operation into its reason;
   `h` folds it again. The diff is complete, not a count.
 - **Conflicts** are shown in red with the reason on each operation, and commit is
-  disabled until they are gone. Typical causes: a move onto an existing file, or a
-  destination two operations both want.
+  disabled until they are gone. Typical causes: a move onto an existing file, a
+  destination two operations both want, or a rename that would drop a track's
+  audio extension so MPD could no longer play it.
 - **Warnings** are not blockers — for instance, that a file is in MPD's current
   queue and will need requeueing.
 

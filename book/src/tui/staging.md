@@ -19,8 +19,15 @@ already is stages nothing.
 `r` opens the command line already filled in as `:move <path of the row>`. Edit the
 path and press `enter`; `esc` cancels. You can also type `:move <dst>` yourself.
 
-With one thing selected, `<dst>` is its new path (a rename). With several, `<dst>` is
-a directory they move into.
+With one thing selected, `<dst>` is its new path (a rename), unless it is a file and
+`<dst>` ends in `/` or is an existing folder: then the file moves into that folder and
+keeps its name. With several, `<dst>` is a directory they move into, with or without
+the `/`. `<dst>` is relative to the music directory, not to the folder you are
+browsing. The rules are the same as for [`mpdfm move`](../guide/move.md#where-dst-points).
+
+A rename that would cost a track its audio extension, such as `:move Singles` on a
+song, is refused in the pending view rather than staged as a song MPD cannot play.
+Type `:move Singles/` to move it into a folder instead.
 
 ## Delete: `d`
 
