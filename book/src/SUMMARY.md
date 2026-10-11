@@ -19,6 +19,12 @@
 # The TUI
 
 - [Using the TUI](tui/overview.md)
+  - [Browsing and marking](tui/browsing.md)
+  - [Moves, renames, deletes, organize](tui/staging.md)
+  - [Editing tags](tui/tags.md)
+  - [The pending view](tui/pending.md)
+  - [Search and filter](tui/search.md)
+  - [Commands and status bar](tui/commands.md)
 - [Key bindings](tui/keys.md)
 
 # Safety
