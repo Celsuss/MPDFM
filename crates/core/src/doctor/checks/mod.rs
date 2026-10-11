@@ -30,7 +30,7 @@ pub const ALL: &[Info] = &[
         "broken-references",
         Group::References,
         Severity::Problem,
-        "playlist lines whose file, or CUE track, is missing",
+        "playlist lines whose file, or CUE track, is missing or not a track",
     ),
     info(
         "unrewritable-entries",
@@ -48,7 +48,7 @@ pub const ALL: &[Info] = &[
         "broken-queue-entries",
         Group::References,
         Severity::Warning,
-        "entries in MPD's saved queue whose file is missing",
+        "entries in MPD's saved queue whose file is missing or not a track",
     ),
     info(
         "duplicate-entries",

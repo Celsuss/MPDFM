@@ -183,9 +183,12 @@ pub enum Command {
 /// `mpdfm move <SRC> <DST>`
 ///
 /// `SRC` and `DST` are both **relative to the music directory**, or absolute
-/// paths inside it. `DST` is the full destination path and not a directory to
-/// move into: `move a/x b/x`, never `move a/x b`. A trailing slash is ignored,
-/// because shell completion adds them and nobody means anything by them.
+/// paths inside it. `DST` is the full destination path — `move a/x b/x` — with
+/// one exception, for a file: a `DST` that ends in `/` or is an existing
+/// directory is where it goes *into*, so `move a/x.mp3 b/` is `b/x.mp3`, as
+/// with `mv`. For a directory a trailing slash is ignored, because shell
+/// completion adds one to every directory name and moving onto an existing
+/// directory already means `--merge`.
 #[derive(Debug, Args)]
 pub struct MoveArgs {
     /// Source, relative to the music dir or absolute inside it.

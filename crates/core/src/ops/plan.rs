@@ -54,7 +54,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use camino::Utf8Path;
 
 use crate::config::Config;
-use crate::library::{DirPath, Library, ScanWarning};
+use crate::library::{DirPath, Kind, Library, ScanWarning};
 use crate::mpd::state::{self, MpdState};
 use crate::paths::RelPath;
 use crate::playlist::PlaylistIndex;
@@ -489,6 +489,14 @@ fn expand(
                 });
                 return Vec::new();
             }
+            if changes_kind(from, to) {
+                effects.conflicts.push(Conflict::KindChanged {
+                    op: index,
+                    from: from.clone(),
+                    to: to.clone(),
+                });
+                return Vec::new();
+            }
             let mut steps = Vec::new();
             if let Some(parent) = to.parent() {
                 steps.push(FsStep::MkDir { at: parent });
@@ -628,6 +636,14 @@ fn expand(
 }
 
 /// Whether `path` is inside something an earlier operation takes away.
+/// Whether moving `from` to `to` turns something a playlist can name — a track,
+/// or a CUE sheet whose virtual tracks it can name — into a different kind of
+/// file. The case of the extension is not a change: MPD reads `.MP3` as `.mp3`.
+fn changes_kind(from: &RelPath, to: &RelPath) -> bool {
+    let kind = Kind::of(from);
+    (kind.is_audio() || kind == Kind::Cue) && Kind::of(to) != kind
+}
+
 fn is_vacated(path: &RelPath, vacated: &[RelPath]) -> bool {
     vacated
         .iter()

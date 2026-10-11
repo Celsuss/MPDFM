@@ -163,6 +163,62 @@ fn a_source_that_is_not_there_is_a_conflict_that_names_it() {
         .assert_stdout("hiphop/not an album is not in the library");
 }
 
+#[test]
+fn a_track_moved_to_a_name_mpd_does_not_read_is_refused_and_the_playlist_kept() {
+    // The real library's `Coding flow.m3u` broke this way: a track renamed to
+    // `Singles`, and the playlist rewritten to follow it to a file MPD will not
+    // `add`.
+    let world = with_the_committed_playlists();
+    let before = world.snapshot();
+
+    world
+        .run(&["move", names::SWITCHANGEL_TRACK, "Singles", "--yes"])
+        .assert_code(2)
+        .assert_stdout("not a name MPD reads as a track")
+        .assert_stdout("Nothing was changed.");
+
+    world.snapshot().assert_same(&before);
+}
+
+#[test]
+fn a_trailing_slash_moves_a_track_into_that_directory() {
+    let world = with_the_committed_playlists();
+    let (_, broken_before) = references(&world);
+
+    world
+        .run(&[
+            "move",
+            names::SWITCHANGEL_TRACK,
+            "coding-music/SwitchAngel/Singles/",
+            "--yes",
+        ])
+        .assert_code(0);
+
+    assert!(
+        world
+            .abs("coding-music/SwitchAngel/Singles/Coding_Trance.mp3")
+            .exists()
+    );
+    let (_, broken_after) = references(&world);
+    assert_eq!(
+        broken_after, broken_before,
+        "no reference broke that was not already broken"
+    );
+}
+
+#[test]
+fn an_existing_directory_takes_a_track_in_under_its_own_name() {
+    let world = with_the_committed_playlists();
+
+    world
+        .run(&["move", names::SWITCHANGEL_TRACK, "jazz", "--dry-run"])
+        .assert_code(0)
+        .assert_stdout(&format!(
+            "{} → jazz/Coding_Trance.mp3",
+            names::SWITCHANGEL_TRACK
+        ));
+}
+
 /// `--yes` does not override a conflict. The exit code is the refusal's, not the
 /// prompt's.
 #[test]

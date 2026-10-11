@@ -297,6 +297,63 @@ fn a_missing_source_is_a_conflict() {
     assert!(!effects.is_committable());
 }
 
+/// One album, and the playlist that names its track.
+fn coding_flow() -> Fixture {
+    Fixture::builder()
+        .album(
+            "coding-music/SwitchAngel",
+            &["Coding_Trance.mp3", "Coding_Trance_Reprise.m4a"],
+        )
+        .playlist("Coding flow.m3u", &[names::SWITCHANGEL_TRACK])
+        .build()
+}
+
+#[test]
+fn a_track_moved_to_a_name_mpd_does_not_index_is_a_conflict() {
+    // `:move Singles` with one track marked: a directory typed without its
+    // `/`. Planned as written it renames the track to a file called `Singles`,
+    // and rewrites `Coding flow.m3u` to point at it — a line MPD answers with
+    // "No such directory". Found on the real library.
+    let fx = coding_flow();
+    let world = World::of(&fx);
+
+    for to in [
+        "Singles",
+        "coding-music/SwitchAngel/Singles",
+        "coding-music/SwitchAngel/Coding_Trance.flac",
+        "coding-music/SwitchAngel/Coding_Trance.mp3.bak",
+    ] {
+        let effects = world.validate(&Plan::of(vec![move_file(names::SWITCHANGEL_TRACK, to)]));
+
+        assert!(
+            matches!(sole_conflict(&effects), Conflict::KindChanged { op: 0, .. }),
+            "{to}: {:?}",
+            effects.conflicts
+        );
+        assert!(!effects.is_committable(), "{to}");
+        assert!(effects.fs_steps.is_empty(), "{to}: nothing may be planned");
+    }
+}
+
+#[test]
+fn a_rename_that_keeps_the_format_is_not_a_kind_change() {
+    let fx = coding_flow();
+    let world = World::of(&fx);
+
+    // Upper-case is the same format to MPD, and a rename is still a rename.
+    for to in [
+        "coding-music/SwitchAngel/Singles/Coding_Trance.mp3",
+        "coding-music/SwitchAngel/Coding Trance.MP3",
+    ] {
+        let effects = world.validate(&Plan::of(vec![move_file(names::SWITCHANGEL_TRACK, to)]));
+        assert!(effects.is_committable(), "{to}: {:?}", effects.conflicts);
+        assert!(
+            !effects.playlist_edits.is_empty(),
+            "{to}: Coding flow follows it"
+        );
+    }
+}
+
 #[test]
 fn a_destination_that_leaves_the_library_is_a_conflict() {
     // The music directory holds a symlink out to a directory beside it; a move
