@@ -96,6 +96,8 @@ pub enum Mode {
     TagEdit,
     /// The staged-operations view (task 24).
     Pending,
+    /// The cover view: one directory's images and its tracks' covers.
+    Cover,
     /// The incremental search line (task 25).
     Search,
     /// The `:` command line.
@@ -107,6 +109,7 @@ impl Mode {
     pub const ALL: &'static [Self] = &[
         Self::Browser,
         Self::Pending,
+        Self::Cover,
         Self::TagEdit,
         Self::Search,
         Self::Command,
@@ -119,6 +122,7 @@ impl Mode {
             Self::Browser => "browser",
             Self::TagEdit => "tagedit",
             Self::Pending => "pending",
+            Self::Cover => "cover",
             Self::Search => "search",
             Self::Command => "command",
         }
@@ -672,6 +676,7 @@ const DEFAULTS: &[(Mode, &[(&str, Action)])] = &[
             ("r", Action::Rename),
             ("d", Action::StageDelete),
             ("o", Action::Organize),
+            ("C", Action::Covers),
             ("p", Action::ShowPending),
             ("c", Action::Commit),
             ("x", Action::DiscardPending),
@@ -718,6 +723,44 @@ const DEFAULTS: &[(Mode, &[(&str, Action)])] = &[
             ("p", Action::ShowPending),
             ("esc", Action::Cancel),
             (":", Action::CommandMode),
+            ("?", Action::Help),
+            ("q", Action::Quit),
+        ],
+    ),
+    (
+        // The cover view. `h` / `l` step the draft of the track under the
+        // cursor, which is the hand fix for a pairing by name that guessed
+        // wrong; `w` stages the drafts, as it does in the tag editor.
+        Mode::Cover,
+        &[
+            ("j", Action::Down),
+            ("down", Action::Down),
+            ("k", Action::Up),
+            ("up", Action::Up),
+            ("gg", Action::Top),
+            ("G", Action::Bottom),
+            ("ctrl-d", Action::HalfPageDown),
+            ("ctrl-u", Action::HalfPageUp),
+            ("tab", Action::SwitchPane),
+            ("h", Action::Left),
+            ("left", Action::Left),
+            ("l", Action::Right),
+            ("right", Action::Right),
+            ("space", Action::ToggleMark),
+            ("a", Action::MarkAll),
+            ("A", Action::UnmarkAll),
+            ("s", Action::AssignCover),
+            ("enter", Action::AssignCover),
+            ("x", Action::RemoveCover),
+            ("n", Action::PairCovers),
+            ("w", Action::StageCovers),
+            ("e", Action::ExtractCover),
+            ("C", Action::CanonicalCover),
+            ("d", Action::StageDelete),
+            ("D", Action::PruneCovers),
+            ("z", Action::ToggleDownscale),
+            ("p", Action::ShowPending),
+            ("esc", Action::Cancel),
             ("?", Action::Help),
             ("q", Action::Quit),
         ],
@@ -1358,6 +1401,7 @@ mod tests {
             ("r", Action::Rename),
             ("d", Action::StageDelete),
             ("o", Action::Organize),
+            ("C", Action::Covers),
             ("p", Action::ShowPending),
             ("c", Action::Commit),
             ("x", Action::DiscardPending),
@@ -1664,7 +1708,10 @@ mod tests {
         assert!(joined.contains("more than two keys"), "{joined}");
         assert!(joined.contains("found an integer"), "{joined}");
         // The unknown-mode warning names the modes that do exist.
-        assert!(joined.contains("browser, pending, tagedit"), "{joined}");
+        assert!(
+            joined.contains("browser, pending, cover, tagedit"),
+            "{joined}"
+        );
 
         // The one good line applied.
         assert_eq!(

@@ -151,7 +151,7 @@ pub struct Art {
 }
 
 /// Load the art for the library entry at `abs`: a track's preferred embedded
-/// picture, or an image file itself.
+/// picture, an image file itself, or a directory's best loose image.
 ///
 /// `Ok(None)` for something with no art — a track with no pictures, an `.nfo`.
 /// `decode` is false when the protocol is the placeholder, which needs only the
@@ -176,6 +176,23 @@ pub fn load(rel: &RelPath, abs: &Utf8Path, decode: bool) -> Result<Option<Art>, 
     } else if is_image_name(rel.file_name()) {
         let bytes = std::fs::read(abs).map_err(|err| format!("{abs}: {err}"))?;
         (rel.file_name().to_owned(), bytes)
+    } else if abs.is_dir() {
+        // A directory shows its best loose image, and says when it has more
+        // than one — a folder of singles with a cover each is worth knowing
+        // about before the cover view is opened on it.
+        let loose = art::loose(abs).map_err(|err| format!("{abs}: {err}"))?;
+        let Some(best) = loose.iter().find(|file| file.is_image()) else {
+            return Ok(None);
+        };
+        let path = art::read::loose_path(abs, best);
+        let bytes = std::fs::read(&path).map_err(|err| format!("{path}: {err}"))?;
+        let images = loose.iter().filter(|file| file.is_image()).count();
+        let label = if images > 1 {
+            format!("{} \u{b7} {images} images", best.name)
+        } else {
+            best.name.clone()
+        };
+        (label, bytes)
     } else {
         return Ok(None);
     };
@@ -303,7 +320,6 @@ impl ArtCache {
     }
 
     /// What is known about `rel`'s art.
-    #[cfg(test)]
     #[must_use]
     pub fn slot(&self, rel: &RelPath) -> Option<&Slot> {
         self.slots.get(rel)
@@ -311,8 +327,10 @@ impl ArtCache {
 
     /// The entry a worker should load next, if any: `rel`, unless it is already
     /// known or a load is already out. Marks it loading.
-    pub fn want(&mut self, rel: &RelPath) -> Option<RelPath> {
-        if self.in_flight.is_some() || self.slots.contains_key(rel) || !has_art(rel) {
+    ///
+    /// `is_dir` says `rel` is a directory, whose art is its best loose image.
+    pub fn want(&mut self, rel: &RelPath, is_dir: bool) -> Option<RelPath> {
+        if self.in_flight.is_some() || self.slots.contains_key(rel) || !(is_dir || has_art(rel)) {
             return None;
         }
         self.in_flight = Some(rel.clone());

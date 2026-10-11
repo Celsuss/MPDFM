@@ -167,6 +167,27 @@ actions! {
     /// Reverse the most recent committed transaction.
     Undo => "undo", "undo last transaction";
 
+    // -- cover art ---------------------------------------------------------
+
+    /// Open the cover view on a directory: its images and its tracks' covers.
+    Covers => "covers", "cover art of this directory";
+    /// Draft the image under the cursor onto the marked tracks, or all of them.
+    AssignCover => "assign_cover", "assign this image to the tracks";
+    /// Draft the removal of the marked tracks' front covers, or all of them.
+    RemoveCover => "remove_cover", "draft removing the embedded cover";
+    /// Draft, for each track, the image whose name goes with it.
+    PairCovers => "pair_covers", "pair tracks with images by name";
+    /// Stage every drafted cover change.
+    StageCovers => "stage_covers", "stage the cover changes";
+    /// Stage writing a track's embedded cover out beside it.
+    ExtractCover => "extract_cover", "write the embedded cover out";
+    /// Stage renaming the image under the cursor to `cover.<ext>`.
+    CanonicalCover => "canonical_cover", "make this image the cover.<ext>";
+    /// Stage deleting every image but the one under the cursor.
+    PruneCovers => "prune_covers", "delete every other image here";
+    /// Whether large images are downscaled before they are embedded.
+    ToggleDownscale => "toggle_downscale", "downscale large images when embedding";
+
     // -- finding things ----------------------------------------------------
 
     /// Search within the listing.

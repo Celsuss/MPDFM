@@ -17,6 +17,8 @@ $ mpdfm cover remove "rock/Album"              # remove the embedded front cover
 
 Cover art is decoded for JPEG and PNG. In the [TUI](../tui/overview.md) it is
 drawn in kitty, iTerm2/WezTerm and sixel terminals, and as a plain placeholder
-everywhere else (never inside tmux).
+everywhere else (never inside tmux). The TUI's [cover view](../tui/covers.md)
+(`C`) does all four of these per track rather than per album, which is what a
+folder of singles needs, and pairs singles with their images by name.
 
 See also the [`cover` reference](../reference/cli/cover.md).

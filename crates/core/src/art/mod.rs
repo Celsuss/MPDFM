@@ -21,6 +21,7 @@
 //! |---|---|
 //! | [`read`] | embedded pictures, loose image files, and what disagrees between them |
 //! | [`write`] | [`CoverEdit`] — the cover half of a [`TagDelta`][crate::tags::TagDelta] — and the optional downscale |
+//! | [`plan`] | the operations a cover request comes to, and which loose image goes with which single |
 //!
 //! # A cover is a tag edit
 //!
@@ -47,6 +48,7 @@
 //! every `covr` image counts as the front cover — which is the only reading under
 //! which "replace the front cover" means anything there.
 
+pub mod plan;
 pub mod read;
 pub mod write;
 

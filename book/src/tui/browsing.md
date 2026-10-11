@@ -10,7 +10,8 @@
 - **Details** (right, 90 columns or wider) — tags, size and format of the focused
   entry, and **which playlists refer to it**. The cover art is drawn here in
   terminals that support it (kitty, iTerm2/WezTerm, sixel; a placeholder elsewhere,
-  and never inside tmux).
+  and never inside tmux). On a folder it is the folder's best image, with a count
+  when there are several; `C` opens the [cover view](covers.md) to manage them.
 
 `tab` switches focus between the tree and the listing.
 

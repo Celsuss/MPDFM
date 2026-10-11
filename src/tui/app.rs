@@ -96,7 +96,8 @@ use super::msg::{
 };
 use super::terminal::Graphics;
 use super::terminal::{MIN_SIZE, fits};
-use super::views::browser::{Browser, Enter, Pane, Results, Sort, TreeRow};
+use super::views::browser::{Browser, Enter, Pane, Results, Sort, Target, TreeRow};
+use super::views::cover::{self as cover_view, Covers, Draft, Focus as CoverFocus};
 use super::views::error::ErrorReport;
 use super::views::organize::Organize;
 use super::views::pending::{self, Pending, Report};
@@ -104,7 +105,7 @@ use super::views::search::{Finding, Kind, Prompt};
 use super::views::tagedit::{Begin, FileAction, Hints, Preview, Started, TagEdit};
 use super::widgets::details::DetailsPane;
 use super::widgets::filelist::FileList;
-use super::widgets::image::{ArtCache, Protocol};
+use super::widgets::image::{ArtCache, Protocol, Slot};
 use super::widgets::input::Input;
 use super::widgets::progress::Progress as Busy;
 use super::widgets::statusbar::{Light, Status};
@@ -128,6 +129,14 @@ const CHROME_ROWS: u16 = 3;
 /// the right trade: a 14-cell details pane is unreadable and the listing is what
 /// the keys act on. The task calls it "a third, narrow column on wide terminals".
 const DETAILS_FROM: u16 = 90;
+
+/// The longest side, in pixels, an image is downscaled to when the cover view's
+/// `z` is on — what `mpdfm cover set --max-dimension 1000` does.
+const DOWNSCALE_TO: u32 = 1000;
+
+/// How wide the cover view has to be before the picture is drawn beside the
+/// list.
+const COVER_PREVIEW_FROM: u16 = 70;
 
 /// Cells given to the details pane when it is shown.
 const DETAILS_W: u16 = 26;
@@ -239,6 +248,12 @@ pub enum View {
     /// organize is 2 800 `TagSet`s. Its `enter` stages into
     /// [`View::Pending`], which is where the plan is read and committed.
     Organize(Box<Organize>),
+    /// One directory's images and its tracks' covers, and the drafts of what
+    /// each track's cover is to become (`views::cover`).
+    ///
+    /// Boxed because it holds the directory's survey: every track's pictures
+    /// and every loose image's facts.
+    Covers(Box<Covers>),
     /// The key help, generated from the live keymap (`widgets::help`): every
     /// mode's bindings, the one it was opened from first.
     Help {
@@ -303,6 +318,7 @@ impl View {
                 | Self::TagEdit(_)
                 | Self::Pending(_)
                 | Self::Organize(_)
+                | Self::Covers(_)
         )
     }
 
@@ -313,6 +329,7 @@ impl View {
             Self::TagEdit(_) => "tagedit",
             Self::Pending(_) => "pending",
             Self::Organize(_) => "organize",
+            Self::Covers(_) => "covers",
             Self::Help { .. } => "help",
             Self::Command(_) => "command",
             Self::Search(_) => "search",
@@ -349,6 +366,8 @@ enum Answer {
     Act(Action),
     /// Close the tag editor, throwing away what was typed into it.
     DiscardEdits,
+    /// Close the cover view, throwing away its unstaged drafts.
+    DiscardCoverDrafts,
     /// Throw the staged plan away.
     ///
     /// Not an action for the same reason as `DiscardEdits`: `x` is the verb, and
@@ -777,6 +796,7 @@ impl App {
             Some(View::Search(_)) => Mode::Search,
             Some(View::TagEdit(_)) => Mode::TagEdit,
             Some(View::Pending(_)) => Mode::Pending,
+            Some(View::Covers(_)) => Mode::Cover,
             _ => Mode::Browser,
         }
     }
@@ -800,6 +820,12 @@ impl App {
                     }
                     Answer::DiscardPlan => {
                         self.discard_plan();
+                    }
+                    Answer::DiscardCoverDrafts => {
+                        if matches!(self.views.last(), Some(View::Covers(_))) {
+                            self.log.line("covers: drafts discarded");
+                            self.views.pop();
+                        }
                     }
                 }
                 true
@@ -915,6 +941,12 @@ impl App {
             return dirty;
         }
 
+        // The cover view claims its own verbs and the moving-around ones; the
+        // help and quitting fall through to the panel rules below.
+        if let Some(dirty) = self.covers_action(action) {
+            return dirty;
+        }
+
         // And so does the pending view, for the same reason and in the same
         // place: `d` unstages in there and stages a delete everywhere else.
         if let Some(dirty) = self.pending_action(action) {
@@ -1016,6 +1048,28 @@ impl App {
             Action::SearchPrev => self.step_search(false),
 
             Action::Organize => self.open_organize(None),
+            Action::Covers => self.open_covers(),
+
+            // -- only meaningful inside the cover view ----------------------
+            Action::AssignCover
+            | Action::RemoveCover
+            | Action::PairCovers
+            | Action::StageCovers
+            | Action::ExtractCover
+            | Action::CanonicalCover
+            | Action::PruneCovers
+            | Action::ToggleDownscale => {
+                let how = self
+                    .keys
+                    .map()
+                    .key_for(Mode::Browser, Action::Covers)
+                    .map_or_else(String::new, |key| format!(" \u{b7} {key} opens it"));
+                self.notify(
+                    Level::Warn,
+                    format!("{}: only in the cover view{how}", action.help()),
+                );
+                true
+            }
 
             // -- only meaningful inside the tag editor ----------------------
             Action::EditField
@@ -1668,6 +1722,712 @@ impl App {
         dirty
     }
 
+    // -- covers ----------------------------------------------------------------
+
+    /// The cover view, if it is on top.
+    fn covers(&self) -> Option<&Covers> {
+        match self.views.last() {
+            Some(View::Covers(view)) => Some(view),
+            _ => None,
+        }
+    }
+
+    /// The cover view, if it is on top, to change.
+    fn covers_mut(&mut self) -> Option<&mut Covers> {
+        match self.views.last_mut() {
+            Some(View::Covers(view)) => Some(view),
+            _ => None,
+        }
+    }
+
+    /// The entry whose art the screen wants: the cover view's image or track
+    /// when that view is on top, and the browser's focused entry otherwise.
+    fn art_focus(&self) -> Option<RelPath> {
+        if let Some(view) = self.covers() {
+            return view.focused_rel();
+        }
+        let library = self.library.as_ref()?;
+        self.browser.focused_path(library)
+    }
+
+    /// `C`: open the cover view on the directory the cursor means — a
+    /// subdirectory row in the listing, or else the directory being browsed.
+    ///
+    /// Tracks marked in the browser that are in that directory start out
+    /// marked in the view, so "mark three singles, press `C`, pick the image"
+    /// works without marking them twice.
+    fn open_covers(&mut self) -> bool {
+        let dir = self.cover_dir();
+        self.open_covers_on(dir)
+    }
+
+    /// The directory `C` and `:cover` are about.
+    fn cover_dir(&self) -> DirPath {
+        match (self.focus, self.browser.focused_target()) {
+            (Focus::Files, Some(Target::Dir(dir))) => dir.clone(),
+            _ => self.browser.dir().clone(),
+        }
+    }
+
+    /// `:cover set | remove | extract`, without the view: the same plans the
+    /// view's keys stage, for the marked tracks of the directory or all of
+    /// them, read here because a directory's tracks are a handful of files.
+    fn cover_command(&mut self, command: command::CoverCommand) -> bool {
+        use command::CoverCommand;
+        use mpdfm_core::art::{self, plan};
+
+        if command == CoverCommand::Open {
+            return self.open_covers();
+        }
+        let Some(library) = &self.library else {
+            return false;
+        };
+        let root = library.root().to_path_buf();
+        let dir = self.cover_dir();
+        let marked: Vec<RelPath> = self
+            .browser
+            .marks()
+            .into_iter()
+            .filter(|rel| DirPath::of(rel) == dir && library.get(rel).is_some_and(|e| e.is_audio()))
+            .collect();
+        let tracks: Vec<RelPath> = if marked.is_empty() {
+            library
+                .files_in(&dir)
+                .filter(|entry| entry.is_audio())
+                .map(|entry| entry.rel.clone())
+                .collect()
+        } else {
+            marked
+        };
+        if tracks.is_empty() {
+            self.notify(Level::Warn, format!("no audio files directly in {dir}"));
+            return true;
+        }
+        let pictures: Vec<(RelPath, Vec<art::Embedded>)> = tracks
+            .into_iter()
+            .map(|rel| {
+                let pictures = art::embedded(&rel.to_abs(&root)).unwrap_or_default();
+                (rel, pictures)
+            })
+            .collect();
+
+        let planned = match command {
+            CoverCommand::Open => return false,
+            CoverCommand::Set { image } => {
+                let given = camino::Utf8Path::new(&image);
+                let dir_abs = dir.to_abs(&root);
+                let path = if given.is_absolute() {
+                    given.to_owned()
+                } else if dir_abs.join(given).is_file() {
+                    dir_abs.join(given)
+                } else {
+                    root.join(given)
+                };
+                let image = match art::CoverImage::load(&path) {
+                    Ok((image, _)) => image,
+                    Err(err) => {
+                        self.notify(Level::Warn, err.to_string());
+                        return true;
+                    }
+                };
+                let mut planned = plan::embed(&pictures, &image);
+                if planned.is_empty() {
+                    self.notify(Level::Info, "every track already has that front cover");
+                    return true;
+                }
+                if image.image.size > plan::LARGE_COVER {
+                    planned.notes.push(format!(
+                        "{path} is over 1 MB; the cover view's downscale would shrink it"
+                    ));
+                }
+                planned
+            }
+            CoverCommand::Remove => {
+                let planned = plan::remove(&pictures);
+                if planned.is_empty() {
+                    self.notify(Level::Info, "no track there embeds a front cover");
+                    return true;
+                }
+                planned
+            }
+            CoverCommand::Extract { name } => {
+                match plan::extract(&dir, &pictures, name.as_deref(), |to| {
+                    std::fs::read(to.to_abs(&root))
+                        .ok()
+                        .map(|bytes| mpdfm_core::ops::exec_fs::hash_bytes(&bytes))
+                }) {
+                    Ok(planned) => planned,
+                    Err(err) => {
+                        self.notify(Level::Warn, err.to_string());
+                        return true;
+                    }
+                }
+            }
+        };
+        let dirty = self.stage(planned.ops, "cover");
+        for note in planned.notes {
+            self.notify(Level::Info, note);
+        }
+        dirty
+    }
+
+    fn open_covers_on(&mut self, dir: DirPath) -> bool {
+        let Some(library) = &self.library else {
+            return false;
+        };
+        if library.dir(&dir).is_none() {
+            self.notify(
+                Level::Warn,
+                format!("{dir} is not a directory in the library"),
+            );
+            return true;
+        }
+        let premarked: Vec<RelPath> = self
+            .browser
+            .marks()
+            .into_iter()
+            .filter(|rel| DirPath::of(rel) == dir)
+            .collect();
+        self.log.line(format!("covers: opening on {dir}"));
+        self.read_covers(&dir);
+        self.push(View::Covers(Box::new(Covers::opening(dir, premarked))))
+    }
+
+    /// Start the survey of `dir` on a worker.
+    fn read_covers(&self, dir: &DirPath) {
+        let Some(library) = &self.library else {
+            return;
+        };
+        let tracks: Vec<RelPath> = library
+            .files_in(dir)
+            .filter(|entry| entry.is_audio())
+            .map(|entry| entry.rel.clone())
+            .collect();
+        work::read_covers(
+            self.tx.clone(),
+            dir.clone(),
+            tracks,
+            library.root().to_path_buf(),
+            Arc::clone(&self.log),
+        );
+    }
+
+    /// A survey landed. It goes to the cover view that asked for it, wherever
+    /// that is on the stack — the pending view may be over it.
+    fn on_covers_read(
+        &mut self,
+        dir: &DirPath,
+        result: Result<cover_view::Survey, String>,
+    ) -> bool {
+        for view in &mut self.views {
+            if let View::Covers(view) = view
+                && view.dir() == dir
+                && view.survey().is_none()
+            {
+                view.arrived(result);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The library was rescanned: every cover view reads its directory again.
+    fn reload_covers(&mut self) {
+        let Some(library) = &self.library else {
+            return;
+        };
+        let mut again = Vec::new();
+        for view in &mut self.views {
+            if let View::Covers(view) = view {
+                if library.dir(view.dir()).is_some() {
+                    view.reloading();
+                    again.push(view.dir().clone());
+                } else {
+                    view.gone();
+                }
+            }
+        }
+        for dir in again {
+            self.read_covers(&dir);
+        }
+    }
+
+    /// How many rows the cover view's list has, from the last size the
+    /// terminal reported.
+    fn cover_rows(&self) -> usize {
+        usize::from(self.size.1.saturating_sub(CHROME_ROWS + 2))
+    }
+
+    /// The cover view's share of the actions. `None` when it is not on top or
+    /// does not want this one.
+    fn covers_action(&mut self, action: Action) -> Option<bool> {
+        self.covers()?;
+        let rows = self.cover_rows();
+        let step = self.page_step();
+        let view = self.covers_mut()?;
+        let said: (Level, String) = match action {
+            Action::Down => return Some(view.move_cursor(1, rows)),
+            Action::Up => return Some(view.move_cursor(-1, rows)),
+            Action::HalfPageDown => return Some(view.move_cursor(step, rows)),
+            Action::HalfPageUp => return Some(view.move_cursor(-step, rows)),
+            Action::Top => return Some(view.set_cursor(0, rows)),
+            Action::Bottom => return Some(view.set_cursor(usize::MAX, rows)),
+            Action::SwitchPane => return Some(view.switch_section(rows)),
+            Action::Left => return Some(view.cycle(false)),
+            Action::Right => return Some(view.cycle(true)),
+            Action::ToggleMark => return Some(view.toggle_mark()),
+            Action::MarkAll => return Some(view.mark_all()),
+            Action::UnmarkAll => return Some(view.unmark_all()),
+            Action::AssignCover => match view.assign() {
+                Ok(tracks) => (
+                    Level::Info,
+                    format!(
+                        "drafted for {} \u{b7} {}",
+                        tracks_phrase(tracks),
+                        self.stage_hint()
+                    ),
+                ),
+                Err(why) => (Level::Warn, why),
+            },
+            Action::RemoveCover => {
+                let tracks = view.draft_removal();
+                (
+                    Level::Info,
+                    format!(
+                        "drafted removing the front cover of {} \u{b7} {}",
+                        tracks_phrase(tracks),
+                        self.stage_hint()
+                    ),
+                )
+            }
+            Action::PairCovers => {
+                let report = view.pair();
+                let mut text = format!("paired {}", tracks_phrase(report.paired));
+                if !report.unmatched.is_empty() {
+                    text.push_str(&format!(
+                        " \u{b7} no image matches {}",
+                        report.unmatched.join(", ")
+                    ));
+                }
+                if !report.ambiguous.is_empty() {
+                    text.push_str(&format!(
+                        " \u{b7} more than one image matches {}",
+                        report.ambiguous.join(", ")
+                    ));
+                }
+                let level = if report.unmatched.is_empty() && report.ambiguous.is_empty() {
+                    Level::Info
+                } else {
+                    // Named, because they are the ones left to fix by hand.
+                    text.push_str(" \u{b7} h / l on a track picks its image");
+                    Level::Warn
+                };
+                (level, text)
+            }
+            Action::ToggleDownscale => {
+                let on = view.toggle_downscale();
+                (
+                    Level::Info,
+                    if on {
+                        format!("images larger than {DOWNSCALE_TO} px are downscaled when embedded")
+                    } else {
+                        "images are embedded as they are".to_owned()
+                    },
+                )
+            }
+            Action::StageCovers => return Some(self.stage_covers()),
+            Action::ExtractCover => return Some(self.extract_cover(None)),
+            Action::CanonicalCover => return Some(self.canonical_cover()),
+            Action::StageDelete => return Some(self.delete_cover_image()),
+            Action::PruneCovers => return Some(self.prune_covers()),
+            Action::ShowPending => return Some(self.show_pending()),
+            Action::Cancel => return Some(self.close_covers()),
+            _ => return None,
+        };
+        self.notify(said.0, said.1);
+        Some(true)
+    }
+
+    /// `w to stage`, in the key the user has, or nothing.
+    fn stage_hint(&self) -> String {
+        self.keys
+            .map()
+            .key_for(Mode::Cover, Action::StageCovers)
+            .map_or_else(
+                || "not staged yet".to_owned(),
+                |key| format!("{key} to stage"),
+            )
+    }
+
+    /// `esc`: leave, asking first if drafts would be lost.
+    fn close_covers(&mut self) -> bool {
+        let Some(view) = self.covers() else {
+            return false;
+        };
+        let drafts = view
+            .drafts()
+            .iter()
+            .filter(|draft| **draft != Draft::Keep)
+            .count();
+        if drafts == 0 {
+            return self.pop();
+        }
+        self.push(View::Confirm(Confirm {
+            question: format!(
+                "{} cover change(s) drafted and not staged.\nThrow them away?",
+                drafts
+            ),
+            on_yes: Answer::DiscardCoverDrafts,
+        }))
+    }
+
+    /// The tracks of the cover view's survey, each with its pictures.
+    fn cover_tracks(
+        view: &Covers,
+        which: &[usize],
+    ) -> Vec<(RelPath, Vec<mpdfm_core::art::Embedded>)> {
+        let Some(survey) = view.survey() else {
+            return Vec::new();
+        };
+        which
+            .iter()
+            .map(|&at| {
+                let track = &survey.art.tracks[at];
+                (track.rel.clone(), track.pictures.clone())
+            })
+            .collect()
+    }
+
+    /// Whether a staged operation moves or deletes `rel` — an image a cover
+    /// edit would read from at commit time.
+    fn staged_away(&self, rel: &RelPath) -> bool {
+        self.plan.ops().iter().any(|op| op.vacates(rel))
+    }
+
+    /// Whether a staged cover edit embeds the image at `abs`, which therefore
+    /// has to stay where it is until the commit.
+    fn staged_embeds(&self, abs: &camino::Utf8Path) -> bool {
+        self.plan.ops().iter().any(|op| match op {
+            Operation::WriteTags { changes, .. } => matches!(
+                changes.cover(),
+                Some(mpdfm_core::art::CoverEdit::Set(image)) if image.source == abs
+            ),
+            _ => false,
+        })
+    }
+
+    /// `w`: turn the drafts into operations and stage them.
+    ///
+    /// One embed per image, so the bytes each costs are reported per image,
+    /// and the removals together. Nothing is staged unless every image loads:
+    /// a draft that would half-stage is worse than one that says why not.
+    fn stage_covers(&mut self) -> bool {
+        let Some(library) = &self.library else {
+            return false;
+        };
+        let root = library.root().to_path_buf();
+        let Some(view) = self.covers() else {
+            return false;
+        };
+        let Some(survey) = view.survey() else {
+            self.notify(Level::Info, "still reading the pictures — a moment");
+            return true;
+        };
+        let mut embeds: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        let mut removals = Vec::new();
+        for (at, draft) in view.drafts().iter().enumerate() {
+            match draft {
+                Draft::Embed(image) => embeds.entry(*image).or_default().push(at),
+                Draft::Remove => removals.push(at),
+                Draft::Keep => {}
+            }
+        }
+        if embeds.is_empty() && removals.is_empty() {
+            let assign = self
+                .keys
+                .map()
+                .key_for(Mode::Cover, Action::AssignCover)
+                .map_or_else(String::new, |key| {
+                    format!(" \u{b7} {key} assigns the image under the cursor")
+                });
+            self.notify(Level::Info, format!("nothing drafted{assign}"));
+            return true;
+        }
+
+        let dir_abs = view.dir().to_abs(&root);
+        let downscale = view.downscale();
+        let mut ops = Vec::new();
+        let mut notes = Vec::new();
+        for (image, tracks) in &embeds {
+            let file = &survey.art.loose[*image];
+            let source = dir_abs.join(&file.name);
+            if let Ok(rel) = view.dir().join(&file.name)
+                && self.staged_away(&rel)
+            {
+                self.notify(
+                    Level::Warn,
+                    format!(
+                        "{} is staged to move or be deleted, so it cannot be embedded",
+                        file.name
+                    ),
+                );
+                return true;
+            }
+            let loaded = mpdfm_core::art::CoverImage::load(&source).and_then(|(image, bytes)| {
+                if !downscale {
+                    return Ok((image, None));
+                }
+                match mpdfm_core::art::downscale(&bytes, DOWNSCALE_TO, &image.source)? {
+                    None => Ok((image, None)),
+                    Some(smaller) => {
+                        let staged = mpdfm_core::art::stage(&self.config.data_dir, &smaller)?;
+                        let (resized, _) = mpdfm_core::art::CoverImage::load(&staged)?;
+                        let note = format!(
+                            "{} downscaled: {} \u{2192} {}",
+                            file.name, image.image, resized.image
+                        );
+                        Ok((resized, Some(note)))
+                    }
+                }
+            });
+            let (image, note) = match loaded {
+                Ok(loaded) => loaded,
+                Err(err) => {
+                    self.notify(Level::Warn, err.to_string());
+                    return true;
+                }
+            };
+            notes.extend(note);
+            if !downscale && image.image.size > mpdfm_core::art::plan::LARGE_COVER {
+                let key = self
+                    .keys
+                    .map()
+                    .key_for(Mode::Cover, Action::ToggleDownscale)
+                    .map_or_else(String::new, |key| format!("; {key} downscales it"));
+                notes.push(format!("{} is over 1 MB{key}", file.name));
+            }
+            let planned = mpdfm_core::art::plan::embed(&Self::cover_tracks(view, tracks), &image);
+            ops.extend(planned.ops);
+            notes.extend(planned.notes);
+        }
+        let planned = mpdfm_core::art::plan::remove(&Self::cover_tracks(view, &removals));
+        ops.extend(planned.ops);
+        notes.extend(planned.notes);
+
+        if ops.is_empty() {
+            if let Some(view) = self.covers_mut() {
+                view.clear_drafts();
+            }
+            self.notify(
+                Level::Info,
+                "nothing to stage: every track already has that cover",
+            );
+            return true;
+        }
+        // In track order, which is how the pending view is read: per image is
+        // how they were worked out, not how anybody thinks of an album.
+        ops.sort_by(|a, b| a.source().cmp(b.source()));
+        let before = self.plan.len();
+        let dirty = self.stage(ops, "cover");
+        if self.plan.len() != before {
+            for view in &mut self.views {
+                if let View::Covers(view) = view {
+                    view.clear_drafts();
+                }
+            }
+            for note in notes {
+                self.notify(Level::Info, note);
+            }
+        }
+        dirty
+    }
+
+    /// `e` and `:cover extract [name]`: stage writing the embedded cover out
+    /// beside the tracks — the focused track's, or the first track's that has
+    /// one.
+    fn extract_cover(&mut self, name: Option<String>) -> bool {
+        let Some(library) = &self.library else {
+            return false;
+        };
+        let root = library.root().to_path_buf();
+        let Some(view) = self.covers() else {
+            return false;
+        };
+        let Some(survey) = view.survey() else {
+            self.notify(Level::Info, "still reading the pictures — a moment");
+            return true;
+        };
+        let mut order: Vec<usize> = (0..survey.art.tracks.len()).collect();
+        if let Some(CoverFocus::Track(at)) = view.focused() {
+            order.retain(|other| *other != at);
+            order.insert(0, at);
+        }
+        let tracks = Self::cover_tracks(view, &order);
+        let planned = mpdfm_core::art::plan::extract(view.dir(), &tracks, name.as_deref(), |to| {
+            std::fs::read(to.to_abs(&root))
+                .ok()
+                .map(|bytes| mpdfm_core::ops::exec_fs::hash_bytes(&bytes))
+        });
+        match planned {
+            Ok(planned) => {
+                let dirty = self.stage(planned.ops, "extract");
+                for note in planned.notes {
+                    self.notify(Level::Info, note);
+                }
+                dirty
+            }
+            Err(err) => {
+                self.notify(Level::Warn, err.to_string());
+                true
+            }
+        }
+    }
+
+    /// The loose image under the cover view's cursor, with its path.
+    fn focused_image(&mut self, verb: &str) -> Option<(mpdfm_core::art::Loose, RelPath)> {
+        let view = self.covers()?;
+        let found = match (view.focused(), view.survey()) {
+            (Some(CoverFocus::Image(at)), Some(survey)) => {
+                let file = survey.art.loose[at].clone();
+                view.dir().join(&file.name).ok().map(|rel| (file, rel))
+            }
+            _ => None,
+        };
+        if found.is_none() {
+            self.notify(
+                Level::Warn,
+                format!("put the cursor on an image to {verb} it"),
+            );
+        }
+        found
+    }
+
+    /// Refuse to stage a move or delete of an image a staged cover edit reads.
+    fn refuse_if_embedded(&mut self, file: &mpdfm_core::art::Loose, rel: &RelPath) -> bool {
+        let Some(library) = &self.library else {
+            return true;
+        };
+        if self.staged_embeds(&rel.to_abs(library.root())) {
+            self.notify(
+                Level::Warn,
+                format!(
+                    "{} is staged to be embedded; commit or unstage that first",
+                    file.name
+                ),
+            );
+            return true;
+        }
+        false
+    }
+
+    /// `C`: stage renaming the image under the cursor to `cover.<ext>`, the
+    /// name MPD's `albumart` and every client that reads loose art looks for
+    /// first.
+    fn canonical_cover(&mut self) -> bool {
+        let Some((file, rel)) = self.focused_image("rename") else {
+            return true;
+        };
+        if !file.is_image() {
+            self.notify(Level::Warn, format!("{} is not an image", file.name));
+            return true;
+        }
+        let name = mpdfm_core::art::plan::canonical_name(&file);
+        if file.name == name {
+            self.notify(Level::Info, format!("{name} is already the cover"));
+            return true;
+        }
+        if self.refuse_if_embedded(&file, &rel) {
+            return true;
+        }
+        let Some(view) = self.covers() else {
+            return false;
+        };
+        let Ok(to) = view.dir().join(&name) else {
+            return false;
+        };
+        let taken = self.library.as_ref().is_some_and(|library| {
+            library.get(&to).is_some() || to.to_abs(library.root()).exists()
+        });
+        if taken && !self.staged_away(&to) {
+            let how = self
+                .keys
+                .map()
+                .key_for(Mode::Cover, Action::PruneCovers)
+                .map_or_else(String::new, |key| {
+                    format!(", or {key} on this image to keep only it")
+                });
+            self.notify(
+                Level::Warn,
+                format!("{name} is already here — delete it first{how}"),
+            );
+            return true;
+        }
+        self.stage(vec![Operation::MoveFile { from: rel, to }], "rename")
+    }
+
+    /// `d` in the cover view: stage deleting the image under the cursor.
+    fn delete_cover_image(&mut self) -> bool {
+        let Some((file, rel)) = self.focused_image("delete") else {
+            return true;
+        };
+        if self.refuse_if_embedded(&file, &rel) {
+            return true;
+        }
+        if self.staged_away(&rel) {
+            self.notify(
+                Level::Info,
+                format!("{} is already staged to go", file.name),
+            );
+            return true;
+        }
+        self.stage(vec![Operation::Delete { target: rel }], "delete")
+    }
+
+    /// `D`: stage deleting every image in the directory but the one under the
+    /// cursor.
+    fn prune_covers(&mut self) -> bool {
+        let Some((keep, _)) = self.focused_image("keep") else {
+            return true;
+        };
+        let Some(view) = self.covers() else {
+            return false;
+        };
+        let Some(survey) = view.survey() else {
+            return true;
+        };
+        let doomed: Vec<(mpdfm_core::art::Loose, RelPath)> = survey
+            .art
+            .loose
+            .iter()
+            .filter(|file| file.name != keep.name)
+            .filter_map(|file| {
+                view.dir()
+                    .join(&file.name)
+                    .ok()
+                    .map(|rel| (file.clone(), rel))
+            })
+            .collect();
+        let doomed: Vec<(mpdfm_core::art::Loose, RelPath)> = doomed
+            .into_iter()
+            .filter(|(_, rel)| !self.staged_away(rel))
+            .collect();
+        if doomed.is_empty() {
+            self.notify(Level::Info, format!("{} is the only image here", keep.name));
+            return true;
+        }
+        for (file, rel) in &doomed {
+            if self.refuse_if_embedded(file, rel) {
+                return true;
+            }
+        }
+        let ops = doomed
+            .into_iter()
+            .map(|(_, target)| Operation::Delete { target })
+            .collect();
+        self.stage(ops, "delete")
+    }
+
     // -- staging, and the view that shows what is staged -------------------
 
     /// The pending view on the stack, if it is there.
@@ -2300,6 +3060,7 @@ impl App {
                 }
             },
             Command::Undo { txid } => self.undo_last(txid),
+            Command::Cover(cover) => self.cover_command(cover),
             Command::Doctor => self.not_yet("doctor", Some("29-doctor.md")),
             Command::Messages => self.push(View::Messages { scroll: 0 }),
             Command::Set { key, value } => self.set_setting(&key, &value),
@@ -2949,6 +3710,9 @@ impl App {
                 if self.pending().is_some() {
                     self.revalidate();
                 }
+                // And the cover view's survey is about files a commit may just
+                // have rewritten: read it again.
+                self.reload_covers();
 
                 if warnings == 0 {
                     self.notify(Level::Info, summary);
@@ -3065,13 +3829,11 @@ impl App {
                 filled || moved
             }
             TaskOutcome::Art { rel, result } => {
-                let focused = self
-                    .library
-                    .as_ref()
-                    .and_then(|library| self.browser.focused_path(library));
+                let focused = self.art_focus();
                 self.art.arrived(rel.clone(), result);
                 focused.as_ref() == Some(&rel)
             }
+            TaskOutcome::Covers { dir, result } => self.on_covers_read(&dir, result),
             TaskOutcome::Selection(reads) => self.on_selection(reads),
             TaskOutcome::Organize(reads) => self.on_organize_read(reads),
             TaskOutcome::Found(outcome) => self.on_found(*outcome),
@@ -3277,10 +4039,11 @@ impl App {
         let Some(library) = &self.library else {
             return;
         };
-        let Some(rel) = self.browser.focused_path(library) else {
+        let Some(rel) = self.art_focus() else {
             return;
         };
-        if let Some(rel) = self.art.want(&rel) {
+        let is_dir = library.dir(&DirPath::from(rel.clone())).is_some();
+        if let Some(rel) = self.art.want(&rel, is_dir) {
             work::read_art(
                 self.tx.clone(),
                 rel,
@@ -3704,6 +4467,7 @@ impl App {
             View::TagEdit(form) => self.render_tagedit(form, body, frame),
             View::Pending(view) => self.render_pending(view, body, frame),
             View::Organize(view) => self.render_organize(view, body, frame),
+            View::Covers(view) => self.render_covers(view, body, frame),
             View::Confirm(confirm) => panel(
                 " confirm ",
                 &format!("{}\n\ny to quit · n or esc to stay", confirm.question),
@@ -3711,13 +4475,12 @@ impl App {
                 body,
                 frame,
             ),
-            View::Notice { title, body: text } => panel(
-                title,
-                &format!("{text}\n\nesc to dismiss"),
-                Color::Yellow,
-                body,
-                frame,
-            ),
+            // The way out in the border, where a notice too long for the panel
+            // — the list of action names a bad `keys.toml` line gets — cannot
+            // push it out of sight.
+            View::Notice { title, body: text } => {
+                panel_with_footer(title, text, " esc to dismiss ", Color::Yellow, body, frame)
+            }
             View::Error(report) => {
                 let area = panel_area(body);
                 let lines = report.lines(inner_width(area));
@@ -3819,6 +4582,74 @@ impl App {
                 inner.y.saturating_add(row),
             ));
         }
+    }
+
+    /// The cover view: the list on the left, the picture under the cursor on
+    /// the right when there is room for both.
+    ///
+    /// The whole body, like the other views a user works in rather than
+    /// dismisses.
+    fn render_covers(&self, view: &Covers, body: Rect, frame: &mut ratatui::Frame) {
+        let key = |action| self.keys.map().key_for(Mode::Cover, action);
+        let hints = cover_view::Hints {
+            assign: key(Action::AssignCover),
+            pair: key(Action::PairCovers),
+            stage: key(Action::StageCovers),
+            back: key(Action::Cancel),
+            help: key(Action::Help),
+        };
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(Color::Cyan))
+            .title(fit(&view.title(), inner_width(body)))
+            .title_bottom(fit(&view.footer(&hints), inner_width(body)));
+        let inner = block.inner(body);
+        frame.render_widget(Clear, body);
+        frame.render_widget(block, body);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        // The picture gets two fifths of a wide body and none of a narrow one:
+        // below this the list's names and sizes no longer fit beside it.
+        let preview_w = if inner.width >= COVER_PREVIEW_FROM {
+            inner.width * 2 / 5
+        } else {
+            0
+        };
+        let [list, preview] =
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(preview_w)]).areas(inner);
+        Paragraph::new(view.lines(usize::from(list.width), usize::from(list.height)))
+            .render(list, frame.buffer_mut());
+
+        if preview.width == 0 {
+            return;
+        }
+        let Some(rel) = view.focused_rel() else {
+            return;
+        };
+        // `rows_for` keeps art to half a pane, which is right beside the
+        // browser's details and wrong here, where the picture is the point.
+        let rows = self
+            .art
+            .rows_for(&rel, preview.width, preview.height.saturating_mul(2))
+            .min(preview.height);
+        if rows == 0 {
+            let said = match self.art.slot(&rel) {
+                None | Some(Slot::Loading) => " loading…",
+                Some(_) => " no picture",
+            };
+            Paragraph::new(Line::styled(said, Style::new().fg(Color::DarkGray)))
+                .render(preview, frame.buffer_mut());
+            return;
+        }
+        let area = Rect {
+            height: rows,
+            ..preview
+        };
+        // Graphics only when nothing is drawn over this view.
+        let graphics = matches!(self.views.last(), Some(View::Covers(_)));
+        self.art.render(&rel, area, frame.buffer_mut(), graphics);
     }
 
     /// The pending view: what is staged, and what a running commit is doing
@@ -4293,6 +5124,15 @@ fn tag_targets(browser: &Browser, library: &Library) -> (Vec<RelPath>, usize) {
     (files, skipped)
 }
 
+/// `1 track`, `3 tracks`.
+fn tracks_phrase(n: usize) -> String {
+    if n == 1 {
+        "1 track".to_owned()
+    } else {
+        format!("{n} tracks")
+    }
+}
+
 /// What `o` organizes: the marks, or the row under the cursor, or the
 /// directory on screen — with every directory among them expanded to all the
 /// audio below it. Sorted and deduplicated.
@@ -4390,6 +5230,18 @@ fn tree_label(row: &TreeRow) -> String {
 /// browser visible around the edges so that it is obvious the overlay is on top of
 /// something rather than instead of it.
 fn panel(title: &str, text: &str, color: Color, body: Rect, frame: &mut ratatui::Frame) {
+    panel_with_footer(title, text, "", color, body, frame);
+}
+
+/// A [`panel`] with `footer` in its bottom border.
+fn panel_with_footer(
+    title: &str,
+    text: &str,
+    footer: &str,
+    color: Color,
+    body: Rect,
+    frame: &mut ratatui::Frame,
+) {
     let area = panel_area(body);
 
     // Without this the browser's rows show through the gaps in the text.
@@ -4401,7 +5253,8 @@ fn panel(title: &str, text: &str, color: Color, body: Rect, frame: &mut ratatui:
                 Block::new()
                     .borders(Borders::ALL)
                     .border_style(Style::new().fg(color))
-                    .title(title.to_owned()),
+                    .title(title.to_owned())
+                    .title_bottom(footer.to_owned()),
             ),
         area,
     );
@@ -9500,7 +10353,7 @@ mod tests {
 
         let rel = RelPath::parse(&track).expect("a fixture path");
         assert!(
-            app.art.want(&rel).is_none(),
+            app.art.want(&rel, false).is_none(),
             "loaded, so not asked for again"
         );
 
@@ -9536,5 +10389,297 @@ mod tests {
             !written.contains("\x1bPq"),
             "a sixel was drawn over the help"
         );
+    }
+    // -- the cover view ------------------------------------------------------
+
+    /// A directory of three singles beside three real images: `cover.jpg`, and
+    /// one named after each of the first two tracks.
+    fn singles_fixture() -> (Fixture, Vec<u8>, Vec<u8>, Vec<u8>) {
+        let fx = Fixture::builder()
+            .album(
+                "singles",
+                &["01 Song A.mp3", "02 Song B.mp3", "03 Untitled.mp3"],
+            )
+            .build();
+        let cover = mpdfm_core::testing::tags::jpeg(40, 40);
+        let a = mpdfm_core::testing::tags::jpeg(32, 32);
+        let b = mpdfm_core::testing::tags::png(24, 24);
+        std::fs::write(fx.abs("singles/cover.jpg"), &cover).expect("write cover.jpg");
+        std::fs::write(fx.abs("singles/Song A.jpg"), &a).expect("write Song A.jpg");
+        std::fs::write(fx.abs("singles/Song B.png"), &b).expect("write Song B.png");
+        (fx, cover, a, b)
+    }
+
+    /// Open the cover view on `dir` and wait for its survey.
+    fn open_covers_in(app: &mut App, rx: &mpsc::Receiver<Msg>, fx: &Fixture, dir: &str) {
+        app.update(scanned(fx));
+        let mut terminal = screen(120, 30);
+        go_to(app, &mut terminal, dir);
+        assert!(app.update(press('C')));
+        assert!(matches!(app.views.last(), Some(View::Covers(_))));
+        settle_until(app, rx, |app| {
+            app.covers().is_some_and(|view| view.survey().is_some())
+        });
+    }
+
+    fn drafts(app: &App) -> Vec<Draft> {
+        app.covers()
+            .expect("the cover view is on top")
+            .drafts()
+            .to_vec()
+    }
+
+    /// The image each staged cover edit embeds, by track file name.
+    fn staged_covers(app: &App) -> Vec<(String, String)> {
+        app.plan
+            .ops()
+            .iter()
+            .filter_map(|op| match op {
+                Operation::WriteTags { target, changes } => Some((
+                    target.file_name().to_owned(),
+                    changes
+                        .cover()
+                        .map_or_else(String::new, |cover| match cover {
+                            mpdfm_core::art::CoverEdit::Set(image) => {
+                                image.source.file_name().unwrap_or_default().to_owned()
+                            }
+                            mpdfm_core::art::CoverEdit::Remove => "<removed>".to_owned(),
+                        }),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn last_toast(app: &App) -> String {
+        app.toasts
+            .history()
+            .next_back()
+            .map(|entry| entry.text.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn singles_pair_by_name_and_the_one_left_over_is_fixed_by_hand() {
+        let (fx, cover, a, b) = singles_fixture();
+        let (mut app, rx) = app(&fx);
+        open_covers_in(&mut app, &rx, &fx, "singles");
+
+        // Images first, best first: cover.jpg, Song A.jpg, Song B.png.
+        app.update(press('n'));
+        assert_eq!(
+            drafts(&app),
+            [Draft::Embed(1), Draft::Embed(2), Draft::Keep]
+        );
+        let said = last_toast(&app);
+        assert!(said.contains("paired 2 tracks"), "{said}");
+        assert!(
+            said.contains("03 Untitled.mp3"),
+            "the one to fix is named: {said}"
+        );
+
+        // The hand fix: onto the third track, and `l` steps it to the first
+        // image, cover.jpg.
+        app.update(press('G'));
+        app.update(press('l'));
+        assert_eq!(drafts(&app)[2], Draft::Embed(0));
+
+        app.update(press('w'));
+        assert_eq!(
+            staged_covers(&app),
+            [
+                ("01 Song A.mp3".to_owned(), "Song A.jpg".to_owned()),
+                ("02 Song B.mp3".to_owned(), "Song B.png".to_owned()),
+                ("03 Untitled.mp3".to_owned(), "cover.jpg".to_owned()),
+            ]
+        );
+        assert!(matches!(app.views.last(), Some(View::Pending(_))));
+
+        // Committed, each track carries its own cover, and the cover view
+        // underneath has read them again.
+        app.dispatch(Action::Commit);
+        settle_until(&mut app, &rx, |app| {
+            app.running.is_none()
+                && matches!(app.scan, ScanState::Done { .. })
+                && app
+                    .views
+                    .iter()
+                    .any(|view| matches!(view, View::Covers(view) if view.survey().is_some()))
+        });
+        for (track, bytes) in [
+            ("singles/01 Song A.mp3", &a),
+            ("singles/02 Song B.mp3", &b),
+            ("singles/03 Untitled.mp3", &cover),
+        ] {
+            let pictures = mpdfm_core::art::embedded(&fx.abs(track)).expect("readable");
+            let front = pictures
+                .iter()
+                .find(|picture| picture.kind.is_front())
+                .unwrap_or_else(|| panic!("{track} has no front cover"));
+            assert_eq!(
+                front.image.hash,
+                mpdfm_core::ops::exec_fs::hash_bytes(bytes),
+                "{track}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_nothing_marked_an_image_goes_to_every_track() {
+        let (fx, ..) = singles_fixture();
+        let (mut app, rx) = app(&fx);
+        open_covers_in(&mut app, &rx, &fx, "singles");
+        app.update(press('s'));
+        assert_eq!(drafts(&app), [Draft::Embed(0); 3]);
+        app.update(press('w'));
+        assert_eq!(staged_covers(&app).len(), 3);
+    }
+
+    #[test]
+    fn marks_narrow_an_assignment_and_x_drafts_a_removal() {
+        let (fx, ..) = singles_fixture();
+        let (mut app, rx) = app(&fx);
+        open_covers_in(&mut app, &rx, &fx, "singles");
+        // Onto the second track and mark it, then back to Song A.jpg.
+        app.update(key(KeyCode::Tab));
+        app.update(press('j'));
+        app.update(key(KeyCode::Char(' ')));
+        app.update(key(KeyCode::Tab));
+        app.update(press('j'));
+        app.update(press('s'));
+        assert_eq!(drafts(&app), [Draft::Keep, Draft::Embed(1), Draft::Keep]);
+        app.update(press('x'));
+        assert_eq!(drafts(&app), [Draft::Keep, Draft::Remove, Draft::Keep]);
+    }
+
+    #[test]
+    fn leaving_with_drafts_asks_first() {
+        let (fx, ..) = singles_fixture();
+        let (mut app, rx) = app(&fx);
+        open_covers_in(&mut app, &rx, &fx, "singles");
+        app.update(press('s'));
+        app.update(key(KeyCode::Esc));
+        assert!(matches!(app.views.last(), Some(View::Confirm(_))));
+        app.update(press('y'));
+        assert_eq!(app.views, vec![View::Browser]);
+        assert!(app.plan.is_empty(), "nothing was staged");
+    }
+
+    #[test]
+    fn keeping_one_image_and_naming_it_cover_are_staged_file_operations() {
+        let (fx, ..) = singles_fixture();
+        let (mut app, rx) = app(&fx);
+        open_covers_in(&mut app, &rx, &fx, "singles");
+
+        // On Song A.jpg: `C` would collide with the cover.jpg already there.
+        app.update(press('j'));
+        app.update(press('C'));
+        assert!(
+            last_toast(&app).contains("cover.jpg is already here"),
+            "{}",
+            last_toast(&app)
+        );
+        assert!(app.plan.is_empty());
+
+        // `D` keeps only Song A.jpg; then `C` can take the name.
+        app.update(press('D'));
+        app.dispatch(Action::Cancel);
+        assert!(
+            matches!(app.views.last(), Some(View::Covers(_))),
+            "esc returns to the covers"
+        );
+        app.update(press('C'));
+        let ops: Vec<String> = app
+            .plan
+            .ops()
+            .iter()
+            .map(|op| match op {
+                Operation::Delete { target } => format!("delete {target}"),
+                Operation::MoveFile { from, to } => format!("move {from} -> {to}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            ops,
+            [
+                "delete singles/cover.jpg",
+                "delete singles/Song B.png",
+                "move singles/Song A.jpg -> singles/cover.jpg",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_image_staged_to_be_embedded_is_not_deleted_out_from_under_it() {
+        let (fx, ..) = singles_fixture();
+        let (mut app, rx) = app(&fx);
+        open_covers_in(&mut app, &rx, &fx, "singles");
+        app.update(press('s'));
+        app.update(press('w'));
+        app.dispatch(Action::Cancel);
+        let staged = app.plan.len();
+        app.update(press('d'));
+        assert_eq!(app.plan.len(), staged);
+        assert!(
+            last_toast(&app).contains("staged to be embedded"),
+            "{}",
+            last_toast(&app)
+        );
+    }
+
+    #[test]
+    fn e_stages_the_embedded_cover_written_out_beside_the_tracks() {
+        let (fx, track) = art_fixture(&mpdfm_core::testing::tags::png(20, 20));
+        let (mut app, rx) = app(&fx);
+        open_covers_in(&mut app, &rx, &fx, "covers/album");
+        app.update(press('e'));
+        match app.plan.ops() {
+            [Operation::ExtractArt { from, to, .. }] => {
+                assert_eq!(from.as_str(), track);
+                assert_eq!(to.as_str(), "covers/album/cover.png");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_cover_command_stages_without_opening_the_view() {
+        let (fx, _track) = art_fixture(&mpdfm_core::testing::tags::jpeg(20, 20));
+        let (mut app, _rx) = app(&fx);
+        app.update(scanned(&fx));
+        let mut terminal = screen(120, 30);
+        go_to(&mut app, &mut terminal, "covers/album");
+        app.run_command(command::Command::Cover(command::CoverCommand::Remove));
+        assert_eq!(
+            staged_covers(&app),
+            [("01 Track.mp3".to_owned(), "<removed>".to_owned())]
+        );
+    }
+
+    #[test]
+    fn the_cover_view_draws_what_each_track_has_and_will_have() {
+        let (fx, ..) = singles_fixture();
+        let (mut app, rx) = app(&fx);
+        open_covers_in(&mut app, &rx, &fx, "singles");
+        app.update(press('n'));
+        let mut terminal = screen(120, 30);
+        draw(&mut app, &mut terminal);
+        let drawn = text(&terminal);
+        assert!(drawn.contains("covers \u{b7} singles"), "{drawn}");
+        assert!(drawn.contains("no cover  \u{2192} Song A.jpg"), "{drawn}");
+        assert!(
+            drawn.contains("w stage"),
+            "the footer offers staging once there are drafts: {drawn}"
+        );
+    }
+
+    #[test]
+    fn a_directory_in_the_details_pane_shows_its_best_image_and_how_many_there_are() {
+        let (fx, ..) = singles_fixture();
+        let rel = RelPath::parse("singles").expect("a path");
+        let art = super::super::widgets::image::load(&rel, &fx.abs("singles"), false)
+            .expect("readable")
+            .expect("it has images");
+        assert_eq!(art.label, "cover.jpg \u{b7} 3 images");
     }
 }
