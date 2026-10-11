@@ -7,6 +7,7 @@
 //! | `tagedit` | the tag editor — the selection, what was typed into it, what that would write |
 //! | `pending` | the staged plan — what is about to happen, folded and unfolded |
 //! | `organize` | the template being typed, and where the first files would go |
+//! | `cover` | one directory's images, its tracks' covers, and what each is to become |
 //! | `search` | the pattern being typed, and a library-wide walk in flight |
 //! | `error` | something that went wrong, the path it is about, and what to do next |
 //!
@@ -22,6 +23,7 @@
 //!   `update`, never in `render`.
 
 pub mod browser;
+pub mod cover;
 pub mod error;
 pub mod organize;
 pub mod pending;

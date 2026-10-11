@@ -168,6 +168,15 @@ pub enum TaskOutcome {
         result: Result<Option<super::widgets::image::Art>, String>,
     },
 
+    /// A directory's art was surveyed for the cover view.
+    Covers {
+        /// The directory.
+        dir: mpdfm_core::library::DirPath,
+        /// Its tracks' pictures and titles and its loose images, or why the
+        /// directory could not be listed.
+        result: Result<super::views::cover::Survey, String>,
+    },
+
     /// A window of files was read for the browser (task 22).
     ///
     /// See [`Reads`] for the shape, which is also the one a failure takes.

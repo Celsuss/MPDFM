@@ -235,11 +235,20 @@ fn name_fits(name: &str, format: ImageFormat) -> bool {
 }
 
 /// The name a loose image would have as the directory's canonical cover:
-/// `cover.` and the extension its **bytes** call for, so a `folder.jpg` that is
-/// a PNG becomes `cover.png`.
+/// `cover.` and its own extension, lower-cased, when that is one its bytes can
+/// be opened by — `cover.jpeg` stays `cover.jpeg` — and otherwise the extension
+/// its **bytes** call for, so a `folder.jpg` that is a PNG becomes `cover.png`.
 #[must_use]
 pub fn canonical_name(image: &Loose) -> String {
-    format!("cover.{}", image.image.format.extension())
+    let own = image
+        .name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .filter(|ext| name_fits(&format!("cover.{ext}"), image.image.format));
+    format!(
+        "cover.{}",
+        own.unwrap_or_else(|| image.image.format.extension().to_owned())
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -273,47 +282,76 @@ pub enum Paired {
 /// spaces, a leading track number dropped — so `01 - Song A.mp3`, `Song A.flac`
 /// and a track titled "Song A" all go with `song_a.JPG`.
 ///
-/// An image is matched to a track whose file name or title is the **same** key,
-/// or failing that whose key **ends with** it as whole words (`Artist - Song A`
-/// goes with `Song A.jpg`). More than one candidate at the same tier is
-/// [`Paired::Ambiguous`], never a guess. Only JPEG and PNG are candidates,
-/// because nothing else can be embedded.
+/// Three tiers, and the first that finds anything decides:
+///
+/// 1. the track's file name or title is the **same** key as the image's;
+/// 2. it **ends with** the image's key as whole words — `Artist - Song A` goes
+///    with `Song A.jpg`;
+/// 3. with anything in brackets dropped and the spaces taken out
+///    ([`compact_key`]), it is the same as the image's or ends with it — which
+///    is what a downloaded single looks like:
+///    `Artist_-_Song_Title_(AMV)_[dQw4w9WgXcQ].mp3` beside `songtitle.jpg`.
+///
+/// More than one candidate in the deciding tier is [`Paired::Ambiguous`],
+/// never a guess. Only JPEG and PNG are candidates, because nothing else can be
+/// embedded.
 #[must_use]
 pub fn pair(tracks: &[ToPair<'_>], loose: &[Loose]) -> Vec<Paired> {
-    let images: Vec<(usize, String)> = loose
+    let images: Vec<(usize, String, String)> = loose
         .iter()
         .enumerate()
         .filter(|(_, file)| file.image.format.embeddable())
-        .map(|(at, file)| (at, name_key(stem(&file.name))))
-        .filter(|(_, key)| !key.is_empty())
+        .map(|(at, file)| {
+            let stem = stem(&file.name);
+            (at, name_key(stem), compact_key(stem))
+        })
+        .filter(|(_, key, _)| !key.is_empty())
         .collect();
 
     tracks
         .iter()
         .map(|track| {
-            let mut keys = vec![name_key(stem(track.rel.file_name()))];
-            if let Some(title) = track.title {
-                keys.push(name_key(title));
-            }
-            keys.retain(|key| !key.is_empty());
-
-            let exact: Vec<usize> = images
-                .iter()
-                .filter(|(_, image)| keys.iter().any(|key| key == image))
-                .map(|(at, _)| *at)
+            let names: Vec<&str> = std::iter::once(stem(track.rel.file_name()))
+                .chain(track.title)
                 .collect();
-            let found = if exact.is_empty() {
+            let keys: Vec<String> = names
+                .iter()
+                .map(|name| name_key(name))
+                .filter(|key| !key.is_empty())
+                .collect();
+            let compact: Vec<String> = names
+                .iter()
+                .map(|name| compact_key(name))
+                .filter(|key| !key.is_empty())
+                .collect();
+
+            let exact = |track: &str, image: &str| track == image;
+            let words = |track: &str, image: &str| {
+                image.len() >= MIN_SUFFIX && track.ends_with(&format!(" {image}"))
+            };
+            let packed =
+                |track: &str, image: &str| image.len() >= MIN_PACKED && track.ends_with(image);
+
+            // Name keys are compared with name keys and compact keys with
+            // compact keys: a space-free key inside a spaced one is no match.
+            let only_keys = |test: &dyn Fn(&str, &str) -> bool| -> Vec<usize> {
                 images
                     .iter()
-                    .filter(|(_, image)| {
-                        image.len() >= MIN_SUFFIX
-                            && keys.iter().any(|key| key.ends_with(&format!(" {image}")))
-                    })
-                    .map(|(at, _)| *at)
+                    .filter(|(_, key, _)| keys.iter().any(|track| test(track, key)))
+                    .map(|(at, _, _)| *at)
                     .collect()
-            } else {
-                exact
             };
+            let only_compact = |test: &dyn Fn(&str, &str) -> bool| -> Vec<usize> {
+                images
+                    .iter()
+                    .filter(|(_, _, key)| compact.iter().any(|track| test(track, key)))
+                    .map(|(at, _, _)| *at)
+                    .collect()
+            };
+            let found = [only_keys(&exact), only_keys(&words), only_compact(&packed)]
+                .into_iter()
+                .find(|found| !found.is_empty())
+                .unwrap_or_default();
             match found.as_slice() {
                 [] => Paired::NoMatch,
                 [one] => Paired::Image(*one),
@@ -326,6 +364,36 @@ pub fn pair(tracks: &[ToPair<'_>], loose: &[Loose]) -> Vec<Paired> {
 /// The shortest image name that may match the end of a track's name: below
 /// this, `a.jpg` would go with every song whose title ends in "a".
 const MIN_SUFFIX: usize = 3;
+
+/// The same, for [`compact_key`]s, which have lost the word boundaries that
+/// keep a short name honest.
+const MIN_PACKED: usize = 4;
+
+/// A looser key than [`name_key`]: anything in `()`, `[]` or `{}` dropped — a
+/// `(Remix)`, an `(AMV)`, a downloader's `[dQw4w9WgXcQ]` — and the spaces
+/// taken out, so `maverickhunter.jpg` and `Maverick_Hunter_(AMV)` compare
+/// equal.
+///
+/// ```
+/// use mpdfm_core::art::plan::compact_key;
+///
+/// assert_eq!(compact_key("Artist_-_Song_Title_(AMV)_[dQw4w9WgXcQ]"), "artistsongtitle");
+/// assert_eq!(compact_key("song-title"), "songtitle");
+/// ```
+#[must_use]
+pub fn compact_key(name: &str) -> String {
+    let mut kept = String::with_capacity(name.len());
+    let mut depth = 0usize;
+    for c in name.chars() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            c if depth == 0 => kept.push(c),
+            _ => {}
+        }
+    }
+    name_key(&kept).replace(' ', "")
+}
 
 /// A file name without its extension.
 fn stem(name: &str) -> &str {
@@ -464,7 +532,10 @@ mod tests {
     #[test]
     fn an_extraction_is_named_by_its_bytes_and_refuses_a_path_or_a_copy() {
         let dir = DirPath::parse("a").unwrap();
-        let tracks = vec![(rel("a/01.mp3"), vec![]), (rel("a/02.mp3"), vec![front(7, 100)])];
+        let tracks = vec![
+            (rel("a/01.mp3"), vec![]),
+            (rel("a/02.mp3"), vec![front(7, 100)]),
+        ];
         let planned = extract(&dir, &tracks, None, |_| None).unwrap();
         match &planned.ops[..] {
             [Operation::ExtractArt { from, to, .. }] => {
@@ -486,7 +557,12 @@ mod tests {
             Err(ExtractError::NoPicture { .. })
         ));
         let named = extract(&dir, &tracks, Some("front.png"), |_| None).unwrap();
-        assert!(named.notes.iter().any(|note| note.contains("says otherwise")));
+        assert!(
+            named
+                .notes
+                .iter()
+                .any(|note| note.contains("says otherwise"))
+        );
     }
 
     #[test]
@@ -545,6 +621,56 @@ mod tests {
         assert_eq!(pair(&to_pair, &twins), [Paired::Ambiguous(vec![0, 1])]);
         let webp = [loose("Song A.webp", ImageFormat::Webp)];
         assert_eq!(pair(&to_pair, &webp), [Paired::NoMatch]);
+    }
+
+    #[test]
+    fn a_downloaded_single_goes_with_its_squashed_cover_name() {
+        let tracks = [
+            rel("s/Artist_-_Song_Title_(AMV)_[dQw4w9WgXcQ].mp3"),
+            rel("s/Artist_-_Ghost_[abcDEF12345].mp3"),
+            rel("s/Artist_-_Night_Drive_(Official_Video)_[xyz_-012345].mp3"),
+        ];
+        let to_pair: Vec<ToPair<'_>> = tracks
+            .iter()
+            .map(|rel| ToPair { rel, title: None })
+            .collect();
+        let images = [
+            loose("ghost.jpg", ImageFormat::Jpeg),
+            loose("nightdrive.jpg", ImageFormat::Jpeg),
+            loose("songtitle.png", ImageFormat::Png),
+        ];
+        assert_eq!(
+            pair(&to_pair, &images),
+            [Paired::Image(2), Paired::Image(0), Paired::Image(1)]
+        );
+    }
+
+    #[test]
+    fn a_closer_tier_wins_over_a_looser_one() {
+        // `Song A (Remix)` is exactly `song a remix`; the bracket-dropping tier
+        // would also have offered `Song A.jpg`, and must not get the chance.
+        let track = rel("s/01 Song A (Remix).mp3");
+        let to_pair = [ToPair {
+            rel: &track,
+            title: None,
+        }];
+        let images = [
+            loose("Song A.jpg", ImageFormat::Jpeg),
+            loose("Song A Remix.jpg", ImageFormat::Jpeg),
+        ];
+        assert_eq!(pair(&to_pair, &images), [Paired::Image(1)]);
+    }
+
+    #[test]
+    fn the_canonical_name_keeps_an_extension_that_fits_the_bytes() {
+        let jpeg = |name: &str| loose(name, ImageFormat::Jpeg);
+        assert_eq!(canonical_name(&jpeg("front.JPEG")), "cover.jpeg");
+        assert_eq!(canonical_name(&jpeg("folder.jpg")), "cover.jpg");
+        assert_eq!(
+            canonical_name(&jpeg("scan.png")),
+            "cover.jpg",
+            "the bytes win"
+        );
     }
 
     #[test]

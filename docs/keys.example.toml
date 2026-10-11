@@ -86,6 +86,25 @@
 # "ctrl-y" = "commit"
 
 
+# -- the cover view ----------------------------------------------------------
+#
+# `C` in the browser opens it on a directory: its loose images on top, its
+# tracks below, each track with what its embedded front cover is now and what it
+# is drafted to become. `s` assigns the image under the cursor to the marked
+# tracks — or to every track when none is marked — `x` drafts removing the cover,
+# `n` pairs each track with the image of the same name (a folder of singles),
+# and `h` / `l` on a track step its draft through the images by hand. `w` stages
+# the drafts; nothing is written before that.
+#
+# `e`, `C`, `d` and `D` stage straight away: write the embedded cover out as
+# cover.<ext>, rename the image under the cursor to cover.<ext>, delete it, or
+# delete every image but it. `z` downscales large images when they are embedded.
+#
+# [cover]
+# "enter" = "none"
+# "ctrl-s" = "stage_covers"
+
+
 # -- the tag editor (task 23) -----------------------------------------------
 #
 # One mode with two states in it. Between the form's fields a bare letter is a
@@ -166,6 +185,17 @@
 #   commit               commit pending
 #   discard_pending      discard pending
 #   undo                 undo last transaction
+#
+# Cover art
+#   covers               cover art of this directory
+#   assign_cover         assign this image to the tracks
+#   remove_cover         draft removing the embedded cover
+#   pair_covers          pair tracks with images by name
+#   stage_covers         stage the cover changes
+#   extract_cover        write the embedded cover out
+#   canonical_cover      make this image the cover.<ext>
+#   prune_covers         delete every other image here
+#   toggle_downscale     downscale large images when embedding
 #
 # Finding things
 #   search               search

@@ -58,6 +58,9 @@ pub enum Command {
         /// the complaint about a bad one belongs.
         query: String,
     },
+    /// `:cover [set <image> | remove | extract [name]]` — the directory's cover
+    /// art, as `mpdfm cover` does it.
+    Cover(CoverCommand),
     /// `:doctor` — the library and playlist health report.
     Doctor,
     /// `:messages` — everything the message line has said this session, and
@@ -74,6 +77,27 @@ pub enum Command {
     Quit {
         /// Whether to leave without asking.
         force: bool,
+    },
+}
+
+/// What `:cover` was asked to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoverCommand {
+    /// `:cover` — open the cover view on the directory.
+    Open,
+    /// `:cover set <image>` — stage embedding `image` into the marked tracks of
+    /// the directory, or all of them.
+    Set {
+        /// The image: a name in the directory, a path in the library, or an
+        /// absolute path.
+        image: String,
+    },
+    /// `:cover remove` — stage removing the embedded front cover.
+    Remove,
+    /// `:cover extract [name]` — stage writing the embedded cover out.
+    Extract {
+        /// The file name, `cover.<ext>` by default.
+        name: Option<String>,
     },
 }
 
@@ -112,6 +136,10 @@ pub enum CommandError {
         takes: &'static str,
     },
 
+    /// `:cover` with something it does not take.
+    #[error("cover takes nothing, `set <image>`, `remove` or `extract [name]`")]
+    BadCover,
+
     /// `:set` without a `key=value`.
     #[error("set takes key=value, as in `set backup_keep=20`")]
     BadSetting,
@@ -126,6 +154,16 @@ pub const USAGE: &[(&str, &str)] = &[
     ("organize <template>", "re-file by a template"),
     ("find <query>", "search the whole library"),
     ("undo [txid]", "reverse a committed transaction"),
+    ("cover", "the cover view of this directory"),
+    (
+        "cover set <image>",
+        "stage embedding an image in its tracks",
+    ),
+    ("cover remove", "stage removing the embedded covers"),
+    (
+        "cover extract [name]",
+        "stage writing the embedded cover out",
+    ),
     ("doctor", "library and playlist health"),
     ("messages", "everything said this session, errors included"),
     ("set <k>=<v>", "change a setting for this session"),
@@ -135,11 +173,15 @@ pub const USAGE: &[(&str, &str)] = &[
 
 /// The command names, for the "no such command" message.
 fn usage_names() -> String {
-    USAGE
-        .iter()
-        .map(|(usage, _)| usage.split(['<', ' ']).next().unwrap_or(usage).trim())
-        .collect::<Vec<_>>()
-        .join(", ")
+    let mut names: Vec<&str> = Vec::new();
+    for (usage, _) in USAGE {
+        let name = usage.split(['<', ' ']).next().unwrap_or(usage).trim();
+        // `cover` has four lines in the table and is one command.
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names.join(", ")
 }
 
 /// Read a command line.
@@ -210,6 +252,30 @@ pub fn parse(line: &str) -> Result<Command, CommandError> {
                 txid: (!rest.is_empty()).then(|| rest.to_owned()),
             })
         }
+        "cover" => {
+            let (sub, arg) = match rest.split_once(char::is_whitespace) {
+                Some((sub, arg)) => (sub, arg.trim()),
+                None => (rest, ""),
+            };
+            let cover = match (sub, arg) {
+                ("", _) => CoverCommand::Open,
+                ("set", "") => {
+                    return Err(CommandError::MissingArgument {
+                        command: "cover set",
+                        what: "an image",
+                    });
+                }
+                ("set", image) => CoverCommand::Set {
+                    image: image.to_owned(),
+                },
+                ("remove", "") => CoverCommand::Remove,
+                ("extract", name) => CoverCommand::Extract {
+                    name: (!name.is_empty()).then(|| name.to_owned()),
+                },
+                _ => return Err(CommandError::BadCover),
+            };
+            Ok(Command::Cover(cover))
+        }
         "doctor" => {
             nothing("no arguments")?;
             Ok(Command::Doctor)
@@ -252,6 +318,7 @@ fn name_of(typed: &str) -> &'static str {
         "organize" => "organize",
         "find" | "f" => "find",
         "undo" => "undo",
+        "cover" => "cover",
         "doctor" => "doctor",
         "messages" | "mes" => "messages",
         "set" => "set",
@@ -502,6 +569,38 @@ mod tests {
     }
 
     #[test]
+    fn cover_takes_a_verb_and_says_which_when_it_does_not() {
+        assert_eq!(parse("cover"), Ok(Command::Cover(CoverCommand::Open)));
+        assert_eq!(
+            parse("cover set Song A.jpg"),
+            Ok(Command::Cover(CoverCommand::Set {
+                image: "Song A.jpg".to_owned()
+            })),
+            "an image name keeps its spaces"
+        );
+        assert_eq!(
+            parse("cover remove"),
+            Ok(Command::Cover(CoverCommand::Remove))
+        );
+        assert_eq!(
+            parse("cover extract"),
+            Ok(Command::Cover(CoverCommand::Extract { name: None }))
+        );
+        assert_eq!(
+            parse("cover extract folder.jpg"),
+            Ok(Command::Cover(CoverCommand::Extract {
+                name: Some("folder.jpg".to_owned())
+            }))
+        );
+        assert!(matches!(
+            parse("cover set"),
+            Err(CommandError::MissingArgument { .. })
+        ));
+        assert_eq!(parse("cover frobnicate"), Err(CommandError::BadCover));
+        assert_eq!(parse("cover remove all"), Err(CommandError::BadCover));
+    }
+
+    #[test]
     fn the_usage_table_covers_every_command_the_parser_takes() {
         // The help overlay lists `USAGE`; this is what stops the list and the
         // grammar drifting apart.
@@ -511,6 +610,8 @@ mod tests {
                 .replace("<dst>", "x")
                 .replace("<template>", "x")
                 .replace("[txid]", "")
+                .replace("<image>", "x.jpg")
+                .replace("[name]", "")
                 .replace("<k>=<v>", "k=v");
             assert!(
                 parse(&line).is_ok(),

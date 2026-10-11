@@ -35,6 +35,7 @@ fn about(mode: Mode) -> &'static str {
     match mode {
         Mode::Browser => "the library",
         Mode::Pending => "what is staged, and committing it",
+        Mode::Cover => "a directory's images and its tracks' covers",
         Mode::TagEdit => "the tag editor",
         Mode::Search => "the / f F line",
         Mode::Command => "the : line",

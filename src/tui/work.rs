@@ -207,6 +207,84 @@ pub fn read_art(tx: Sender<Msg>, rel: RelPath, root: Utf8PathBuf, decode: bool, 
     }
 }
 
+/// Survey one directory for the cover view: every track's pictures and title,
+/// and every loose image, hashed.
+///
+/// A worker because every image is read in full to be hashed — a few hundred
+/// kilobytes an album, and a scene release's 5 MB scans. A track whose tags
+/// will not read is a [`TrackArt::error`][mpdfm_core::art::read::TrackArt] in
+/// its own slot, as `mpdfm cover show` reports it; only a directory that cannot
+/// be listed fails the survey.
+pub fn read_covers(
+    tx: Sender<Msg>,
+    dir: DirPath,
+    tracks: Vec<RelPath>,
+    root: Utf8PathBuf,
+    log: Arc<Log>,
+) {
+    use mpdfm_core::art::{self, read::TrackArt};
+
+    let fallback = tx.clone();
+    let spawned = thread::Builder::new()
+        .name("mpdfm-covers".to_owned())
+        .spawn(move || {
+            let started = Instant::now();
+            let mut titles = Vec::with_capacity(tracks.len());
+            let tracks: Vec<TrackArt> =
+                tracks
+                    .into_iter()
+                    .map(|rel| {
+                        let abs = rel.to_abs(&root);
+                        titles.push(mpdfm_core::tags::read::read_tags(&abs).ok().and_then(
+                            |tags| {
+                                tags.get(mpdfm_core::tags::Field::Title)
+                                    .first()
+                                    .map(ToOwned::to_owned)
+                            },
+                        ));
+                        match art::embedded(&abs) {
+                            Ok(pictures) => TrackArt {
+                                rel,
+                                pictures,
+                                error: None,
+                            },
+                            Err(err) => TrackArt {
+                                rel,
+                                pictures: Vec::new(),
+                                error: Some(err.to_string()),
+                            },
+                        }
+                    })
+                    .collect();
+            let abs = dir.to_abs(&root);
+            let result = art::loose(&abs)
+                .map(|loose| {
+                    let mismatches = art::read::mismatches(&tracks, &loose);
+                    super::views::cover::Survey {
+                        art: art::AlbumArt {
+                            dir: dir.clone(),
+                            tracks,
+                            loose,
+                            mismatches,
+                        },
+                        titles,
+                    }
+                })
+                .map_err(|err| format!("cannot list {abs}: {err}"));
+            log.line(format!(
+                "covers: {dir} in {} µs",
+                started.elapsed().as_micros()
+            ));
+            let _ = tx.send(Msg::TaskDone(Box::new(TaskOutcome::Covers { dir, result })));
+        });
+    if let Err(err) = spawned {
+        let _ = fallback.send(Msg::TaskDone(Box::new(TaskOutcome::Failed {
+            what: "read cover art".to_owned(),
+            message: format!("cannot start the covers thread: {err}"),
+        })));
+    }
+}
+
 /// Read every file the tag editor was opened on.
 ///
 /// [`read_tags`] answers a different question: the bulk view has to see the

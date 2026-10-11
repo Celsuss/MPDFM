@@ -136,25 +136,21 @@ pub fn set(cli: &Cli, config: &Config, out: &Out, args: &CoverSetArgs) -> Result
 pub fn extract(cli: &Cli, config: &Config, out: &Out, args: &CoverExtractArgs) -> Result<ExitCode> {
     let album = Album::open(config, &args.album_dir)?;
     let root = album.library.root().to_owned();
-    let planned = match art::plan::extract(
-        &album.dir,
-        &album.pictures(),
-        args.name.as_deref(),
-        |to| {
+    let planned =
+        match art::plan::extract(&album.dir, &album.pictures(), args.name.as_deref(), |to| {
             std::fs::read(to.to_abs(&root))
                 .ok()
                 .map(|bytes| mpdfm_core::ops::exec_fs::hash_bytes(&bytes))
-        },
-    ) {
-        Ok(planned) => planned,
-        Err(err @ art::plan::ExtractError::AlreadyThere { .. }) => {
-            return nothing(out, &format!("{err}."));
-        }
-        Err(art::plan::ExtractError::NotAName { name }) => {
-            anyhow::bail!("--name takes a file name, not a path: {name:?}")
-        }
-        Err(err) => return Err(err.into()),
-    };
+        }) {
+            Ok(planned) => planned,
+            Err(err @ art::plan::ExtractError::AlreadyThere { .. }) => {
+                return nothing(out, &format!("{err}."));
+            }
+            Err(art::plan::ExtractError::NotAName { name }) => {
+                anyhow::bail!("--name takes a file name, not a path: {name:?}")
+            }
+            Err(err) => return Err(err.into()),
+        };
     let notes = planned.notes;
     let plan = Plan::of(planned.ops);
     run(

@@ -13,6 +13,8 @@ not parse stays open with the reason under it, so you can edit rather than retyp
 | `:organize <template>` | open the organize view with this template |
 | `:find <query>` (`:f`) | find across the whole library |
 | `:undo [txid]` | reverse a committed transaction, the latest by default |
+| `:cover` | open the [cover view](covers.md) on this folder |
+| `:cover set <image>` / `remove` / `extract [name]` | stage a cover change for this folder's marked tracks, or all of them |
 | `:messages` (`:mes`) | everything said this session, errors included |
 | `:set sort=<name\|track\|mtime\|size>` | change the browser's sort for this session |
 | `:q` / `:q!` | quit, asking first if operations are staged / quit regardless |

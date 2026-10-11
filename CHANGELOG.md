@@ -6,7 +6,28 @@ All notable changes to MPDFM are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **A cover view in the TUI.** `C` (or `:cover`) on a folder lists its images and
+  each track's embedded front cover. Assign an image to the marked tracks, or to
+  every track, with `s`; draft removals with `x`; then `w` stages it all to the
+  pending view as ordinary, undoable tag writes. `z` downscales large images
+  first.
+- **Singles are paired with their covers by name.** In a folder of singles, `n`
+  drafts each track's own image, matching `01 - Song A.mp3` to `song_a.jpg` and
+  a downloaded `Artist_-_Song_Title_(AMV)_[id].mp3` to `songtitle.jpg`. A track
+  nothing matches is named, and `h` / `l` on it picks its image by hand.
+- **Tidying loose images from the TUI:** `e` writes the embedded cover out, `C`
+  renames an image to `cover.<ext>`, `d` deletes one and `D` deletes every image
+  but the one under the cursor, all staged like any other operation.
+- `:cover set <image>`, `:cover remove` and `:cover extract [name]` mirror
+  `mpdfm cover` from the TUI's command line.
+- The details pane shows a folder's best image, and how many there are.
+
 ### Fixed
+
+- The `keys.toml` warning panel keeps `esc to dismiss` in its border, where a
+  long list of action names can no longer push it out of sight.
 
 - **A move can no longer hide a track from MPD.** Moving one file to a name that
   is not a folder — `:move Singles` in the TUI, `mpdfm move song.mp3 Singles` —
